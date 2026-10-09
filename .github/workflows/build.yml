@@ -1,37 +1,82 @@
+# CI 门禁：push / PR 触发。
+# 约定（ADR-107 / 1.2.0 批次 E）：
+# - 全部使用 GitHub 托管 runner（公开仓安全底线：绝不用自托管 runner 跑 PR）
+# - 所有第三方 action 按 SHA 固定
+# - macOS 目标只做 cargo check 编译验证（公证分发需 Apple 开发者账号，见 ADR-107）
 name: build
 
 on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  check-windows:
-    runs-on: [self-hosted, windows-local]
+  windows:
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
-      - uses: Swatinem/rust-cache@v2
-      - name: Add MinGW bin to PATH (dlltool/gcc for windows crates, GNU target)
-        run: Add-Content $env:GITHUB_PATH "C:\mingw64\bin"
-      - run: npm ci --prefix ui
-      - run: npm run build --prefix ui
-      - run: cargo test --workspace --exclude clouddock-app
-      - run: cargo check --workspace --exclude clouddock-app
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Rust toolchain (fmt/clippy components)
+        run: rustup component add rustfmt clippy
+      - name: UI install
+        run: npm --prefix ui ci
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: core tests
+        run: cargo test -p pandock-core
+      - name: app compile check
+        run: |
+          cargo check -p pandock-app
+          cargo check -p pandock-updater
+      - name: UI tests
+        run: npm --prefix ui test
+      - name: UI build
+        run: npm --prefix ui run build
+      - name: secret scan
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\check-secrets.ps1
 
-  check-macos:
-    runs-on: [self-hosted, mac-local]
+  coverage:
+    runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: cargo-llvm-cov
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: coverage gate (core >=80%, auth/cdn/verify/journal/velopack_feed >=90%)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\check-coverage.ps1
+
+  macos-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: npm ci --prefix ui
-      - run: npm run build --prefix ui
-      - run: cargo test --workspace
-      - run: cargo check --workspace
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: UI install + build
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+      - name: macOS compile check (WebDAV-only scope, no NativeSync/Velopack)
+        run: |
+          cargo check -p pandock-core
+          cargo check -p pandock-app
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"

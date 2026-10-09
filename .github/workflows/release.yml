@@ -1,0 +1,45 @@
+# 发布流水线：仅手动触发（workflow_dispatch），tag 必须先存在于仓库。
+# environment: release 配置required reviewers 后即为人工审批闸门。
+# 签名顺序约束（ADR-107）：将来接入 Authenticode 时，签名步骤必须位于
+# vpk pack（生成 releases.win.json）之前。
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的已存在 tag（如 1.2.0）"
+        required: true
+        type: string
+
+permissions:
+  contents: write  # 创建/发布 Release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.tag }}
+      - name: verify tag exists and matches version files
+        shell: pwsh
+        run: |
+          git fetch --tags origin
+          git rev-parse "refs/tags/${{ inputs.tag }}" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "tag ${{ inputs.tag }} does not exist" }
+          powershell -ExecutionPolicy Bypass -File .\scripts\check-version.ps1
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: full local gate
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1
+      - name: build + publish Velopack release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\build-velopack.ps1 -Upload -Publish
