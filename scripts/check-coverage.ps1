@@ -74,7 +74,7 @@ function Assert-Coverage([string]$Path) {
 New-Item -ItemType Directory -Path (Split-Path -Parent $summaryPath) -Force | Out-Null
 
 $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
-if ($isWindows -and (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+if ($isWindows -and (Get-Command wsl.exe -ErrorAction SilentlyContinue) -and (wsl.exe -l -q 2>$null | Where-Object { $_.Trim() -ne "" })) {
     $linuxRoot = ConvertTo-WslPath $root
     $linuxSummary = ConvertTo-WslPath (Split-Path -Parent $summaryPath)
     $linuxSummary = "$linuxSummary/coverage-summary.json"
