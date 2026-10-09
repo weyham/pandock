@@ -3026,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "pandock-app"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "keyring",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "pandock-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3076,7 +3076,7 @@ dependencies = [
 
 [[package]]
 name = "pandock-nativesync"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "futures-util",
  "hex",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "pandock-updater"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "fs2",
  "pandock-core",

@@ -35,6 +35,8 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: ui/package-lock.json
+      - name: Velopack CLI (vpk)
+        run: dotnet tool install --global vpk
       - name: full local gate
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1

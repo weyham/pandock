@@ -1,6 +1,6 @@
 {
   "name": "pandock",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "Pandock desktop WebDAV bridge and placeholder sync for the Baidu Netdisk Open Platform application directory",
   "scripts": {
