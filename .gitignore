@@ -1,0 +1,55 @@
+# Build outputs
+/target/
+/core/target/
+/src-tauri/target/
+/ui/node_modules/
+/ui/dist/
+/dist/
+*.tsbuildinfo
+*.rs.bk
+
+# Runtime, local data and generated state
+/data/
+/.env
+.env.*
+*.log
+*.tmp
+*.bak
+*.db
+*.db-*
+nul
+
+# Credentials and signing material
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision
+*.cer
+*.crt
+id_rsa*
+id_ed25519*
+.npmrc
+.cargo/credentials*
+
+# IDE and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tauri generated schemas
+/src-tauri/gen/schemas/
+
+# Local application runtime
+/app/
+
+# Internal process documents (local-only companion repo)
+/internal-docs/
+
+# Python bytecode cache (scripts/)
+__pycache__/
+*.pyc

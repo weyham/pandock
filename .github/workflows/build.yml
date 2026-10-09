@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check-windows:
+    runs-on: [self-hosted, windows-local]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - name: Add MinGW bin to PATH (dlltool/gcc for windows crates, GNU target)
+        run: Add-Content $env:GITHUB_PATH "C:\mingw64\bin"
+      - run: npm ci --prefix ui
+      - run: npm run build --prefix ui
+      - run: cargo test --workspace --exclude clouddock-app
+      - run: cargo check --workspace --exclude clouddock-app
+
+  check-macos:
+    runs-on: [self-hosted, mac-local]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci --prefix ui
+      - run: npm run build --prefix ui
+      - run: cargo test --workspace
+      - run: cargo check --workspace

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <clipPath id="cloud">
+      <!-- Global silhouette: three overlapping circles plus a bottom rectangle tangent to both side circles. -->
+      <circle cx="318.4" cy="608.5" r="239.5"/>
+      <circle cx="525.3" cy="389.1" r="209.6"/>
+      <circle cx="705.2" cy="608.8" r="239.2"/>
+      <rect x="318.4" y="500" width="386.8" height="348"/>
+    </clipPath>
+    <linearGradient id="facetLight" x1="150" y1="200" x2="760" y2="820" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#64C4F6"/><stop offset="1" stop-color="#4FBBF5"/>
+    </linearGradient>
+  </defs>
+  <g clip-path="url(#cloud)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#facetLight)"/>
+    <path d="M734.0 361.6 A102 102 0 0 1 704.3 440.3 L339.2 805.4 A105.6 105.6 0 0 1 211.2 821.7 L150 1000 L1200 1000 L1200 200 L734 200 Z" fill="#1E67B2"/>
+  </g>
+</svg>
