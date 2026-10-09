@@ -1,4 +1,7 @@
 # macOS 发布资产构建：手动触发，把未公证 dmg 挂到已存在的 Release。
+# 顺序约束：必须先由 release.yml 创建该 tag 的 Release（vpk upload），
+# 本工作流只负责往已有 Release 上挂 dmg——否则 gh release upload 报
+# "release not found"（1.2.1 实测踩过）。
 # 范围（ADR-107）：macOS 仅 WebDAV 模块，无 NativeSync，无自动更新
 #（应用内检测新版本 + 引导手动下载）。未公证，用户首次右键打开放行。
 name: macos-release
