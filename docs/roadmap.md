@@ -32,15 +32,14 @@
 - 质量门禁：fmt、clippy、Rust 测试、核心覆盖率、UI 测试、UI 构建、密钥扫描。
 - 当前核心行覆盖率：87.29%；UI 测试：40/40。
 
-## 1.2.0 计划（开源迁移，方案已批准 2026-10-10）
+### 1.2.0（2026-10-10）
 
-详见 docs/release/1.2.0-open-source-migration-plan.md 与 ADR-107。
-
-- 迁移至公开仓 weyham/pandock（无历史单初始提交，旧仓归档），License MIT。
-- 更新链路零 API 化：删除 GitHub App 授权，改走 releases/latest/download CDN 路由。
-- GitHub Actions CI/CD（托管 runner、SHA pin、release 人工闸门）。
-- SignPath OSS 签名申请（Pandock + Halcyon 联合）；获批前接受未签名发布。
-- macOS 首发：仅 WebDAV 模块，未公证分发，NativeSync 不提供。
+- 开源迁移：公开仓 [weyham/pandock](https://github.com/weyham/pandock) 上线（无历史单初始提交，tree-hash 构造性比对验证），旧仓归档，License MIT。
+- ADR-104 更名收尾：pandock.exe / pandock-updater.exe、com.weyham.pandock、keyring 服务名迁移与旧 exe 首 run 清理。
+- 更新链路零 API 化：GitHub App 授权流程整体移除，更新走 Releases CDN 匿名路由（实测通过）。
+- GitHub Actions CI 上线：windows / coverage / macos-check 三门禁全绿；release 流水线配人工审批闸门。
+- macOS 首发：WebDAV 模块（未公证 dmg，手动放行）；NativeSync 不提供（CFAPI 为 Windows 独占）。
+- SignPath OSS 签名申请推进中；获批前产物未签名（SmartScreen 警告照旧）。
 
 ## 1.3.0 候选
 
