@@ -1,0 +1,48 @@
+# macOS 发布资产构建：手动触发，把未公证 dmg 挂到已存在的 Release。
+# 范围（ADR-107）：macOS 仅 WebDAV 模块，无 NativeSync，无自动更新
+#（应用内检测新版本 + 引导手动下载）。未公证，用户首次右键打开放行。
+name: macos-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 Release tag（如 1.2.0）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: tauri-cli
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
+        with:
+          tool: tauri-cli
+      - name: UI build
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui run build
+      - name: build dmg (unsigned)
+        run: cargo tauri build --bundles dmg -- --features custom-protocol
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+      - name: attach dmg to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dmg=$(ls target/release/bundle/dmg/*.dmg)
+          echo "built: $dmg"
+          gh release upload "${{ inputs.tag }}" "$dmg" --repo weyham/pandock --clobber
