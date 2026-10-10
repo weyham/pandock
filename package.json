@@ -2,6 +2,7 @@
   "name": "pandock",
   "version": "1.2.1",
   "private": true,
+  "license": "MIT",
   "description": "Pandock desktop WebDAV bridge and placeholder sync for the Baidu Netdisk Open Platform application directory",
   "scripts": {
     "ui:install": "npm --prefix ui ci",
