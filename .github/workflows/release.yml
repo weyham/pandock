@@ -40,15 +40,13 @@ jobs:
           rustup toolchain install stable-x86_64-pc-windows-gnu --component rustfmt --component clippy
           rustup default stable-x86_64-pc-windows-gnu
           Add-Content $env:GITHUB_PATH "C:\mingw64\bin"
-      - name: cargo-llvm-cov（覆盖率门禁）
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2
-        with:
-          tool: cargo-llvm-cov
       - name: Velopack CLI (vpk)
         run: dotnet tool install --global vpk
       - name: full local gate
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -SkipCoverage
+          # 覆盖率门禁由 build.yml 在同一提交上完成（llvm-cov 与 GNU 工具链不兼容，
+          # 而发布构建必须与本地一致使用 GNU——WebView2Loader.dll 只在 GNU 下产出）
       - name: build + publish Velopack release
         shell: pwsh
         env:
