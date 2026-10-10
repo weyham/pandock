@@ -41,6 +41,8 @@ jobs:
         run: |
           cargo check -p pandock-app
           cargo check -p pandock-updater
+      - name: app lib tests
+        run: cargo test -p pandock-app --lib
       - name: UI tests
         run: npm --prefix ui test
       - name: UI build

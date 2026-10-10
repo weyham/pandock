@@ -14,7 +14,9 @@ Pandock：百度网盘开放平台应用目录的本地桥接工具（WebDAV + W
 3. 提交前必须通过 `scripts/check.ps1`（fmt、clippy -D warnings、测试、覆盖率、UI 构建、密钥扫描）；
 4. 契约（WebDAV 行为、更新 feed、配置结构）变更必须同步修改测试与相关文档；
 5. 文档为追加式维护：并集合并，不整段覆盖；
-6. 面向用户的可见名称一律为 **Pandock**。
+6. 面向用户的可见名称一律为 **Pandock**。；
+7. **运行目录 `app\` 的实例更新只允许走 `scripts/deploy-dev.ps1`**（原子、白名单、备份、
+   精确路径停进程）；禁止手工 kill+copy；`app\data\` 永不被部署触碰。
 
 ## 目录
 

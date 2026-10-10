@@ -24,6 +24,9 @@ const WINDOWS_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\R
 #[cfg(windows)]
 const WINDOWS_APPROVED_RUN_KEY: &str =
     r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+#[cfg(windows)]
+const WINDOWS_APPROVED_STARTUP_FOLDER_KEY: &str =
+    r"HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
 
 #[cfg(windows)]
 fn startup_shortcut_path() -> Result<PathBuf, String> {
@@ -95,7 +98,33 @@ fn create_startup_shortcut_at(shortcut: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn create_startup_shortcut() -> Result<(), String> {
-    create_startup_shortcut_at(&startup_shortcut_path()?)
+    create_startup_shortcut_at(&startup_shortcut_path()?)?;
+    ensure_startup_folder_approved()
+}
+
+/// Startup 文件夹项的启用状态由 StartupApproved\StartupFolder 的 12 字节
+/// REG_BINARY 控制（首字节 0x02=启用，0x03=禁用）。程序自建的快捷方式可能
+/// 从未登记该值，或被系统/用户改成禁用——两者都会导致登录时不启动。
+/// 这里在写快捷方式后强制保证值存在且首字节为 0x02；其余字节清零，
+/// 由 Windows 自行维护时间戳。
+#[cfg(windows)]
+fn ensure_startup_folder_approved() -> Result<(), String> {
+    let script = format!(
+        r#"$ErrorActionPreference='Stop'; $key={key}; New-Item -Path $key -Force | Out-Null; $name={name}; $cur=(Get-ItemProperty -LiteralPath $key -Name $name -ErrorAction SilentlyContinue).$name; if ($null -eq $cur -or $cur.Length -ne 12 -or $cur[0] -ne 2) {{ $enabled=[byte[]](2,0,0,0,0,0,0,0,0,0,0,0); New-ItemProperty -LiteralPath $key -Name $name -PropertyType Binary -Value $enabled -Force | Out-Null }}; exit 0"#,
+        key = powershell_literal(WINDOWS_APPROVED_STARTUP_FOLDER_KEY),
+        name = powershell_literal(SHORTCUT_NAME),
+    );
+    run_powershell(&script)
+}
+
+#[cfg(windows)]
+fn remove_startup_folder_approved() -> Result<(), String> {
+    let script = format!(
+        r#"$ErrorActionPreference='SilentlyContinue'; Remove-ItemProperty -LiteralPath {key} -Name {name} -ErrorAction SilentlyContinue; exit 0"#,
+        key = powershell_literal(WINDOWS_APPROVED_STARTUP_FOLDER_KEY),
+        name = powershell_literal(SHORTCUT_NAME),
+    );
+    run_powershell(&script)
 }
 
 #[cfg(windows)]
@@ -137,6 +166,7 @@ fn remove_legacy_run_entries() -> Result<(), String> {
 #[cfg(windows)]
 fn clear_current_metadata() -> Result<(), String> {
     remove_startup_shortcut()?;
+    remove_startup_folder_approved()?;
     remove_legacy_run_entries()
 }
 
@@ -207,6 +237,16 @@ mod tests {
             powershell_literal(&path.display().to_string()),
             "'C:\\Users\\O''Brien\\Pandock.exe'"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn approved_folder_script_targets_shortcut_name_and_enabled_byte() {
+        // 脚本必须：指向 StartupApproved\StartupFolder、作用在 Pandock.lnk、
+        // 首字节写 0x02（启用）、长度校验 12 字节。
+        let key = WINDOWS_APPROVED_STARTUP_FOLDER_KEY;
+        assert!(key.ends_with("StartupApproved\\StartupFolder"));
+        assert_eq!(SHORTCUT_NAME, "Pandock.lnk");
     }
 
     #[cfg(windows)]
