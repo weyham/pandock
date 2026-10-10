@@ -12,8 +12,12 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$SourceDir,
-    [string]$RuntimeDir = (Join-Path (Split-Path -Parent $PSScriptRoot) "app")
+    [string]$RuntimeDir = ""
 )
+
+if ([string]::IsNullOrWhiteSpace($RuntimeDir)) {
+    $RuntimeDir = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "..\app"
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
