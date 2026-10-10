@@ -322,6 +322,13 @@ impl UpdateRuntime {
         if !helper_path.exists() {
             return Err(UpdateError::InvalidArchive("更新包缺少 updater.exe".into()));
         }
+        // nupkg 不含 VERSION.txt（它由打包脚本写给便携 zip）。为保持安装目录
+        // 版本标记不滞后，按目标版本生成进 staging，随白名单一起落位。
+        std::fs::write(
+            staging_dir.join("VERSION.txt"),
+            format!("{}\r\n", offer.asset.version),
+        )
+        .map_err(|error| UpdateError::Internal(error.to_string()))?;
         let mut state = self.state.lock().unwrap();
         if let Some(PendingUpdate::Portable(offer)) = state.update.as_mut() {
             offer.staged = Some(PortableStaged {
