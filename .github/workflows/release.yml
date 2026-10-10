@@ -52,3 +52,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: powershell -ExecutionPolicy Bypass -File .\scripts\build-velopack.ps1 -Upload -Publish
+      - name: attach sha256 sidecars
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ inputs.tag }}" dist/velopack/*.sha256 --repo weyham/pandock --clobber
