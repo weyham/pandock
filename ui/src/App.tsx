@@ -319,6 +319,7 @@ export function App() {
   return <div className="layout">
     <aside className="side">
       <div className="brand">
+        <img className="brand-logo" src="/pandock-logo.svg" alt="" aria-hidden="true" />
         <div className="brand-name">Pandock</div>
         <div className={`brand-status ${dotClass}`}><span className="dot" /><span>{labels[status.kind] || status.kind}{status.reason ? " · " + status.reason : ""}</span></div>
         <div className="brand-addr">{"http://" + config.listen + config.dav_prefix + "/"}</div>
@@ -373,7 +374,7 @@ export function App() {
           <span className={`status-chip ${updateState.phase === "error" ? "error" : updateState.phase === "up_to_date" || updateState.phase === "update_available" ? "ok" : ""}`}>{phaseLabels[updateState.phase] || updateState.phase}</span>
         </div>
         <section className="about-hero card">
-          <div className="about-mark">P</div>
+          <img className="about-mark" src="/pandock-logo.svg" alt="" aria-hidden="true" />
           <div>
             <div className="about-title">Pandock</div>
             <div className="hint">轻量、本地、可审计的百度网盘同步与按需下载客户端</div>

@@ -452,7 +452,7 @@ button:disabled { opacity: 0.5; }
 .status-chip.ok { border-color: rgba(46, 204, 113, 0.5); color: #65e49a; }
 .status-chip.error { border-color: rgba(231, 76, 60, 0.55); color: #f28c80; }
 .about-hero { display: flex; align-items: center; gap: 14px; padding: 18px; }
-.about-mark { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 12px; background: linear-gradient(145deg, #4f8cff, #2f6fdd); color: #fff; font-size: 23px; font-weight: 700; box-shadow: 0 8px 22px rgba(47, 111, 221, 0.35); }
+.about-mark { width: 52px; height: 52px; flex: 0 0 52px; object-fit: contain; filter: drop-shadow(0 6px 16px rgba(0, 0, 0, 0.35)); }
 .about-title { font-size: 18px; font-weight: 650; margin-bottom: 6px; color: #e6e6ea; }
 .about-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 4px; }
 .about-item { background: #26272e; border: 1px solid #33343d; border-radius: 10px; padding: 10px 14px; }
@@ -570,7 +570,7 @@ h3 { font-size: 13px; margin: 0; font-weight: 600; }
 .card-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
 
 .about-hero { display: flex; align-items: center; gap: 14px; padding: 18px; }
-.about-mark { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 12px; background: linear-gradient(145deg, #4f8cff, #2f6fdd); color: #fff; font-size: 23px; font-weight: 700; box-shadow: 0 8px 22px rgba(47, 111, 221, 0.35); }
+.about-mark { width: 52px; height: 52px; flex: 0 0 52px; object-fit: contain; filter: drop-shadow(0 6px 16px rgba(0, 0, 0, 0.35)); }
 .about-title { font-size: 18px; font-weight: 650; margin-bottom: 3px; }
 .about-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .about-item { margin-bottom: 0; }
