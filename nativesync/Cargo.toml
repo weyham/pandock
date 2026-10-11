@@ -21,6 +21,7 @@ hex = "0.4"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_CloudFilters",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
@@ -29,6 +30,10 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # 外壳集成：注册同步根（导航栏节点 + 水合状态角标 + 状态列）
+    "Storage",
+    "Storage_Provider",
+    "Foundation_Collections",
 ] }
 
 
