@@ -119,6 +119,33 @@ impl IndexDb {
         rows.map(|r| r.map_err(|e| e.to_string())).collect()
     }
     pub fn upsert(&self, e: &EntryRecord) -> Result<(), String> {
+        // remote_entry 有**两个**唯一约束：fs_id（主键）与 remote_path。
+        // 云端条目被替换时 fs_id 会变，而旧行仍占着同一个 remote_path；
+        // 下面的 INSERT 只声明了 ON CONFLICT(fs_id)，此时会撞 remote_path 的
+        // 唯一约束并让整次同步中断（表现为资源管理器里只剩目录、没有文件）。
+        // 因此先按 remote_path 清掉不同 fs_id 的陈旧行（连同其 local_state）。
+        let stale: Vec<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT fs_id FROM remote_entry WHERE remote_path=?1 AND fs_id<>?2")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![e.remote_path, e.fs_id], |r| r.get::<_, i64>(0))
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(Result::ok).collect()
+        };
+        for fs_id in &stale {
+            log::info!(
+                "native-sync replacing stale entry: fs_id={fs_id} path={}",
+                e.remote_path
+            );
+            self.conn
+                .execute("DELETE FROM local_state WHERE fs_id=?1", params![fs_id])
+                .map_err(|e| e.to_string())?;
+            self.conn
+                .execute("DELETE FROM remote_entry WHERE fs_id=?1", params![fs_id])
+                .map_err(|e| e.to_string())?;
+        }
         self.conn.execute("INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone) VALUES(?,?,?,?,?,?,?,?,?,0,0) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0",params![e.fs_id,e.parent_fs_id,e.remote_path,e.name,e.is_dir as i64,e.size,e.md5,e.modified_at,Option::<String>::None]).map_err(|e|e.to_string())?;
         self.conn.execute("INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?,?,1,?,?,?,0) ON CONFLICT(fs_id) DO UPDATE SET relative_path=excluded.relative_path",params![e.fs_id,e.relative_path,e.state.to_string(),e.pin_state.to_string(),e.error]).map_err(|e|e.to_string())?;
         Ok(())
@@ -332,6 +359,54 @@ mod tests {
     use super::*;
     use crate::model::{EntryRecord, NativeSyncState, PinState};
     use tempfile::tempdir;
+    /// remote_path 是唯一键；云端条目被替换后 fs_id 变化时，
+    /// 旧行仍占用同一路径，若 upsert 只处理 ON CONFLICT(fs_id) 会撞
+    /// remote_path 唯一约束并使整次同步中断（实测：目录建出、文件全缺）。
+    #[test]
+    fn upsert_replaces_stale_row_when_remote_path_changes_fs_id() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        let record = |fs_id: u64, state: NativeSyncState| EntryRecord {
+            fs_id,
+            parent_fs_id: None,
+            remote_path: "/a.txt".into(),
+            relative_path: "a.txt".into(),
+            name: "a.txt".into(),
+            is_dir: false,
+            size: 3,
+            md5: None,
+            modified_at: None,
+            state,
+            pin_state: PinState::Unpinned,
+            error: None,
+            has_children: false,
+        };
+
+        db.upsert(&record(1, NativeSyncState::Hydrated)).unwrap();
+        // 同一路径、新 fs_id：必须成功，并替换掉旧行。
+        db.upsert(&record(2, NativeSyncState::OnlineOnly)).unwrap();
+
+        let ids: Vec<i64> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT fs_id FROM remote_entry WHERE remote_path='/a.txt'")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap();
+            rows.filter_map(Result::ok).collect()
+        };
+        assert_eq!(ids, vec![2], "旧 fs_id 应被清理，只保留新行");
+
+        let states: Vec<i64> = {
+            let mut stmt = db
+                .conn
+                .prepare("SELECT fs_id FROM local_state ORDER BY fs_id")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap();
+            rows.filter_map(Result::ok).collect()
+        };
+        assert_eq!(states, vec![2], "旧 local_state 应一并清理");
+    }
+
     #[test]
     fn migration_enables_wal_and_creates_all_tables() {
         let dir = tempdir().unwrap();
