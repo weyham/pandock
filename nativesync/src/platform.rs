@@ -98,13 +98,156 @@ impl PlatformSync for StubPlatform {
 
 #[cfg(windows)]
 mod windows_impl {
+
+    /// 同步根注册标识：`<providerId>!<用户SID>!<accountId>`。
+    /// 与外壳注册（StorageProviderSyncRootManager）使用同一个 Id，
+    /// 且包含 SID 以保证每用户一份、互不干扰。
+    const SHELL_PROVIDER_ID: &str = "Pandock";
+    const SHELL_ACCOUNT_ID: &str = "Personal";
+
+    /// 当前登录用户的 SID。
+    fn current_user_sid() -> Result<String, PlatformError> {
+        use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        unsafe {
+            let mut token = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+                .map_err(|e| PlatformError::Api(e.to_string()))?;
+            let mut needed = 0u32;
+            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+            let mut buf = vec![0u8; needed as usize];
+            let result = GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+                needed,
+                &mut needed,
+            );
+            let _ = CloseHandle(token);
+            result.map_err(|e| PlatformError::Api(e.to_string()))?;
+            let user = &*(buf.as_ptr() as *const TOKEN_USER);
+            let mut sid = windows::core::PWSTR::null();
+            ConvertSidToStringSidW(user.User.Sid, &mut sid)
+                .map_err(|e| PlatformError::Api(e.to_string()))?;
+            sid.to_string().map_err(|e| PlatformError::Api(e.to_string()))
+        }
+    }
+
+    /// 同步根的注册标识。
+    fn shell_sync_root_id() -> Result<String, PlatformError> {
+        let sid = current_user_sid()?;
+        Ok(format!("{SHELL_PROVIDER_ID}!{sid}!{SHELL_ACCOUNT_ID}"))
+    }
+
+    /// 记住当前注册的同步根路径，供 unregister 使用。
+    fn shell_root_set(root: &Path) {
+        if let Ok(mut slot) = SHELL_ROOT.get_or_init(|| RwLock::new(None)).write() {
+            *slot = Some(root.to_path_buf());
+        }
+    }
+
+    fn shell_root_take() {
+        if let Some(lock) = SHELL_ROOT.get() {
+            if let Ok(mut slot) = lock.write() {
+                *slot = None;
+            }
+        }
+    }
+
+    static SHELL_ROOT: OnceLock<RwLock<Option<std::path::PathBuf>>> = OnceLock::new();
+
+    /// 外壳层注册：把同步根交给 Windows 外壳，解锁导航栏节点与同步状态角标。
+    ///
+    /// 依据微软 CloudMirror 官方示例（Samples/CloudMirror）：现代做法是
+    /// 「StorageProviderSyncRootManager.Register + CfConnectSyncRoot」，
+    /// 不使用 CfRegisterSyncRoot；两者混用会返回 0x8007018B（已拒绝访问云文件）。
+    fn register_with_shell(root: &Path) -> Result<(), PlatformError> {
+        use windows::Storage::Provider::{
+            StorageProviderHydrationPolicy, StorageProviderHydrationPolicyModifier,
+            StorageProviderInSyncPolicy, StorageProviderPopulationPolicy,
+            StorageProviderSyncRootInfo, StorageProviderSyncRootManager,
+        };
+        use windows::core::Interface;
+        use windows::Storage::StorageFolder;
+
+        let id = shell_sync_root_id()?;
+        let info = StorageProviderSyncRootInfo::new()
+            .map_err(|e| PlatformError::Api(e.to_string()))?;
+
+        let folder = StorageFolder::GetFolderFromPathAsync(&windows::core::HSTRING::from(
+            root.to_string_lossy().as_ref(),
+        ))
+        .and_then(|op| op.get())
+        .map_err(|e| PlatformError::Api(e.to_string()))?;
+
+        let folder: windows::Storage::IStorageFolder = folder
+            .cast()
+            .map_err(|e| PlatformError::Api(e.to_string()))?;
+
+        let set = |r: windows::core::Result<()>| r.map_err(|e| PlatformError::Api(e.to_string()));
+        set(info.SetId(&windows::core::HSTRING::from(id.as_str())))?;
+        set(info.SetPath(&folder))?;
+        set(info.SetDisplayNameResource(&windows::core::HSTRING::from("Pandock")))?;
+        // 图标取自本程序内嵌的应用图标（Windows 按 SHLoadIndirectString 解析）。
+        if let Ok(exe) = std::env::current_exe() {
+            set(info.SetIconResource(&windows::core::HSTRING::from(format!(
+                "{},0",
+                exe.display()
+            ))))?;
+        }
+        set(info.SetVersion(&windows::core::HSTRING::from(env!("CARGO_PKG_VERSION"))))?;
+        // 按需水合：占位符可在线、可固定到本地。
+        set(info.SetHydrationPolicy(StorageProviderHydrationPolicy::Full))?;
+        set(info.SetHydrationPolicyModifier(
+            StorageProviderHydrationPolicyModifier::None,
+        ))?;
+        set(info.SetPopulationPolicy(StorageProviderPopulationPolicy::Full))?;
+        set(info.SetInSyncPolicy(StorageProviderInSyncPolicy::Default))?;
+        set(info.SetHardlinkPolicy(
+            windows::Storage::Provider::StorageProviderHardlinkPolicy::None,
+        ))?;
+        set(info.SetAllowPinning(true))?;
+        set(info.SetShowSiblingsAsGroup(false))?;
+
+        match StorageProviderSyncRootManager::Register(&info) {
+            Ok(()) => {}
+            // 已注册（重复启用/重启）：视为成功。
+            Err(e) if e.code().0 as u32 == 0x800700B7 => {
+                log::info!("native-sync shell sync root already registered");
+            }
+            Err(e) => return Err(PlatformError::Api(e.to_string())),
+        }
+        shell_root_set(root);
+        log::info!("native-sync shell sync root registered: {}", root.display());
+        Ok(())
+    }
+
+    /// 注销外壳注册（仅卸载/彻底停用同步时调用）。
+    fn unregister_from_shell() -> Result<(), PlatformError> {
+        use windows::Storage::Provider::StorageProviderSyncRootManager;
+        let id = shell_sync_root_id()?;
+        match StorageProviderSyncRootManager::Unregister(&windows::core::HSTRING::from(id.as_str())) {
+            Ok(()) => {}
+            Err(e) => {
+                let code = e.code().0 as u32;
+                // 未注册时视为成功。
+                if code != 0x80070490 && code != 0x80070002 {
+                    return Err(PlatformError::Api(e.to_string()));
+                }
+            }
+        }
+        shell_root_take();
+        log::info!("native-sync shell sync root unregistered");
+        Ok(())
+    }
     use super::*;
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex, OnceLock, RwLock};
     use std::thread;
-    use windows::core::{GUID, PCWSTR};
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, NTSTATUS};
     use windows::Win32::Storage::CloudFilters::*;
     use windows::Win32::Storage::FileSystem::*;
@@ -205,9 +348,6 @@ mod windows_impl {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-    fn identity_guid() -> GUID {
-        GUID::from_u128(0x2f6f3a10_7c1b_4c6a_9a1d_55f1a2b3c4d5)
     }
     fn file_handle(path: &Path, write: bool) -> Result<HANDLE, PlatformError> {
         let full = path.to_string_lossy().replace('/', "\\");
@@ -946,50 +1086,8 @@ mod windows_impl {
             Ok(())
         }
         fn register(&mut self, root: &Path) -> Result<(), PlatformError> {
+            // 只准备目录与记录根路径；外壳注册放在 connect() 里，与引擎连接同生命周期。
             std::fs::create_dir_all(root).map_err(|e| PlatformError::Path(e.to_string()))?;
-            let rw = wide(&root.to_string_lossy());
-            let pn = wide("Pandock");
-            let pv = wide(env!("CARGO_PKG_VERSION"));
-            let ident = *b"CLOUDDOCK-S1-000";
-            let reg = CF_SYNC_REGISTRATION {
-                StructSize: std::mem::size_of::<CF_SYNC_REGISTRATION>() as u32,
-                ProviderName: PCWSTR(pn.as_ptr()),
-                ProviderVersion: PCWSTR(pv.as_ptr()),
-                SyncRootIdentity: ident.as_ptr() as *const c_void,
-                SyncRootIdentityLength: ident.len() as u32,
-                FileIdentity: std::ptr::null(),
-                FileIdentityLength: 0,
-                ProviderId: identity_guid(),
-            };
-            let policies = CF_SYNC_POLICIES {
-                StructSize: std::mem::size_of::<CF_SYNC_POLICIES>() as u32,
-                Hydration: CF_HYDRATION_POLICY {
-                    Primary: CF_HYDRATION_POLICY_FULL,
-                    Modifier: CF_HYDRATION_POLICY_MODIFIER_NONE,
-                },
-                Population: CF_POPULATION_POLICY {
-                    Primary: CF_POPULATION_POLICY_FULL,
-                    Modifier: CF_POPULATION_POLICY_MODIFIER_NONE,
-                },
-                InSync: CF_INSYNC_POLICY_NONE,
-                HardLink: CF_HARDLINK_POLICY_NONE,
-                PlaceholderManagement: CF_PLACEHOLDER_MANAGEMENT_POLICY_DEFAULT,
-            };
-            unsafe {
-                match CfRegisterSyncRoot(
-                    PCWSTR(rw.as_ptr()),
-                    &reg,
-                    &policies,
-                    CF_REGISTER_FLAG_NONE,
-                ) {
-                    Ok(()) => {}
-                    // 0x800700B7 ERROR_ALREADY_EXISTS：重启后注册仍在，视为成功。
-                    Err(e) if e.code().0 as u32 == 0x800700B7 => {
-                        log::info!("native-sync sync root already registered");
-                    }
-                    Err(e) => return Err(PlatformError::Api(e.to_string())),
-                }
-            }
             if let Ok(mut slot) = self.runtime.root.write() {
                 *slot = Some(root.to_path_buf());
             }
@@ -1004,6 +1102,12 @@ mod windows_impl {
                 .root
                 .clone()
                 .ok_or_else(|| PlatformError::Path("未注册同步根".into()))?;
+            // 外壳层注册：导航栏节点、水合状态角标、状态列都由它带来。
+            // 依据微软 CloudMirror 官方示例，正确顺序是「外壳注册 → CfConnectSyncRoot」；
+            // 不使用 CfRegisterSyncRoot（旧的低层路径，混用会报 0x8007018B）。
+            // 之所以放在 connect 而非 register：外壳注册一旦存在，引擎未连接时资源管理器
+            // 访问该目录会直接报「云文件提供程序未运行」，因此两者必须同生命周期。
+            register_with_shell(&root)?;
             let rw = wide(&root.to_string_lossy());
             retain_process_context(&self.runtime)?;
             let k = unsafe {
@@ -1030,17 +1134,13 @@ mod windows_impl {
                 }
                 self.connection = None;
             }
+            // 引擎断开后必须撤销外壳注册，否则该目录在资源管理器中会变成不可访问。
+            unregister_from_shell()?;
             Ok(())
         }
         fn unregister(&mut self) -> Result<(), PlatformError> {
             self.disconnect()?;
-            if let Some(root) = self.root.take() {
-                let rw = wide(&root.to_string_lossy());
-                unsafe {
-                    CfUnregisterSyncRoot(PCWSTR(rw.as_ptr()))
-                        .map_err(|e| PlatformError::Api(e.to_string()))?;
-                }
-            }
+            self.root.take();
             Ok(())
         }
         fn create_placeholder(

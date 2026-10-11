@@ -1166,7 +1166,14 @@ pub fn run() {
                     let status = {
                         let mut guard = state.native_sync.lock().await;
                         match guard.as_mut() {
-                            Some(manager) => manager.reconnect_from_db().ok(),
+                            Some(manager) => match manager.reconnect_from_db() {
+                                Ok(status) => Some(status),
+                                // 不能静默吞掉：重连失败会让同步根目录在资源管理器里不可访问。
+                                Err(error) => {
+                                    log::warn!("native-sync autostart reconnect failed: {error}");
+                                    None
+                                }
+                            },
                             None => None,
                         }
                     };
