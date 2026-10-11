@@ -1110,15 +1110,25 @@ mod windows_impl {
             register_with_shell(&root)?;
             let rw = wide(&root.to_string_lossy());
             retain_process_context(&self.runtime)?;
-            let k = unsafe {
+            let connected = unsafe {
                 CfConnectSyncRoot(
                     PCWSTR(rw.as_ptr()),
                     CALLBACKS.as_ptr(),
                     Some(Arc::as_ptr(&self.runtime) as *const c_void),
                     CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
                 )
-            }
-            .map_err(|e| PlatformError::Api(e.to_string()))?;
+            };
+            let k = match connected {
+                Ok(k) => k,
+                Err(e) => {
+                    // 回滚：外壳注册已建立而引擎连接失败时，目录会变成不可访问，
+                    // 必须撤销外壳注册，避免把用户目录留在坏状态。
+                    if let Err(rollback) = unregister_from_shell() {
+                        log::warn!("native-sync shell rollback failed: {rollback}");
+                    }
+                    return Err(PlatformError::Api(e.to_string()));
+                }
+            };
             self.connection = Some(k);
             self.runtime.start_accepting();
             Ok(())
