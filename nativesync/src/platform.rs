@@ -483,8 +483,18 @@ mod windows_impl {
                 None,
             )
         };
-        r.map_err(|e| PlatformError::Api(format!("CfCreatePlaceholders 调用失败: {e}")))?;
+        r.map_err(|e| {
+            log::warn!(
+                "native-sync CfCreatePlaceholders call failed: parent={parent_full} error={e}"
+            );
+            PlatformError::Api(format!("CfCreatePlaceholders 调用失败: {e}"))
+        })?;
         if infos[0].Result.is_err() {
+            log::warn!(
+                "native-sync file placeholder failed: {} size={size} hr=0x{:08X}",
+                path.display(),
+                infos[0].Result.0 as u32
+            );
             return Err(PlatformError::Api(format!(
                 "CfCreatePlaceholders 条目失败: 0x{:08X}",
                 infos[0].Result.0 as u32
@@ -1161,6 +1171,9 @@ mod windows_impl {
             identity: &[u8],
         ) -> Result<(), PlatformError> {
             if path.exists() {
+                // 已存在即跳过。若该路径是被 create_dir_all 顺带建出的普通目录，
+                // 它会永远停留在"非占位符"状态——这是待修缺陷，先记录以便定位。
+                log::debug!("native-sync placeholder skipped (exists): {}", path.display());
                 return Ok(());
             }
             if let Some(p) = path.parent() {
@@ -1184,7 +1197,13 @@ mod windows_impl {
                 unsafe {
                     let _ = CloseHandle(h);
                 }
-                return r.map_err(|e| PlatformError::Api(e.to_string()));
+                return r.map_err(|e| {
+                    log::warn!(
+                        "native-sync dir placeholder convert failed: {} error={e}",
+                        path.display()
+                    );
+                    PlatformError::Api(e.to_string())
+                });
             }
             // P0-1: 在线文件占位符必须无磁盘数据。MARK_IN_SYNC + set_len 的满尺寸文件
             // 会被 Explorer 视为内容已在本地，双击不触发 FETCH_DATA，消费者读到全零。
