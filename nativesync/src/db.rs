@@ -146,7 +146,7 @@ impl IndexDb {
                 .execute("DELETE FROM remote_entry WHERE fs_id=?1", params![fs_id])
                 .map_err(|e| e.to_string())?;
         }
-        self.conn.execute("INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone) VALUES(?,?,?,?,?,?,?,?,?,0,0) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0",params![e.fs_id,e.parent_fs_id,e.remote_path,e.name,e.is_dir as i64,e.size,e.md5,e.modified_at,Option::<String>::None]).map_err(|e|e.to_string())?;
+        self.conn.execute("INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone) VALUES(?,?,?,?,?,?,?,?,?,0,0) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0",params![e.fs_id,e.parent_fs_id,e.remote_path,e.name,e.is_dir as i64,e.size,e.md5,e.modified_at,Option::<String>::None]).map_err(|err|format!("remote_entry 写入失败 fs_id={} path={} err={err}",e.fs_id,e.remote_path))?;
         self.conn.execute("INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?,?,1,?,?,?,0) ON CONFLICT(fs_id) DO UPDATE SET relative_path=excluded.relative_path",params![e.fs_id,e.relative_path,e.state.to_string(),e.pin_state.to_string(),e.error]).map_err(|e|e.to_string())?;
         Ok(())
     }
