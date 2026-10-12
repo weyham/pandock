@@ -112,3 +112,16 @@ scripts/deploy-dev.ps1
 
 **边界**：本节证明的是"提供程序不在时被拒绝且不挂起"与"提供程序在时会按需下载、内容逐字节一致"；
 "用户双击后能否被 shell 关联/编辑器打开"属于**体验层**，需用户在场时补充确认。
+
+### 门禁覆盖面差异（2026-10-12 实测）
+
+- 本地 `scripts/check.ps1` **不含** `cargo test -p pandock-app --lib`；该步骤由 **CI**（`windows-latest`／**MSVC**）执行并通过。
+- 本机为 **`x86_64-pc-windows-gnu`**（WinLibs UCRT，rustc 1.97.1 / LLVM 22.1.6），该测试二进制在本机**加载失败**：
+  `0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND`（缺 `WebView2Loader.dll` 时先报 `0xC0000135`）。
+- **在合并前的 `8718b54` 上、以全新独立 `CARGO_TARGET_DIR` 同样复现** ⇒ **本机 GNU 工具链固有、与代码无关、不影响发布产物**。
+- ⇒ 该步骤**只由 CI 把关**；**不要**把它加进本地 `check.ps1`，否则本地门禁会常量失败。
+- 机制层已排除：缺 `WebView2Loader.dll`（那是另一个错误码）、PATH 污染（干净 PATH 仍复现）、
+  `combase.dll`/`rpcrt4.dll` 导入缺失（导入符号均在其导出表中）、`WebView2Loader.dll` 符号不匹配（导入↔导出完全对应）。
+  **未能定位到具体缺失的导出符号**——继续深入需要加载器跟踪（通常需管理员）或 MSVC 对照（本机没有），
+  代价与收益不成比例，故**停止追查**（不编造机理）。
+
