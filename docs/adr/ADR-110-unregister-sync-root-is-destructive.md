@@ -66,6 +66,22 @@ ADR-108 原文一字不改。
 "已注册但未连接"的不可访问目录）。若该根**此前已有未水合占位符**，这条回滚会**永久删除**它们。
 建议后续改为：回滚前检查根下是否存在占位符，或改为保留注册并提示用户（不再用注销做回滚）。
 
+## 修订（2026-10-12，追加式）：连接失败的回滚也不再注销
+
+上面「已知残留风险」一节记录的问题**已在同一批次内修掉**：
+
+- `CfConnectSyncRoot` 失败时**不再注销**同步根，只 `warn`（记录 HRESULT、根路径、并说明
+  "保留注册，未注销"）；
+- 是否注销统一由纯函数裁决：
+  `sync_root_removal_action(SyncRootRemovalCause) -> SyncRootRemovalAction`，
+  起因只有两种——`Deliberate`（刻意移除，允许 `Unregister`）与
+  `ConnectFailure`（**恒为 `KeepRegistration`**）；
+- 单测 `only_deliberate_removal_is_allowed_to_unregister_the_sync_root` 穷举全部起因，
+  断言**唯一会返回 `Unregister` 的起因是刻意移除**；
+- 权衡：保留"已注册但未连接"的根 → 该目录在未连接期间报「云文件提供程序未运行」，
+  但**树与占位符都活着**，由下一次成功 `connect()` 后的自愈（`CfConvertToPlaceholder`）恢复；
+  注销是不可逆的破坏。**前者严格优于后者。**
+
 ## 验证方式（待部署后执行）
 
 1. **自愈生效**：用户点一次「立即同步」→ 7 个条目全部恢复为占位符（`fsutil` 有 Tag、attrs 出现 `0x400`），
