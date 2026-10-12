@@ -2953,9 +2953,20 @@ mod windows_impl {
                     "native-sync in-sync ok fs_id={fs_id} kind={}",
                     if is_dir { "dir" } else { "file" }
                 ),
-                InSyncRepair::Skip => log::debug!(
-                    "native-sync in-sync repair skipped fs_id={fs_id} attrs=0x{attrs:08X} (pending={has_pending_change} snapshot_ok={snapshot_matches})"
-                ),
+                // "看到了未同步却没动手"必须**可见**（info）；其余情形（读不到状态 / 不是占位符）保持 debug。
+                InSyncRepair::Skip => {
+                    if input.in_sync == Some(false) {
+                        log::info!(
+                            "native-sync in-sync repair skipped fs_id={fs_id} kind={} pending={has_pending_change} snapshot_ok={snapshot_matches} attrs=0x{attrs:08X} cf_placeholder={}",
+                            if is_dir { "dir" } else { "file" },
+                            input.is_placeholder
+                        );
+                    } else {
+                        log::debug!(
+                            "native-sync in-sync repair skipped fs_id={fs_id} (probe unavailable or not a placeholder)"
+                        );
+                    }
+                }
             }
         }
         fn create_placeholder(
