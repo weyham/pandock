@@ -28,6 +28,35 @@ pub(crate) fn is_placeholder_attrs(attrs: u32) -> bool {
         != 0
 }
 
+/// 需要"移除同步根"的两种起因。注销是**破坏性**的（会遍历整棵树，见 ADR-110），
+/// 因此必须把起因显式建模，并由 [`sync_root_removal_action`] 统一裁决。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncRootRemovalCause {
+    /// 用户在资源管理器/卸载流程里**刻意移除**同步根：允许注销。
+    Deliberate,
+    /// `CfConnectSyncRoot` 失败：**绝不注销**。
+    ConnectFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncRootRemovalAction {
+    KeepRegistration,
+    Unregister,
+}
+
+/// 裁决"某起因下是否注销同步根"。
+///
+/// **只有刻意移除才允许注销**：注销会遍历整棵树——已水合的占位符转回普通文件、
+/// **未水合的占位符被从本地永久删除**（ADR-110）。连接失败时保留注册虽然会让该目录在
+/// 未连接期间报「云文件提供程序未运行」，但**树与占位符都活着**，可由下一次成功连接后的
+/// 自愈（`CfConvertToPlaceholder`）恢复；注销是不可逆的破坏。前者严格优于后者。
+pub(crate) fn sync_root_removal_action(cause: SyncRootRemovalCause) -> SyncRootRemovalAction {
+    match cause {
+        SyncRootRemovalCause::Deliberate => SyncRootRemovalAction::Unregister,
+        SyncRootRemovalCause::ConnectFailure => SyncRootRemovalAction::KeepRegistration,
+    }
+}
+
 pub(crate) fn placeholder_repair_action(attrs: u32) -> PlaceholderRepair {
     if is_placeholder_attrs(attrs) {
         PlaceholderRepair::KeepInSync
@@ -2636,10 +2665,24 @@ mod windows_impl {
             let k = match connected {
                 Ok(k) => k,
                 Err(e) => {
-                    // 回滚：外壳注册已建立而引擎连接失败时，目录会变成不可访问，
-                    // 必须撤销外壳注册，避免把用户目录留在坏状态。
-                    if let Err(rollback) = unregister_from_shell() {
-                        log::warn!("native-sync shell rollback failed: {rollback}");
+                    // **不再用注销做回滚**（ADR-110）：注销会遍历整棵树，
+                    // 已水合的占位符转回普通文件、未水合的**从本地永久删除**。
+                    // 保留注册 → 该目录在未连接期间报「云文件提供程序未运行」，但树与占位符都活着，
+                    // 可被下一次成功 connect 后的自愈恢复。注销是不可逆的破坏，严格更差。
+                    match sync_root_removal_action(SyncRootRemovalCause::ConnectFailure) {
+                        SyncRootRemovalAction::KeepRegistration => log::warn!(
+                            "native-sync CfConnectSyncRoot failed (hr=0x{:08X}) for {}: \
+                             keeping the shell registration (NOT unregistering — that would \
+                             revert hydrated placeholders to normal files and permanently delete \
+                             un-hydrated ones)",
+                            e.code().0 as u32,
+                            root.display()
+                        ),
+                        SyncRootRemovalAction::Unregister => {
+                            if let Err(rollback) = unregister_from_shell() {
+                                log::warn!("native-sync shell rollback failed: {rollback}");
+                            }
+                        }
                     }
                     return Err(PlatformError::Api(e.to_string()));
                 }
@@ -2676,7 +2719,11 @@ mod windows_impl {
             // 只有**刻意的移除**（卸载 / 从资源管理器移除同步根）才允许注销，
             // 且调用方必须告知用户风险：未水合（仅在线）的占位符会被从本地永久删除。
             self.disconnect()?;
-            unregister_from_shell()?;
+            if sync_root_removal_action(SyncRootRemovalCause::Deliberate)
+                == SyncRootRemovalAction::Unregister
+            {
+                unregister_from_shell()?;
+            }
             self.root.take();
             Ok(())
         }
@@ -2857,6 +2904,34 @@ mod placeholder_repair_tests {
             );
             assert!(is_placeholder_attrs(attrs));
         }
+    }
+
+    /// **唯一**允许注销同步根的起因是"刻意移除"；连接失败必须保留注册。
+    /// （注销会遍历整棵树：已水合转普通文件、未水合的从本地永久删除。）
+    #[test]
+    fn only_deliberate_removal_is_allowed_to_unregister_the_sync_root() {
+        assert_eq!(
+            sync_root_removal_action(SyncRootRemovalCause::ConnectFailure),
+            SyncRootRemovalAction::KeepRegistration,
+            "连接失败绝不能注销同步根"
+        );
+        assert_eq!(
+            sync_root_removal_action(SyncRootRemovalCause::Deliberate),
+            SyncRootRemovalAction::Unregister
+        );
+        // 穷举所有起因：除 Deliberate 外都不得注销。
+        let unregister_causes: Vec<_> = [
+            SyncRootRemovalCause::Deliberate,
+            SyncRootRemovalCause::ConnectFailure,
+        ]
+        .into_iter()
+        .filter(|c| sync_root_removal_action(*c) == SyncRootRemovalAction::Unregister)
+        .collect();
+        assert_eq!(
+            unregister_causes,
+            vec![SyncRootRemovalCause::Deliberate],
+            "唯一会注销的起因只能是刻意移除"
+        );
     }
 
     /// 非占位符（事故现场实测的脱云属性）→ 走 convert 就地修复分支。
