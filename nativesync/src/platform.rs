@@ -13,7 +13,14 @@ pub(crate) enum PlaceholderRepair {
     ConvertToPlaceholder,
 }
 
-/// 依据文件属性判定路径是否已是 Cloud Files 占位符。
+/// **仅供诊断日志用**的属性线索：**不是**权威判定。
+///
+/// ⚠️ 真机实测（2026-10-12）：健康占位符 `db.sql`/`manifest.json`/`skills.zip` 的
+/// `GetFileAttributesW`、`GetFileAttributesExW`、Python `st_file_attributes`
+/// **都不含 `0x400 (REPARSE_POINT)`**（实测 0x00100020 / 0x00080020 / 0x00000020），
+/// 而 `fsutil reparsepoint query` 明确显示它们是重解析点（`Reparse Tag 0x9000601a`）。
+/// 即 Windows 对通用属性接口**隐藏**云占位符的重解析点标志。用它判定会让健康占位符被误判、
+/// 每次 `sync_now` 重复转换。权威判定见 `cf_is_placeholder`（CF 自身给出的结论）。
 ///
 /// 占位符必然是重解析点（`FILE_ATTRIBUTE_REPARSE_POINT`）；在线/按需占位符还会带
 /// `RECALL_ON_OPEN` / `RECALL_ON_DATA_ACCESS`。三者任一命中即视为占位符。
@@ -564,6 +571,31 @@ mod windows_impl {
     /// 一旦它错了——Explorer 会因此禁用「释放空间」并显示"同步挂起"箭头——我们就是盲的。
     /// 所以：**只在不是 `IN_SYNC` 时 `warn`**，正常与查询失败都走 `debug`，避免刷屏。
     /// 只记 `kind`（file/dir），不记文件名（隐私纪律）。
+    /// **CF 原生**判定：`CfGetPlaceholderInfo` 成功即说明该路径确实是本提供程序的占位符。
+    ///
+    /// 不用通用属性位（`GetFileAttributes*`）——Windows 对云占位符会隐藏 `0x400`，
+    /// 用它判定会让健康占位符被反复转换（真实缺陷，见 `is_placeholder_attrs` 的说明）。
+    fn cf_is_placeholder(path: &Path) -> bool {
+        let Ok(handle) = file_handle(path, false) else {
+            return true; // 打不开句柄时按"是占位符"处理，宁可不转换
+        };
+        let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 64];
+        let mut returned = 0u32;
+        let r = unsafe {
+            CfGetPlaceholderInfo(
+                handle,
+                CF_PLACEHOLDER_INFO_BASIC,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                Some(&mut returned),
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        r.is_ok()
+    }
+
     fn probe_in_sync_state(path: &Path) -> Option<bool> {
         let handle = file_handle(path, false).ok()?;
         let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 64];
@@ -2868,7 +2900,7 @@ mod windows_impl {
                 })
                 .unwrap_or(0);
             let input = InSyncRepairInput {
-                is_placeholder: is_placeholder_attrs(attrs),
+                is_placeholder: cf_is_placeholder(path),
                 has_pending_change,
                 snapshot_matches,
                 in_sync: probe_in_sync_state(path),
@@ -2906,7 +2938,7 @@ mod windows_impl {
                     if is_dir { "dir" } else { "file" }
                 ),
                 InSyncRepair::Skip => log::debug!(
-                    "native-sync in-sync repair skipped fs_id={fs_id} (pending={has_pending_change} snapshot_ok={snapshot_matches})"
+                    "native-sync in-sync repair skipped fs_id={fs_id} attrs=0x{attrs:08X} (pending={has_pending_change} snapshot_ok={snapshot_matches})"
                 ),
             }
         }
@@ -2926,7 +2958,12 @@ mod windows_impl {
                         m.file_attributes()
                     })
                     .unwrap_or(0);
-                match placeholder_repair_action(attrs) {
+                let cf_placeholder = cf_is_placeholder(path);
+                log::debug!(
+                    "native-sync existing-path probe attrs=0x{attrs:08X} attrs_hint={} cf_placeholder={cf_placeholder}",
+                    is_placeholder_attrs(attrs)
+                );
+                match placeholder_repair_action(if cf_placeholder { 1 } else { 0 }) {
                     // 本来就是占位符：确保被标记为「与云端已同步」，
                     // 否则 Explorer 状态列会一直显示「同步挂起」。
                     PlaceholderRepair::KeepInSync => {
@@ -3168,6 +3205,20 @@ mod placeholder_repair_tests {
                 in_sync_repair_action(bad),
                 InSyncRepair::Skip,
                 "内容可能被本地改过时绝不能置为已同步: {bad:?}"
+            );
+        }
+    }
+
+    /// 事故回归：**通用属性位不能用来判断占位符**。
+    /// 真机实测这三种值正是健康占位符的 `GetFileAttributes*` 返回（都不含 `0x400`）；
+    /// 若据此判定，每次 `sync_now` 都会把健康占位符重新转换一遍。
+    /// 权威判定是 CF 自身（`CfGetPlaceholderInfo` 成功 = 占位符）。
+    #[test]
+    fn generic_attribute_bits_are_not_a_reliable_placeholder_signal() {
+        for attrs in [0x0010_0020u32, 0x0008_0020, 0x0000_0020] {
+            assert!(
+                !is_placeholder_attrs(attrs),
+                "attrs=0x{attrs:X} 不含重解析点/召回位 —— 它其实是健康占位符（陷阱）"
             );
         }
     }
