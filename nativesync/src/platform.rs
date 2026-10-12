@@ -136,7 +136,8 @@ mod windows_impl {
             let mut sid = windows::core::PWSTR::null();
             ConvertSidToStringSidW(user.User.Sid, &mut sid)
                 .map_err(|e| PlatformError::Api(e.to_string()))?;
-            sid.to_string().map_err(|e| PlatformError::Api(e.to_string()))
+            sid.to_string()
+                .map_err(|e| PlatformError::Api(e.to_string()))
         }
     }
 
@@ -169,17 +170,17 @@ mod windows_impl {
     /// 「StorageProviderSyncRootManager.Register + CfConnectSyncRoot」，
     /// 不使用 CfRegisterSyncRoot；两者混用会返回 0x8007018B（已拒绝访问云文件）。
     fn register_with_shell(root: &Path) -> Result<(), PlatformError> {
+        use windows::core::Interface;
         use windows::Storage::Provider::{
             StorageProviderHydrationPolicy, StorageProviderHydrationPolicyModifier,
             StorageProviderInSyncPolicy, StorageProviderPopulationPolicy,
             StorageProviderSyncRootInfo, StorageProviderSyncRootManager,
         };
-        use windows::core::Interface;
         use windows::Storage::StorageFolder;
 
         let id = shell_sync_root_id()?;
-        let info = StorageProviderSyncRootInfo::new()
-            .map_err(|e| PlatformError::Api(e.to_string()))?;
+        let info =
+            StorageProviderSyncRootInfo::new().map_err(|e| PlatformError::Api(e.to_string()))?;
 
         let folder = StorageFolder::GetFolderFromPathAsync(&windows::core::HSTRING::from(
             root.to_string_lossy().as_ref(),
@@ -205,14 +206,12 @@ mod windows_impl {
         set(info.SetVersion(&windows::core::HSTRING::from(env!("CARGO_PKG_VERSION"))))?;
         // 按需水合：占位符可在线、可固定到本地。
         set(info.SetHydrationPolicy(StorageProviderHydrationPolicy::Full))?;
-        set(info.SetHydrationPolicyModifier(
-            StorageProviderHydrationPolicyModifier::None,
-        ))?;
+        set(info.SetHydrationPolicyModifier(StorageProviderHydrationPolicyModifier::None))?;
         set(info.SetPopulationPolicy(StorageProviderPopulationPolicy::Full))?;
         set(info.SetInSyncPolicy(StorageProviderInSyncPolicy::Default))?;
-        set(info.SetHardlinkPolicy(
-            windows::Storage::Provider::StorageProviderHardlinkPolicy::None,
-        ))?;
+        set(
+            info.SetHardlinkPolicy(windows::Storage::Provider::StorageProviderHardlinkPolicy::None)
+        )?;
         set(info.SetAllowPinning(true))?;
         set(info.SetShowSiblingsAsGroup(false))?;
 
@@ -233,7 +232,8 @@ mod windows_impl {
     fn unregister_from_shell() -> Result<(), PlatformError> {
         use windows::Storage::Provider::StorageProviderSyncRootManager;
         let id = shell_sync_root_id()?;
-        match StorageProviderSyncRootManager::Unregister(&windows::core::HSTRING::from(id.as_str())) {
+        match StorageProviderSyncRootManager::Unregister(&windows::core::HSTRING::from(id.as_str()))
+        {
             Ok(()) => {}
             Err(e) => {
                 let code = e.code().0 as u32;
@@ -687,7 +687,8 @@ mod windows_impl {
         if let Ok(hydrated) = &result {
             if hydrated.full_file {
                 if let Some(root) = runtime.root.read().ok().and_then(|guard| guard.clone()) {
-                    let local = root.join(relative_for_mark.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    let local =
+                        root.join(relative_for_mark.replace('/', std::path::MAIN_SEPARATOR_STR));
                     if let Err(error) = mark_path_in_sync(&local) {
                         log::warn!(
                             "native-sync mark in-sync failed after hydration: fs_id={file_id} error={error}"

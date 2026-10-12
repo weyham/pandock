@@ -4,10 +4,8 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).ok_or("缺少 db 路径")?;
-    let conn = rusqlite::Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
     println!("== sync_root ==");
     let mut st = conn.prepare("SELECT id,root_path,state,enabled FROM sync_root")?;
@@ -20,7 +18,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             r.get::<_, i64>(3)?
         ))
     })?;
-    for r in rows { println!("{}", r?); }
+    for r in rows {
+        println!("{}", r?);
+    }
 
     println!("== remote_entry ==");
     let mut st = conn.prepare(
@@ -36,7 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     })?;
     let mut count = 0;
-    for r in rows { println!("{}", r?); count += 1; }
+    for r in rows {
+        println!("{}", r?);
+        count += 1;
+    }
     println!("  共 {count} 行");
 
     println!("== local_state ==");
@@ -52,6 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             r.get::<_, String>(1)?
         ))
     })?;
-    for r in rows { println!("{}", r?); }
+    for r in rows {
+        println!("{}", r?);
+    }
     Ok(())
 }

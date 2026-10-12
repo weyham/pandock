@@ -12,8 +12,9 @@
 
 use windows::core::{Interface, Result, HSTRING};
 use windows::Storage::Provider::{
-    StorageProviderHydrationPolicy, StorageProviderHydrationPolicyModifier, StorageProviderInSyncPolicy,
-    StorageProviderPopulationPolicy, StorageProviderSyncRootInfo, StorageProviderSyncRootManager,
+    StorageProviderHydrationPolicy, StorageProviderHydrationPolicyModifier,
+    StorageProviderInSyncPolicy, StorageProviderPopulationPolicy, StorageProviderSyncRootInfo,
+    StorageProviderSyncRootManager,
 };
 use windows::Storage::StorageFolder;
 
