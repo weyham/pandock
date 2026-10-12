@@ -49,7 +49,7 @@ pub(crate) enum PlaceholderRepair {
 /// `GetFileAttributesW`、`GetFileAttributesExW`、Python `st_file_attributes`
 /// **都不含 `0x400 (REPARSE_POINT)`**（实测 0x00100020 / 0x00080020 / 0x00000020），
 /// 而 `fsutil reparsepoint query` 明确显示它们是重解析点（`Reparse Tag 0x9000601a`）。
-/// 即 Windows 对通用属性接口**隐藏**云占位符的重解析点标志。用它判定会让健康占位符被误判、
+/// 即**该读取路径不返回** `REPARSE_POINT`（同期 PowerShell 属性读取却返回；机制未确定，可能取决于底层 API）。用它判定会让健康占位符被误判、
 /// 每次 `sync_now` 重复转换。权威判定见 `cf_is_placeholder`（CF 自身给出的结论）。
 ///
 /// 占位符必然是重解析点（`FILE_ATTRIBUTE_REPARSE_POINT`）；在线/按需占位符还会带
