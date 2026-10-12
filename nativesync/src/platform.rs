@@ -3210,6 +3210,43 @@ mod windows_impl {
                 }
             }
             let r = unsafe { CfDehydratePlaceholder(h, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) };
+
+            // **顺序（事故后修正）**：脱水 → **先验真** `OnDiskDataSize == 0` → **再**归一 pin。
+            // 若先归一、而文件其实又被水合回来，会出现「归一 → 又水合 → pin 又回 UNPINNED」的来回抖动；
+            // 更严重的是「看起来成功、其实没释放」。所以验证不过 ⇒ 保留 pin + warn + **返回可感知失败**。
+            if r.is_ok() {
+                let mut std_buf =
+                    vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 64];
+                let mut std_ret = 0u32;
+                let on_disk = if unsafe {
+                    CfGetPlaceholderInfo(
+                        h,
+                        CF_PLACEHOLDER_INFO_STANDARD,
+                        std_buf.as_mut_ptr() as *mut c_void,
+                        std_buf.len() as u32,
+                        Some(&mut std_ret),
+                    )
+                }
+                .is_ok()
+                {
+                    Some(unsafe {
+                        (*(std_buf.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO)).OnDiskDataSize
+                    })
+                } else {
+                    None
+                };
+                if on_disk != Some(0) {
+                    log::warn!(
+                        "native-sync dehydrate verification failed op=CfDehydratePlaceholder OnDiskDataSize={on_disk:?} (expected 0) -- pin NOT normalized"
+                    );
+                    unsafe {
+                        let _ = CloseHandle(h);
+                    }
+                    return Err(PlatformError::Api(format!(
+                        "脱水后本地数据未清空（OnDiskDataSize={on_disk:?}）；已保留 pin 状态，未归一"
+                    )));
+                }
+            }
             if r.is_ok()
                 && dehydrate_post_action(pin_before) == DehydratePostAction::NormalizeToUnspecified
             {
