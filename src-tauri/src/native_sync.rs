@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
-fn map_error(error: NativeSyncError) -> String {
+/// 命令边界的失败留痕：任何返回给 UI 的错误都在这里 warn 一次（命令名 + 错误内容，不含文件名）。
+fn fail(command: &str, error: NativeSyncError) -> String {
+    log::warn!("native-sync command failed cmd={command} error={error}");
     error.to_string()
 }
 
@@ -73,13 +75,15 @@ async fn ensure_manager_guard(
     guard: &mut tokio::sync::MutexGuard<'_, Option<NativeSyncManager>>,
 ) -> Result<(), String> {
     if guard.is_none() {
+        log::warn!("native-sync manager was absent; recreated (state rebuilt from SQLite)");
         let data_dir = app
             .state::<AppState>()
             .data_dir
             .lock()
             .map_err(|_| "无法读取应用数据目录".to_string())?
             .clone();
-        let mut manager = NativeSyncManager::new(&data_dir, None).map_err(map_error)?;
+        let mut manager =
+            NativeSyncManager::new(&data_dir, None).map_err(|e| fail("unknown", e))?;
         // 配置文件里的紧急开关；环境变量优先级更高（在 manager 内部解析）。
         if let Ok(config) = app.state::<AppState>().config.lock() {
             manager.set_notifications_config(config.native_sync_notifications);
@@ -129,7 +133,7 @@ pub async fn native_sync_status(app: AppHandle) -> Result<NativeSyncStatusView, 
         .as_ref()
         .expect("manager initialized")
         .status()
-        .map_err(map_error)
+        .map_err(|e| fail("native_sync_status", e))
 }
 #[tauri::command]
 pub async fn native_sync_enable(
@@ -144,7 +148,7 @@ pub async fn native_sync_enable(
             .as_mut()
             .expect("manager initialized")
             .enable(root_path.map(PathBuf::from))
-            .map_err(map_error)?
+            .map_err(|e| fail("native_sync_enable", e))?
     };
     emit_state(&app, &status);
     Ok(status)
@@ -177,7 +181,7 @@ pub async fn native_sync_disable(
             .as_mut()
             .expect("manager initialized")
             .disable(unregister.unwrap_or(false))
-            .map_err(map_error)?
+            .map_err(|e| fail("native_sync_disable", e))?
     };
     emit_state(&app, &status);
     Ok(status)
@@ -201,7 +205,7 @@ pub async fn native_sync_sync_now(app: AppHandle) -> Result<NativeSyncStatusView
     let status = {
         let mut guard = state.native_sync.lock().await;
         *guard = Some(manager);
-        result.map_err(map_error)?
+        result.map_err(|e| fail("native_sync_sync_now", e))?
     };
     emit_state(&app, &status);
     Ok(status)
@@ -221,7 +225,7 @@ pub async fn native_sync_list(
         .as_ref()
         .expect("manager initialized")
         .list(parent_path, cursor, limit.unwrap_or(100))
-        .map_err(map_error)
+        .map_err(|e| fail("native_sync_list", e))
 }
 #[tauri::command]
 pub async fn native_sync_action(
@@ -240,7 +244,7 @@ pub async fn native_sync_action(
                 relative_path,
                 action,
             })
-            .map_err(map_error)?
+            .map_err(|e| fail("native_sync_action", e))?
     };
     emit_state(&app, &status);
     Ok(status)
@@ -283,7 +287,7 @@ pub async fn native_sync_open_in_explorer(
         .as_ref()
         .expect("manager initialized")
         .open_path(&relative_path)
-        .map_err(map_error)?;
+        .map_err(|e| fail("native_sync_open_in_explorer", e))?;
     let target = if path.is_dir() {
         path
     } else {

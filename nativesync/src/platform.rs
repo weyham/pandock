@@ -693,7 +693,13 @@ mod windows_impl {
         unsafe {
             let _ = CloseHandle(handle);
         }
-        result.map_err(|e| PlatformError::Api(e.to_string()))
+        result.map_err(|e| {
+            log::warn!(
+                "native-sync CfSetInSyncState failed op=mark_in_sync hr=0x{:08X}",
+                e.code().0 as u32
+            );
+            PlatformError::Api(e.to_string())
+        })
     }
 
     fn placeholder_fs_metadata(size: u64) -> CF_FS_METADATA {
@@ -2867,7 +2873,13 @@ mod windows_impl {
             self.runtime.stop_accepting_and_wait();
             if let Some(k) = self.connection {
                 unsafe {
-                    CfDisconnectSyncRoot(k).map_err(|e| PlatformError::Api(e.to_string()))?;
+                    CfDisconnectSyncRoot(k).map_err(|e| {
+                        log::warn!(
+                            "native-sync CfDisconnectSyncRoot failed hr=0x{:08X}",
+                            e.code().0 as u32
+                        );
+                        PlatformError::Api(e.to_string())
+                    })?;
                 }
                 self.connection = None;
             }
@@ -3095,7 +3107,13 @@ mod windows_impl {
             unsafe {
                 let _ = CloseHandle(h);
             }
-            r.map_err(|e| PlatformError::Api(e.to_string()))
+            r.map_err(|e| {
+                log::warn!(
+                    "native-sync CfSetPinState failed hr=0x{:08X}",
+                    e.code().0 as u32
+                );
+                PlatformError::Api(e.to_string())
+            })
         }
         fn dehydrate(&mut self, path: &Path) -> Result<(), PlatformError> {
             // 应用自身发起的脱水会产生 NOTIFY_DEHYDRATE「自杀回调」，先立守卫。
@@ -3105,7 +3123,13 @@ mod windows_impl {
             unsafe {
                 let _ = CloseHandle(h);
             }
-            r.map_err(|e| PlatformError::Api(e.to_string()))
+            r.map_err(|e| {
+                log::warn!(
+                    "native-sync CfDehydratePlaceholder failed hr=0x{:08X}",
+                    e.code().0 as u32
+                );
+                PlatformError::Api(e.to_string())
+            })
         }
         fn pin_state(&self, path: &Path) -> Option<bool> {
             use std::os::windows::fs::MetadataExt;
