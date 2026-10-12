@@ -4,6 +4,38 @@ use pandock_core::cloud::RemotePath;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// 已存在路径的占位符修复动作（纯决策，便于跨平台单测）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaceholderRepair {
+    /// 本来就是占位符：只维持 in-sync 标记。
+    KeepInSync,
+    /// 不是占位符（例如被注销转成了普通文件）：就地转回占位符。
+    ConvertToPlaceholder,
+}
+
+/// 依据文件属性判定路径是否已是 Cloud Files 占位符。
+///
+/// 占位符必然是重解析点（`FILE_ATTRIBUTE_REPARSE_POINT`）；在线/按需占位符还会带
+/// `RECALL_ON_OPEN` / `RECALL_ON_DATA_ACCESS`。三者任一命中即视为占位符。
+pub(crate) fn is_placeholder_attrs(attrs: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+    const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    attrs
+        & (FILE_ATTRIBUTE_REPARSE_POINT
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+        != 0
+}
+
+pub(crate) fn placeholder_repair_action(attrs: u32) -> PlaceholderRepair {
+    if is_placeholder_attrs(attrs) {
+        PlaceholderRepair::KeepInSync
+    } else {
+        PlaceholderRepair::ConvertToPlaceholder
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
     #[error("NativeSync 当前平台不可用: {0}")]
@@ -2632,12 +2664,19 @@ mod windows_impl {
                 }
                 self.connection = None;
             }
-            // 引擎断开后必须撤销外壳注册，否则该目录在资源管理器中会变成不可访问。
-            unregister_from_shell()?;
+            // **故意不注销外壳注册**（ADR-110）：
+            // 注销（`StorageProviderSyncRootManager.Unregister` / `CfUnregisterSyncRoot`）会
+            // **遍历整棵树**——已水合的占位符被转回普通文件、**未水合的占位符被从本地永久删除**。
+            // 干净退出时注销，等于用户每关一次应用就把整棵同步树脱云（真实事故）。
+            // 保持注册与 ADR-108 的明文意图一致（"应用退出后同步根保留、与 OneDrive 一致"），
+            // 代价是应用关闭期间该目录报「云文件提供程序未运行」（ADR-110 已记录）。
             Ok(())
         }
         fn unregister(&mut self) -> Result<(), PlatformError> {
+            // 只有**刻意的移除**（卸载 / 从资源管理器移除同步根）才允许注销，
+            // 且调用方必须告知用户风险：未水合（仅在线）的占位符会被从本地永久删除。
             self.disconnect()?;
+            unregister_from_shell()?;
             self.root.take();
             Ok(())
         }
@@ -2649,13 +2688,55 @@ mod windows_impl {
             identity: &[u8],
         ) -> Result<(), PlatformError> {
             if path.exists() {
-                // 已存在（重启后的正常路径）：只需确保它被标记为「与云端已同步」，
-                // 否则 Explorer 状态列会一直显示「同步挂起」。
-                if let Err(error) = mark_path_in_sync(path) {
-                    log::debug!(
-                        "native-sync mark in-sync skipped for existing path: {} error={error}",
-                        path.display()
-                    );
+                // 已存在：按属性区分两种情形（决策函数见 `placeholder_repair_action`，
+                // 纯函数、有单测）。
+                let attrs = std::fs::metadata(path)
+                    .map(|m| {
+                        use std::os::windows::fs::MetadataExt;
+                        m.file_attributes()
+                    })
+                    .unwrap_or(0);
+                match placeholder_repair_action(attrs) {
+                    // 本来就是占位符：确保被标记为「与云端已同步」，
+                    // 否则 Explorer 状态列会一直显示「同步挂起」。
+                    PlaceholderRepair::KeepInSync => {
+                        if let Err(error) = mark_path_in_sync(path) {
+                            log::debug!(
+                                "native-sync mark in-sync skipped for existing path: {} error={error}",
+                                path.display()
+                            );
+                        }
+                    }
+                    // 已存在但**不是占位符**（例如曾被注销转成普通文件）：就地转回占位符。
+                    // 这是唯一非破坏性的自愈手段——保留内容与 PINNED 位。
+                    PlaceholderRepair::ConvertToPlaceholder => {
+                        let h = file_handle(path, true)?;
+                        let mut usn = 0;
+                        let r = unsafe {
+                            CfConvertToPlaceholder(
+                                h,
+                                Some(identity.as_ptr() as *const c_void),
+                                identity.len() as u32,
+                                CF_CONVERT_FLAG_MARK_IN_SYNC,
+                                Some(&mut usn),
+                                None,
+                            )
+                        };
+                        unsafe {
+                            let _ = CloseHandle(h);
+                        }
+                        if let Err(error) = r {
+                            log::warn!(
+                                "native-sync self-heal convert-to-placeholder failed: {} hr=0x{:08X}",
+                                path.display(),
+                                error.code().0 as u32
+                            );
+                            return Err(PlatformError::Api(error.to_string()));
+                        }
+                        log::info!(
+                            "native-sync self-healed existing path back to a placeholder (dir={is_dir})"
+                        );
+                    }
                 }
                 return Ok(());
             }
@@ -2759,6 +2840,39 @@ mod windows_impl {
 }
 #[cfg(windows)]
 use windows_impl::WindowsPlatform;
+
+#[cfg(test)]
+mod placeholder_repair_tests {
+    use super::*;
+
+    /// 已是占位符 → 维持 in-sync（**不**走 convert 分支）。
+    #[test]
+    fn existing_placeholders_keep_in_sync_and_are_not_converted() {
+        // 真实占位符属性：目录 0x420、在线文件 0x100420、固定文件 0x80420、纯重解析点 0x400
+        for attrs in [0x420u32, 0x0010_0420, 0x0008_0420, 0x0000_0400] {
+            assert_eq!(
+                placeholder_repair_action(attrs),
+                PlaceholderRepair::KeepInSync,
+                "attrs=0x{attrs:X} 应被判为占位符"
+            );
+            assert!(is_placeholder_attrs(attrs));
+        }
+    }
+
+    /// 非占位符（事故现场实测的脱云属性）→ 走 convert 就地修复分支。
+    #[test]
+    fn existing_normal_files_are_converted_back_to_placeholders() {
+        // 实测值：db.sql 0x100020、manifest.json 0x80020、skills.zip 0x20、目录 0x10
+        for attrs in [0x0010_0020u32, 0x0008_0020, 0x0000_0020, 0x0000_0010, 0x0] {
+            assert_eq!(
+                placeholder_repair_action(attrs),
+                PlaceholderRepair::ConvertToPlaceholder,
+                "attrs=0x{attrs:X} 不是占位符，必须走 convert 修复"
+            );
+            assert!(!is_placeholder_attrs(attrs));
+        }
+    }
+}
 
 #[cfg(all(test, not(windows)))]
 mod stub_tests {

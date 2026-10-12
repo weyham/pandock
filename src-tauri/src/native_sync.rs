@@ -149,11 +149,26 @@ pub async fn native_sync_enable(
     emit_state(&app, &status);
     Ok(status)
 }
+/// 停用 NativeSync。
+///
+/// **默认（`unregister` 缺省或 `false`）只是断开引擎**，同步根注册保留——这不会改动
+/// 本地文件，且关闭应用期间的不可访问属预期（ADR-110）。
+///
+/// `unregister = true` 是**破坏性**操作：注销同步根会让平台遍历整棵树，
+/// **已水合的占位符被转回普通文件、未水合（仅在线）的占位符被从本地永久删除**
+/// （云端数据仍在）。只应由"从资源管理器移除同步根 / 卸载"这类显式路径使用；
+/// 设置页的"停止同步"不得传 `true`。
 #[tauri::command]
 pub async fn native_sync_disable(
     app: AppHandle,
     unregister: Option<bool>,
 ) -> Result<NativeSyncStatusView, String> {
+    if unregister == Some(true) {
+        log::warn!(
+            "native-sync disable requested WITH unregister=true: this traverses the sync root and \
+             reverts hydrated placeholders to normal files while permanently deleting un-hydrated ones"
+        );
+    }
     ensure_manager(&app).await?;
     let state = app.state::<AppState>();
     let status = {
