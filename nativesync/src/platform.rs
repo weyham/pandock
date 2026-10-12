@@ -41,6 +41,8 @@ pub(crate) enum PlaceholderRepair {
     KeepInSync,
     /// 不是占位符（例如被注销转成了普通文件）：就地转回占位符。
     ConvertToPlaceholder,
+    /// 无法确定是不是占位符，且**没有索引证据** ⇒ 不动作（本地新建文件不归自愈管）。
+    LeaveUntouched,
 }
 
 /// **仅供诊断日志用**的属性线索：**不是**权威判定。
@@ -94,11 +96,26 @@ pub(crate) fn sync_root_removal_action(cause: SyncRootRemovalCause) -> SyncRootR
     }
 }
 
-pub(crate) fn placeholder_repair_action(is_placeholder: bool) -> PlaceholderRepair {
-    if is_placeholder {
-        PlaceholderRepair::KeepInSync
-    } else {
-        PlaceholderRepair::ConvertToPlaceholder
+/// 已存在路径的占位符修复动作（纯决策，便于跨平台单测）。
+///
+/// 三态 + 索引知情（2026-10-12，修法由开发总监给定）：
+///   * `Placeholder`              → `KeepInSync`（照旧）
+///   * `NotPlaceholder`           → `ConvertToPlaceholder`（照旧；受止血闸门节制，见调用点）
+///   * `Unknown` + **有索引条目** → `ConvertToPlaceholder`：该路径曾经在索引里 ⇒ 它曾经是
+///     云端同步来的占位符、**身份丢了**——就地转回占位符（对健康占位符 `CfConvertToPlaceholder`
+///     只会返回 INVALID_REQUEST，无害）。
+///   * `Unknown` + 无索引条目    → `LeaveUntouched`：本地新建文件不归自愈管。
+///
+/// 关键：**不再扩充错误码清单**（那是无底洞）；探测答不出来时改问**索引**。
+pub(crate) fn placeholder_repair_action(
+    probe: PlaceholderProbe,
+    indexed: bool,
+) -> PlaceholderRepair {
+    match probe {
+        PlaceholderProbe::Placeholder => PlaceholderRepair::KeepInSync,
+        PlaceholderProbe::NotPlaceholder => PlaceholderRepair::ConvertToPlaceholder,
+        PlaceholderProbe::Unknown if indexed => PlaceholderRepair::ConvertToPlaceholder,
+        PlaceholderProbe::Unknown => PlaceholderRepair::LeaveUntouched,
     }
 }
 
@@ -669,6 +686,41 @@ mod windows_impl {
     ///
     /// 不用通用属性位（`GetFileAttributes*`）——Windows 对云占位符会隐藏 `0x400`，
     /// 用它判定会让健康占位符被反复转换（真实缺陷，见 `is_placeholder_attrs` 的说明）。
+    /// 该路径是否在索引里有条目（== 它曾经是云端同步来的占位符、身份丢了）。
+    ///
+    /// 供"索引知情"自愈规则用；**任何失败一律按"不在"处理**（保守：不动它）。
+    /// 代价可控：只在"探测答不出来"时才查一次库（sync_now 每轮通常没有这种情况）。
+    fn is_indexed_path(runtime: &Arc<Runtime>, path: &Path) -> bool {
+        let Some(root) = runtime
+            .root
+            .read()
+            .ok()
+            .and_then(|v| v.clone())
+            .map(|p| p.to_string_lossy().to_string())
+        else {
+            return false;
+        };
+        let key = path.to_string_lossy().replace('\\', "/");
+        let Some(relative) = crate::notify::relative_from_normalized(&key, &root) else {
+            return false;
+        };
+        let Some(relative) = crate::notify::sanitize_relative(&relative) else {
+            return false;
+        };
+        let Some(db_path) = runtime.state_db.read().ok().and_then(|v| v.clone()) else {
+            return false;
+        };
+        let Some(data_dir) = db_path.parent().and_then(|p| p.parent()) else {
+            return false;
+        };
+        let Ok(db) = crate::db::IndexDb::open(data_dir) else {
+            return false;
+        };
+        db.entry_by_relative(&relative)
+            .map(|entry| entry.is_some())
+            .unwrap_or(false)
+    }
+
     fn placeholder_probe(path: &Path) -> PlaceholderProbe {
         let Ok(handle) = file_handle(path, false) else {
             return PlaceholderProbe::Unknown; // 打不开句柄 ⇒ 不确定 ⇒ 宁可不转换
@@ -820,6 +872,27 @@ mod windows_impl {
             ),
             Err(err) => log::warn!("native-sync mark NOT_IN_SYNC failed fs_id={fs_id:?}: {err}"),
         }
+    }
+
+    /// 就地转回占位符（索引知情自愈用）：保留现有内容与 PINNED 位。
+    /// 健康占位符会被平台拒绝（INVALID_REQUEST），无害。
+    fn convert_existing_to_placeholder(path: &Path, identity: &[u8]) -> Result<(), PlatformError> {
+        let handle = file_handle(path, true)?;
+        let mut usn = 0i64;
+        let r = unsafe {
+            CfConvertToPlaceholder(
+                handle,
+                Some(identity.as_ptr() as *const c_void),
+                identity.len() as u32,
+                CF_CONVERT_FLAG_MARK_IN_SYNC,
+                Some(&mut usn),
+                None,
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        r.map_err(|e| PlatformError::Api(e.to_string()))
     }
 
     fn mark_path_in_sync(path: &Path) -> Result<(), PlatformError> {
@@ -3292,25 +3365,22 @@ mod windows_impl {
                     })
                     .unwrap_or(0);
                 let probe = placeholder_probe(path);
-                let cf_placeholder = probe == PlaceholderProbe::Placeholder;
                 log::debug!(
-                    "native-sync existing-path probe attrs=0x{attrs:08X} attrs_hint={} cf_placeholder={cf_placeholder}",
+                    "native-sync existing-path probe attrs=0x{attrs:08X} attrs_hint={} probe={probe:?}",
                     is_placeholder_attrs(attrs)
                 );
                 if let Ok(mut stats) = self.probe_stats.lock() {
                     stats.0 += 1;
-                    if cf_placeholder {
+                    if probe == PlaceholderProbe::Placeholder {
                         stats.1 += 1;
                     }
                 }
-                if probe == PlaceholderProbe::Unknown {
-                    // 「不确定」必须保守：不转换、也不标记，避免把健康占位符改坏。
-                    log::debug!(
-                        "native-sync existing path probe inconclusive; leaving path untouched"
-                    );
-                    return Ok(());
-                }
-                match placeholder_repair_action(cf_placeholder) {
+                // 索引知情（2026-10-12）：「不确定」时若该路径**在索引里有条目** ⇒ 它曾经是
+                // 云端同步来的占位符、身份丢了 ⇒ 就地转回占位符；无索引条目 ⇒ 本地新建文件，
+                // 不归自愈管，不动作。
+                let indexed =
+                    probe == PlaceholderProbe::Unknown && is_indexed_path(&self.runtime, path);
+                match placeholder_repair_action(probe, indexed) {
                     // 本来就是占位符：确保被标记为「与云端已同步」，
                     // 否则 Explorer 状态列会一直显示「同步挂起」。
                     PlaceholderRepair::KeepInSync => {
@@ -3322,17 +3392,34 @@ mod windows_impl {
                         }
                         probe_in_sync(path, if is_dir { "dir" } else { "file" });
                     }
-                    // 已存在但**不是占位符**（例如曾被注销转成普通文件）：就地转回占位符。
-                    // 这是唯一非破坏性的自愈手段——保留内容与 PINNED 位。
                     PlaceholderRepair::ConvertToPlaceholder => {
-                        // **止血（2026-10-12）**：自动转换当前被**闸门**关闭。
-                        // 缘由：探测结论尚未与 CF 层真值逐条对齐——曾因判定传递错误，
-                        // 对**健康的占位符**反复发起 CfConvertToPlaceholder 并全部失败（0x8007017C）。
-                        // 恢复条件：用诊断模式证明"探测结论 == CF 真值"后，才允许重新启用
-                        // （届时单独提交 + 失败测试）。
-                        log::warn!(
-                            "native-sync would convert existing path back to a placeholder, but auto-conversion is gated pending probe validation run={} (dir={is_dir}) attrs=0x{attrs:08X}",
-                            self.run_id.load(std::sync::atomic::Ordering::Relaxed)
+                        if probe == PlaceholderProbe::Unknown {
+                            // 索引知情分支：**绕过**止血闸门——闸门防的是"探测误判健康占位符"
+                            //（曾因判定传递错误，对健康占位符反复发起 CfConvertToPlaceholder 并全部
+                            // 失败 0x8007017C），而这一路的证据来自**索引**（曾在索引里 ⇒ 曾经是
+                            // 占位符），不是探测；且对健康占位符 CfConvertToPlaceholder 只会返回
+                            // INVALID_REQUEST（无害，不改动它）。
+                            if let Err(error) = convert_existing_to_placeholder(path, identity) {
+                                log::warn!(
+                                    "native-sync convert existing path back to placeholder failed: {} error={error}",
+                                    path.display()
+                                );
+                            }
+                        } else {
+                            // 探测型 NotPlaceholder：止血闸门照旧（只 warn，不动它）。
+                            // 缘由：探测结论尚未与 CF 层真值逐条对齐——曾因判定传递错误，
+                            // 对**健康的占位符**反复发起 CfConvertToPlaceholder 并全部失败（0x8007017C）。
+                            // 恢复条件：用诊断模式证明"探测结论 == CF 真值"后，才允许重新启用
+                            //（届时单独提交 + 失败测试）。
+                            log::warn!(
+                                "native-sync would convert existing path back to a placeholder, but auto-conversion is gated pending probe validation run={} (dir={is_dir}) attrs=0x{attrs:08X}",
+                                self.run_id.load(std::sync::atomic::Ordering::Relaxed)
+                            );
+                        }
+                    }
+                    PlaceholderRepair::LeaveUntouched => {
+                        log::debug!(
+                            "native-sync existing path probe inconclusive and not indexed; leaving path untouched"
                         );
                     }
                 }
@@ -3551,7 +3638,7 @@ mod placeholder_repair_tests {
     fn existing_placeholders_keep_in_sync_and_are_not_converted() {
         // 判定输入现在是 **CF 原生结论**（三态里的 Placeholder），不再是通用属性位。
         assert_eq!(
-            placeholder_repair_action(true),
+            placeholder_repair_action(PlaceholderProbe::Placeholder, false),
             PlaceholderRepair::KeepInSync,
             "CF 判定为占位符时不得再转换"
         );
@@ -3696,11 +3783,37 @@ mod placeholder_repair_tests {
         }
     }
 
+    /// 三态 + 索引知情（四个分支，修法由开发总监给定）：占位符→不转换；确定不是→转换；
+    /// 不确定+有索引→转换；不确定+无索引→不动作。
+    #[test]
+    fn existing_path_repair_is_index_informed_for_inconclusive_probes() {
+        assert_eq!(
+            placeholder_repair_action(PlaceholderProbe::Placeholder, false),
+            PlaceholderRepair::KeepInSync,
+            "占位符不得再转换"
+        );
+        assert_eq!(
+            placeholder_repair_action(PlaceholderProbe::NotPlaceholder, false),
+            PlaceholderRepair::ConvertToPlaceholder,
+            "确定不是占位符 ⇒ 转换（受止血闸门节制，见调用点）"
+        );
+        assert_eq!(
+            placeholder_repair_action(PlaceholderProbe::Unknown, true),
+            PlaceholderRepair::ConvertToPlaceholder,
+            "不确定 + 有索引条目 ⇒ 它曾经是占位符、身份丢了 ⇒ 就地转回"
+        );
+        assert_eq!(
+            placeholder_repair_action(PlaceholderProbe::Unknown, false),
+            PlaceholderRepair::LeaveUntouched,
+            "不确定 + 无索引条目 ⇒ 本地新建文件不归自愈管，不动作"
+        );
+    }
+
     /// 非占位符（事故现场实测的脱云属性）→ 走 convert 就地修复分支。
     #[test]
     fn existing_normal_files_are_converted_back_to_placeholders() {
         assert_eq!(
-            placeholder_repair_action(false),
+            placeholder_repair_action(PlaceholderProbe::NotPlaceholder, false),
             PlaceholderRepair::ConvertToPlaceholder,
             "CF 判定不是占位符时才允许走 convert 修复"
         );
