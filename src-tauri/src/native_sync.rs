@@ -216,16 +216,28 @@ pub async fn native_sync_list(
     parent_path: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
+    filter: Option<String>,
 ) -> Result<NativeSyncListView, String> {
     ensure_manager(&app).await?;
     let state = app.state::<AppState>();
     let mut guard = state.native_sync.lock().await;
     ensure_manager_guard(&app, &mut guard).await?;
-    guard
-        .as_ref()
-        .expect("manager initialized")
-        .list(parent_path, cursor, limit.unwrap_or(100))
-        .map_err(|e| fail("native_sync_list", e))
+    let manager = guard.as_ref().expect("manager initialized");
+    // `filter` 是 additive 参数：`None`（旧调用）→ 原按父目录列举；`Some("actionable")` → 可操作视图；
+    // 其它值显式报错（不能把笔误悄悄当成"无过滤"）。
+    match filter.as_deref() {
+        None => manager
+            .list(parent_path, cursor, limit.unwrap_or(100))
+            .map_err(|e| fail("native_sync_list", e)),
+        Some("actionable") => manager
+            .list_actionable(cursor, limit.unwrap_or(100))
+            .map_err(|e| fail("native_sync_list", e)),
+        Some(other) => {
+            let msg = format!("native_sync_list: unknown filter '{other}'");
+            log::warn!("{msg}");
+            Err(msg)
+        }
+    }
 }
 #[tauri::command]
 pub async fn native_sync_action(

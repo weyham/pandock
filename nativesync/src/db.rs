@@ -129,6 +129,29 @@ impl IndexDb {
         };
         self.conn.query_row("SELECT COUNT(*) FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE l.relative_path LIKE ?1 AND instr(substr(l.relative_path,length(?1)+1),'/')=0 AND r.tombstone=0", params![format!("{}%", prefix)], |r| r.get::<_, i64>(0)).map(|v| v as u64).map_err(|e| e.to_string())
     }
+    /// 列映射（两个查询共用）：`entries()` 与 `actionable_entries()` 必须输出**同一种**行。
+    fn entry_record_from_row(r: &rusqlite::Row) -> rusqlite::Result<EntryRecord> {
+        let state: String = r.get(9).unwrap_or_else(|_| "online_only".into());
+        let pin: String = r.get(10).unwrap_or_else(|_| "unpinned".into());
+        Ok(EntryRecord {
+            fs_id: r.get::<_, i64>(0)?,
+            parent_fs_id: r.get(1)?,
+            remote_path: r.get(2)?,
+            name: r.get(3)?,
+            relative_path: r.get(8)?,
+            is_dir: r.get::<_, i64>(4)? != 0,
+            size: r.get::<_, i64>(5)? as u64,
+            md5: r.get(6)?,
+            modified_at: r.get(7)?,
+            state: parse_state(&state),
+            pin_state: parse_pin(&pin),
+            error: r.get(11)?,
+            pending_op: r.get(12)?,
+            pending_since: r.get(13)?,
+            has_children: r.get::<_, i64>(14)? != 0,
+            local_only: r.get::<_, i64>(15)? != 0,
+        })
+    }
     pub fn entries(
         &self,
         parent: &str,
@@ -148,31 +171,57 @@ impl IndexDb {
                     limit.clamp(1, 1000) as i64,
                     offset as i64
                 ],
-                |r| {
-                    let state: String = r.get(9).unwrap_or_else(|_| "online_only".into());
-                    let pin: String = r.get(10).unwrap_or_else(|_| "unpinned".into());
-                    Ok(EntryRecord {
-                        fs_id: r.get::<_, i64>(0)?,
-                        parent_fs_id: r.get(1)?,
-                        remote_path: r.get(2)?,
-                        name: r.get(3)?,
-                        relative_path: r.get(8)?,
-                        is_dir: r.get::<_, i64>(4)? != 0,
-                        size: r.get::<_, i64>(5)? as u64,
-                        md5: r.get(6)?,
-                        modified_at: r.get(7)?,
-                        state: parse_state(&state),
-                        pin_state: parse_pin(&pin),
-                        error: r.get(11)?,
-                        pending_op: r.get(12)?,
-                        pending_since: r.get(13)?,
-                        has_children: r.get::<_, i64>(14)? != 0,
-                        local_only: r.get::<_, i64>(15)? != 0,
-                    })
-                },
+                Self::entry_record_from_row,
             )
             .map_err(|e| e.to_string())?;
         rows.map(|r| r.map_err(|e| e.to_string())).collect()
+    }
+    /// 「可操作」条目：全树扁平（**不按父目录**），只收用户会要操作的集合——
+    /// **已下载**（`hydrated`）、**已固定**（`pinned`）、**需处理**
+    /// （`error`/`remote_missing`/`stale`，或带 `pending_op`）、**本地新建**（`local_only`，待上传）。
+    ///
+    /// 排序：**需处理 → 已固定 → 已下载 → 名称**（不区分大小写，再用相对路径决胜）。
+    /// 设计意图：用户打开设置页的 NativeSync 列表是**要操作**（释放空间/固定/重试/已知悉），
+    /// 不是浏览整棵树——云上未下载的条目默认不出现。
+    pub fn actionable_entries(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<EntryRecord>, String> {
+        let mut st = self
+            .conn
+            .prepare(concat!(
+                "SELECT r.fs_id,r.parent_fs_id,r.remote_path,r.name,r.is_dir,r.size,r.md5,r.modified_at,",
+                "l.relative_path,l.hydration_state,l.pin_state,l.last_error,l.pending_op,l.pending_since,",
+                "EXISTS(SELECT 1 FROM remote_entry c WHERE c.parent_fs_id=r.fs_id AND c.tombstone=0),r.local_only ",
+                "FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id ",
+                "WHERE r.tombstone=0 AND (r.local_only=1 OR l.pending_op IS NOT NULL ",
+                "OR l.hydration_state IN ('error','remote_missing','stale') ",
+                "OR l.pin_state='pinned' OR l.hydration_state='hydrated') ",
+                "ORDER BY CASE WHEN l.hydration_state IN ('error','remote_missing','stale') ",
+                "OR l.pending_op IS NOT NULL OR r.local_only=1 THEN 0 ",
+                "WHEN l.pin_state='pinned' THEN 1 ELSE 2 END,",
+                "r.name COLLATE NOCASE, l.relative_path COLLATE NOCASE LIMIT ?1 OFFSET ?2",
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(
+                params![limit.clamp(1, 1000) as i64, offset as i64],
+                Self::entry_record_from_row,
+            )
+            .map_err(|e| e.to_string())?;
+        rows.map(|r| r.map_err(|e| e.to_string())).collect()
+    }
+    /// 「可操作」条目的总数（与 `actionable_entries` 同过滤）。
+    pub fn count_actionable(&self) -> Result<u64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0 AND (r.local_only=1 OR l.pending_op IS NOT NULL OR l.hydration_state IN ('error','remote_missing','stale') OR l.pin_state='pinned' OR l.hydration_state='hydrated')",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(|e| e.to_string())
     }
     pub fn upsert(&self, e: &EntryRecord) -> Result<(), String> {
         // remote_entry 有**两个**唯一约束：fs_id（主键）与 remote_path。
@@ -925,6 +974,106 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 1, "v1 库升级后 local_state 应具备 pending_op");
+    }
+    /// 「可操作」视图：已下载/已固定/需处理/本地新建都进集合，普通 online_only 不进；
+    /// 排序为 需处理 → 已固定 → 已下载 → 名称。分页与总数与过滤一致。
+    #[test]
+    fn actionable_entries_cover_operable_classes_and_order_attention_first() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        let rec = |fs_id: i64, name: &str, state: NativeSyncState, pin: PinState| EntryRecord {
+            fs_id,
+            local_only: false,
+            parent_fs_id: None,
+            remote_path: format!("/{name}"),
+            relative_path: name.into(),
+            name: name.into(),
+            is_dir: false,
+            size: 0,
+            md5: None,
+            modified_at: None,
+            state,
+            pin_state: pin,
+            error: None,
+            has_children: false,
+            pending_op: None,
+            pending_since: None,
+        };
+        db.upsert(&rec(
+            1,
+            "online.txt",
+            NativeSyncState::OnlineOnly,
+            PinState::Unpinned,
+        ))
+        .unwrap();
+        db.upsert(&rec(
+            2,
+            "downloaded.txt",
+            NativeSyncState::Hydrated,
+            PinState::Unpinned,
+        ))
+        .unwrap();
+        db.upsert(&rec(
+            3,
+            "pinned.txt",
+            NativeSyncState::Hydrated,
+            PinState::Pinned,
+        ))
+        .unwrap();
+        db.upsert(&rec(
+            4,
+            "broken.bin",
+            NativeSyncState::Error,
+            PinState::Unpinned,
+        ))
+        .unwrap();
+        db.upsert(&rec(
+            5,
+            "deleted.doc",
+            NativeSyncState::Hydrated,
+            PinState::Unpinned,
+        ))
+        .unwrap();
+        db.set_pending_op(5, Some("delete"), None).unwrap();
+        let local_id = db.next_local_fs_id().unwrap();
+        db.insert_local_only_entry(local_id, "新建.txt", "新建.txt", false, 3)
+            .unwrap();
+        let rows = db.actionable_entries(50, 0).unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            !names.contains(&"online.txt"),
+            "仅在线且未下载的条目不得出现: {names:?}"
+        );
+        for expected in [
+            "downloaded.txt",
+            "pinned.txt",
+            "broken.bin",
+            "deleted.doc",
+            "新建.txt",
+        ] {
+            assert!(names.contains(&expected), "缺 {expected}: {names:?}");
+        }
+        let pos = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(
+            pos("broken.bin") < pos("pinned.txt"),
+            "需处理必须先于已固定: {names:?}"
+        );
+        assert!(
+            pos("deleted.doc") < pos("pinned.txt"),
+            "需处理必须先于已固定: {names:?}"
+        );
+        assert!(
+            pos("新建.txt") < pos("pinned.txt"),
+            "本地新建属需处理、必须先于已固定: {names:?}"
+        );
+        assert!(
+            pos("pinned.txt") < pos("downloaded.txt"),
+            "已固定必须先于已下载: {names:?}"
+        );
+        assert_eq!(db.count_actionable().unwrap(), 5);
+        assert_eq!(db.actionable_entries(2, 0).unwrap().len(), 2);
+        assert_eq!(db.actionable_entries(2, 2).unwrap().len(), 2);
+        assert_eq!(db.actionable_entries(2, 4).unwrap().len(), 1);
     }
     #[test]
     fn entry_listing_uses_local_relative_path_and_cursor() {

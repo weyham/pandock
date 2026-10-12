@@ -457,23 +457,12 @@ impl NativeSyncManager {
         );
         Ok(())
     }
-    pub fn list(
+    /// `EntryRecord` → `NativeSyncEntryView` 的统一映射（`list()` 与 `list_actionable()` 共用）。
+    fn entry_views(
         &self,
-        parent: Option<String>,
-        cursor: Option<String>,
-        limit: usize,
-    ) -> Result<NativeSyncListView, NativeSyncError> {
-        let parent = parent.unwrap_or_else(|| "/".into());
-        let limit = limit.clamp(1, 1000);
-        let offset = cursor
-            .as_deref()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0);
-        let entries = self
-            .db
-            .entries(&parent, limit, offset)
-            .map_err(NativeSyncError::Message)?;
-        let views = entries
+        entries: Vec<crate::model::EntryRecord>,
+    ) -> Result<Vec<NativeSyncEntryView>, NativeSyncError> {
+        entries
             .into_iter()
             .map(|e| {
                 let cloud_fs_id = if e.local_only { None } else { Some(e.fs_id) };
@@ -501,7 +490,25 @@ impl NativeSyncManager {
                     has_children: e.has_children,
                 })
             })
-            .collect::<Result<Vec<_>, NativeSyncError>>()?;
+            .collect()
+    }
+    pub fn list(
+        &self,
+        parent: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<NativeSyncListView, NativeSyncError> {
+        let parent = parent.unwrap_or_else(|| "/".into());
+        let limit = limit.clamp(1, 1000);
+        let offset = cursor
+            .as_deref()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let entries = self
+            .db
+            .entries(&parent, limit, offset)
+            .map_err(NativeSyncError::Message)?;
+        let views = self.entry_views(entries)?;
         let next_cursor = if views.len() == limit {
             Some((offset + views.len()).to_string())
         } else {
@@ -516,6 +523,41 @@ impl NativeSyncManager {
             next_cursor,
             total,
             parent_path: parent,
+        })
+    }
+    /// 「可操作」视图（设置页默认）：全树扁平、不按父目录——**已下载/已固定/需处理/本地新建**。
+    ///
+    /// 契约：返回的 `parent_path` 恒为 `"/"`（该视图没有父目录概念）；
+    /// 分页语义与 `list()` 相同（`cursor` 是偏移量）；该视图**不读网络**（SQLite 查询）。
+    pub fn list_actionable(
+        &self,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> Result<NativeSyncListView, NativeSyncError> {
+        let limit = limit.clamp(1, 1000);
+        let offset = cursor
+            .as_deref()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let entries = self
+            .db
+            .actionable_entries(limit, offset)
+            .map_err(NativeSyncError::Message)?;
+        let views = self.entry_views(entries)?;
+        let next_cursor = if views.len() == limit {
+            Some((offset + views.len()).to_string())
+        } else {
+            None
+        };
+        let total = self
+            .db
+            .count_actionable()
+            .map_err(NativeSyncError::Message)?;
+        Ok(NativeSyncListView {
+            entries: views,
+            next_cursor,
+            total,
+            parent_path: "/".into(),
         })
     }
     pub fn action(
@@ -1008,6 +1050,47 @@ mod manager_tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    /// additive：不带 `filter` 的 `list()` 结果与之前完全一致；`list_actionable()` 扁平、
+    /// 只收可操作条目、父路径恒为 `"/"`。
+    #[test]
+    fn list_actionable_is_flat_filtered_and_list_stays_unchanged() {
+        let (_dir, _root, _calls, manager) = setup();
+        // 造数：普通 online_only（排除）+ hydrated（进）+ pending delete（进）。
+        manager
+            .db
+            .upsert(&record(11, "a.txt", Some("aaa")))
+            .unwrap();
+        manager
+            .db
+            .upsert(&record(12, "b.txt", Some("bbb")))
+            .unwrap();
+        manager.db.set_state_by_fs_id(12, "hydrated", None).unwrap();
+        manager
+            .db
+            .upsert(&record(13, "c.txt", Some("ccc")))
+            .unwrap();
+        manager.db.set_pending_op(13, Some("delete"), None).unwrap();
+        // 既有行为回归：不带 filter 的 list() 必须仍返回父级的全部条目。
+        let plain = manager.list(None, None, 50).unwrap();
+        assert_eq!(
+            plain.entries.len(),
+            3,
+            "list() 不带 filter 必须仍返回全部条目"
+        );
+        assert_eq!(plain.parent_path, "/");
+        let actionable = manager.list_actionable(None, 50).unwrap();
+        let names: Vec<&str> = actionable
+            .entries
+            .iter()
+            .map(|e| e.relative_path.as_str())
+            .collect();
+        assert!(!names.contains(&"a.txt"), "仅在线条目不得出现: {names:?}");
+        assert!(names.contains(&"b.txt"));
+        assert!(names.contains(&"c.txt"));
+        assert_eq!(actionable.total, 2);
+        assert_eq!(actionable.parent_path, "/", "可操作视图没有父目录概念");
     }
 
     #[tokio::test]
