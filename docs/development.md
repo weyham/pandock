@@ -131,6 +131,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\set-version.ps1 -Version 0.1.
    **判据**：任何"要读内容"的验证步骤，必须先确认目标**不是**已脱水的占位符，或改为只读元数据
    （`FileSize` / `LastWriteTime` / 属性探针 / `CfGetPlaceholderInfo` 走**属性句柄**），
    或对**副本**操作（先拷到 `%TEMP%` 再算哈希）。
+6. **停进程 / 改文件一律按"精确路径"过滤；禁止按进程名批量操作。**
+   反例（真实事故，2026-10-12）：一个临时夹具探针写了
+   `Get-Process -Name pandock | Stop-Process -Force`，把**同机上并存的真实实例**（PID 64040）连同夹具一起杀掉
+   —— 实例不可用 **10–16 秒**（已重启恢复，无数据损失）。
+   本项目在同机上常有"夹具实例 + 真实实例"并存（演练、回归都会用到），按名操作必然误伤。
+   **要求**：`Stop-Process` 前必须 `Where-Object { $_.ExecutablePath/Path -eq <精确路径> }`；
+   文件操作同样按精确路径（`-LiteralPath`）；递归清理前**先断言目标在预期目录下**（例如必须位于 `%TEMP%`）。
+7. **PowerShell 脚本必须存成 UTF-8（带 BOM）+ CRLF。**
+   工具坑（2026-10-12 实测）：无 BOM 时 **Windows PowerShell 5.1** 会把中文注释/字符串按 ANSI(GBK) 解析，
+   直接报语法错（`Unexpected token '}'`），而 `pwsh` 7 读同一文件却正常 —— 所以"在 7 上能跑"不代表 CI/脚本宿主（5.1）能跑。
+   推论（已用在 `deploy-dev.ps1` 硬化里）：**脚本编码问题要在目标宿主上验证**，别只看现代宿主。
+   附一条演练发现的工具约束：`deploy-dev.ps1` 的 pre-flight **不能**把"运行中实例自身的 exe"当成冲突
+   （进程映像只允许读共享），否则会永远拒绝部署；exe 由"停后轮询解锁"把关。
 ## Cloud Files 元数据写操作：句柄与权限（权限验证表的依据）
 
 **官方原文（MS Learn）**——两句合起来说明：**句柄本身可以只带属性访问**，
