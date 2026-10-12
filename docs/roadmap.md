@@ -41,6 +41,15 @@
 - macOS 首发：WebDAV 模块（未公证 dmg，手动放行）；NativeSync 不提供（CFAPI 为 Windows 独占）。
 - SignPath OSS 签名申请推进中；获批前产物未签名（SmartScreen 警告照旧）。
 
+### 1.2.1 之后（NativeSync 外壳集成，进行中）
+
+- 同步根改用外壳注册（ADR-108）：资源管理器出现同步根节点、状态角标、状态列，以及
+  「始终保留在此设备上」「释放空间」原生动词；外壳注册与引擎连接同生命周期，连接失败自动回滚。
+- 修正状态列长期显示「同步挂起」：占位符创建、水合完成、路径已存在时标记 in-sync。
+- 「释放空间」改为先脱水再标记 in-sync。
+- 同步时回读 `FILE_ATTRIBUTE_PINNED` / `FILE_ATTRIBUTE_UNPINNED`，修正固定状态错位。
+- `remote_entry` upsert 兼容 `remote_path` 唯一约束，消除「目录建出但文件缺失」的同步中断。
+- 已知限制：本地新建/编辑/删除/改名不上传云端（单向 remote -> local），原因见 ADR-108。
 ## 1.3.0 候选
 
 - NativeSync 双向同步与冲突处理。
