@@ -69,17 +69,41 @@ if ($present -notcontains "pandock.exe") { throw "源目录缺少 pandock.exe：
 
 $expectedHash = (Get-FileHash -LiteralPath (Join-Path $src "pandock.exe") -Algorithm SHA256).Hash
 $exePath = Join-Path $dst "pandock.exe"
+# 目标实例（恰好运行自 <RuntimeDir>\pandock.exe 的进程）：pre-flight 与「停实例」两步共用同一筛选。
+$targets = Get-CimInstance Win32_Process -Filter "Name='pandock.exe'" |
+    Where-Object { $_.ExecutablePath -eq $exePath }
 
-# ---- ① pre-flight：目标被占用 ⇒ 在停进程之前就退出（不打断服务）----
-# 注意：`pandock.exe` 此刻**正被"我们自己要停掉的实例"锁着**（进程映像只允许读共享），
-# 因此**不**把它纳入这一步——它由"停进程后的轮询解锁"（②）把关：
-#   * 运行中实例造成的锁：Stop-Process 之后会立刻释放（实测 0.5 秒）；
-#   * 第三方（Defender/残留句柄）造成的锁：②轮询 30 秒后仍不放 ⇒ 恢复服务并报错。
-# 这一步只探测"不会被我们停掉"的白名单文件（updater.exe / DLL / 文本）。
+
+# ---- ① pre-flight：目标被**第三方**占用 ⇒ 在停进程之前就退出（不打断服务）----
+# 语义：这一步的意义是「别打断别人」。**被目标实例自身（及其子进程）持有的文件不算冲突**——
+# 我们马上就要停它（停掉后由其释放；实测映像解锁约 0.5–1.1 秒），这类锁交给②的轮询把关。
+# 实现：把"目标实例当前持有的路径"（映像 + 已加载模块 + 子进程映像/模块）从 pre-flight 里排除；
+# 任何**不在**这个集合里的占用 ⇒ 是第三方（Defender / 别的工具 / 残留句柄）⇒ 立即退出。
+# 例：`pandock.exe`（自己的映像）与 `WebView2Loader.dll`（实例把它映射进自己的进程）都不算冲突。
 $existing = @($present | ForEach-Object { Join-Path $dst $_ } | Where-Object { Test-Path -LiteralPath $_ })
-$preflight = @($present | Where-Object { $_ -ne "pandock.exe" } |
-    ForEach-Object { Join-Path $dst $_ } | Where-Object { Test-Path -LiteralPath $_ })
-$lockedNow = @($preflight | Where-Object { -not (Test-FileExclusive $_) })
+$instanceHeld = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($p in $targets) {
+    [void]$instanceHeld.Add($p.ExecutablePath)
+    $proc = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
+    if ($proc) {
+        try {
+            foreach ($m in $proc.Modules) { [void]$instanceHeld.Add($m.FileName) }
+        } catch {
+            Write-Host "注意：枚举不到目标实例的模块清单（PID $($p.ProcessId)）⇒ 其持有的文件会被当成第三方占用（保守中止）：$($_.Exception.Message)"
+        }
+    }
+    $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.ProcessId)" -ErrorAction SilentlyContinue)
+    foreach ($c in $children) {
+        if ($c.ExecutablePath) { [void]$instanceHeld.Add($c.ExecutablePath) }
+        $cp = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue
+        if ($cp) {
+            try {
+                foreach ($m in $cp.Modules) { [void]$instanceHeld.Add($m.FileName) }
+            } catch { }
+        }
+    }
+}
+$lockedNow = @($existing | Where-Object { -not $instanceHeld.Contains($_) } | Where-Object { -not (Test-FileExclusive $_) })
 if ($lockedNow.Count -gt 0) {
     throw "目标文件被占用（未停止任何进程）：$($lockedNow -join ', ')。请稍后重试。"
 }
