@@ -299,15 +299,39 @@ impl NativeSyncManager {
                     snapshot.size,
                     &fs_id.to_le_bytes(),
                 )?;
-                // 记录本地快照作为基线：关闭完成通知靠它与磁盘现状比对来识别本地编辑。
-                if let Ok(meta) = std::fs::metadata(&local) {
+                // 先算 in-sync 自愈的前置条件（**必须在写入新快照之前**，否则就是自证。
+                let (pending_change, snapshot_matches) = if let Ok(meta) = std::fs::metadata(&local)
+                {
                     let mtime = meta
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as i64);
+                    let pending = self
+                        .db
+                        .pending_op_of(fs_id as i64)
+                        .map_err(NativeSyncError::Message)?
+                        .is_some();
+                    let matches = matches!(
+                        self.db
+                            .snapshot_for(fs_id as i64)
+                            .map_err(NativeSyncError::Message)?,
+                        Some(snap) if snap.size == Some(meta.len()) && snap.mtime == mtime
+                    );
+                    // 记录本地快照作为基线：关闭完成通知靠它与磁盘现状比对来识别本地编辑。
                     let _ = self.db.set_snapshot(fs_id as i64, mtime, meta.len());
-                }
+                    (pending, matches)
+                } else {
+                    (true, false)
+                };
+                // 占位符被平台标成"未同步"且内容确实与云端一致时才恢复 in-sync。
+                self.platform.repair_in_sync_if_needed(
+                    &local,
+                    fs_id,
+                    snapshot.is_dir(),
+                    pending_change,
+                    snapshot_matches,
+                );
                 // 回读文件系统上的真实 pin 状态：只跟自己的操作走会与磁盘不一致
                 // （实测：磁盘 PINNED、数据库 unpinned，界面与 Explorer 互相矛盾）。
                 if !snapshot.is_dir() {

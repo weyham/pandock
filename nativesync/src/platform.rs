@@ -65,6 +65,45 @@ pub(crate) fn placeholder_repair_action(attrs: u32) -> PlaceholderRepair {
     }
 }
 
+/// in-sync 自愈的判定输入（纯数据，便于跨平台单测）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InSyncRepairInput {
+    /// 本地路径存在且**是**占位符。
+    pub is_placeholder: bool,
+    /// 该条目有已记录的本地改动（`pending_op` 非空）。
+    pub has_pending_change: bool,
+    /// 本地 mtime/size 与快照一致（内容与云端一致）。
+    pub snapshot_matches: bool,
+    /// 平台侧 in-sync 状态；`None` = 查询不可用。
+    pub in_sync: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InSyncRepair {
+    /// 条件齐备且当前不是 in-sync → 调用 `CfSetInSyncState(IN_SYNC)`。
+    Repair,
+    /// 本来就是 in-sync → 什么都不做。
+    LeaveAlone,
+    /// 前置条件不满足（可能被本地改过 / 读不到状态）→ **绝不动手**。
+    Skip,
+}
+
+/// 判定"是否可以把占位符恢复为 in-sync"。
+///
+/// **三个前置条件缺一不可**：是占位符、没有已记录的本地改动、本地内容与快照一致。
+/// 在任何"内容可能被本地改过"的情况下强行置为已同步，会把真实改动**伪装成已同步**
+/// （S1 没有上传方向，用户会以为改动已同步到云端）——比现状更危险。
+pub(crate) fn in_sync_repair_action(input: InSyncRepairInput) -> InSyncRepair {
+    if !input.is_placeholder || input.has_pending_change || !input.snapshot_matches {
+        return InSyncRepair::Skip;
+    }
+    match input.in_sync {
+        Some(true) => InSyncRepair::LeaveAlone,
+        Some(false) => InSyncRepair::Repair,
+        None => InSyncRepair::Skip,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
     #[error("NativeSync 当前平台不可用: {0}")]
@@ -97,6 +136,17 @@ pub trait PlatformSync: Send + Sync {
     }
     /// 紧急开关：关闭后不再注册/处理本地变更通知（保留只读召回与占位符创建）。
     fn set_notifications_enabled(&mut self, _enabled: bool) {}
+    /// 若占位符被平台标成"未同步"且**内容确实与云端一致**，把它恢复为 in-sync。
+    /// 前置条件（`has_pending_change` / `snapshot_matches`）由调用方从索引库给出。
+    fn repair_in_sync_if_needed(
+        &mut self,
+        _path: &Path,
+        _fs_id: u64,
+        _is_dir: bool,
+        _has_pending_change: bool,
+        _snapshot_matches: bool,
+    ) {
+    }
     fn create_placeholder(
         &mut self,
         path: &Path,
@@ -514,6 +564,37 @@ mod windows_impl {
     /// 一旦它错了——Explorer 会因此禁用「释放空间」并显示"同步挂起"箭头——我们就是盲的。
     /// 所以：**只在不是 `IN_SYNC` 时 `warn`**，正常与查询失败都走 `debug`，避免刷屏。
     /// 只记 `kind`（file/dir），不记文件名（隐私纪律）。
+    fn probe_in_sync_state(path: &Path) -> Option<bool> {
+        let handle = file_handle(path, false).ok()?;
+        let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 64];
+        let mut returned = 0u32;
+        let r = unsafe {
+            CfGetPlaceholderInfo(
+                handle,
+                CF_PLACEHOLDER_INFO_BASIC,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                Some(&mut returned),
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        match r {
+            Ok(()) => {
+                let info = unsafe { &*(buf.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO) };
+                Some(info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC)
+            }
+            Err(error) => {
+                log::debug!(
+                    "native-sync in-sync probe unavailable hr=0x{:08X}",
+                    error.code().0 as u32
+                );
+                None
+            }
+        }
+    }
+
     fn probe_in_sync(path: &Path, kind: &str) {
         let Ok(handle) = file_handle(path, false) else {
             return;
@@ -2772,6 +2853,63 @@ mod windows_impl {
             self.root.take();
             Ok(())
         }
+        fn repair_in_sync_if_needed(
+            &mut self,
+            path: &Path,
+            fs_id: u64,
+            is_dir: bool,
+            has_pending_change: bool,
+            snapshot_matches: bool,
+        ) {
+            let attrs = std::fs::metadata(path)
+                .map(|m| {
+                    use std::os::windows::fs::MetadataExt;
+                    m.file_attributes()
+                })
+                .unwrap_or(0);
+            let input = InSyncRepairInput {
+                is_placeholder: is_placeholder_attrs(attrs),
+                has_pending_change,
+                snapshot_matches,
+                in_sync: probe_in_sync_state(path),
+            };
+            match in_sync_repair_action(input) {
+                InSyncRepair::Repair => {
+                    let Ok(handle) = file_handle(path, true) else {
+                        return;
+                    };
+                    let mut usn = 0i64;
+                    let r = unsafe {
+                        CfSetInSyncState(
+                            handle,
+                            CF_IN_SYNC_STATE_IN_SYNC,
+                            CF_SET_IN_SYNC_FLAG_NONE,
+                            Some(&mut usn),
+                        )
+                    };
+                    unsafe {
+                        let _ = CloseHandle(handle);
+                    }
+                    match r {
+                        Ok(()) => log::info!(
+                            "native-sync in-sync repaired fs_id={fs_id} kind={}",
+                            if is_dir { "dir" } else { "file" }
+                        ),
+                        Err(error) => log::warn!(
+                            "native-sync in-sync repair failed fs_id={fs_id} hr=0x{:08X}",
+                            error.code().0 as u32
+                        ),
+                    }
+                }
+                InSyncRepair::LeaveAlone => log::debug!(
+                    "native-sync in-sync ok fs_id={fs_id} kind={}",
+                    if is_dir { "dir" } else { "file" }
+                ),
+                InSyncRepair::Skip => log::debug!(
+                    "native-sync in-sync repair skipped fs_id={fs_id} (pending={has_pending_change} snapshot_ok={snapshot_matches})"
+                ),
+            }
+        }
         fn create_placeholder(
             &mut self,
             path: &Path,
@@ -2983,6 +3121,55 @@ mod placeholder_repair_tests {
             vec![SyncRootRemovalCause::Deliberate],
             "唯一会注销的起因只能是刻意移除"
         );
+    }
+
+    /// in-sync 自愈：三条前置条件缺一不可；已是 in-sync 不调 set；读不到状态不动手。
+    #[test]
+    fn in_sync_repair_requires_all_preconditions() {
+        let ok = InSyncRepairInput {
+            is_placeholder: true,
+            has_pending_change: false,
+            snapshot_matches: true,
+            in_sync: Some(false),
+        };
+        assert_eq!(in_sync_repair_action(ok), InSyncRepair::Repair);
+        // 已是 in-sync → 不调 set
+        assert_eq!(
+            in_sync_repair_action(InSyncRepairInput {
+                in_sync: Some(true),
+                ..ok
+            }),
+            InSyncRepair::LeaveAlone
+        );
+        // 读不到状态 → 不动手
+        assert_eq!(
+            in_sync_repair_action(InSyncRepairInput {
+                in_sync: None,
+                ..ok
+            }),
+            InSyncRepair::Skip
+        );
+        // 负例三条：不是占位符 / 有本地改动 / 快照不一致 —— 都不得修复
+        for bad in [
+            InSyncRepairInput {
+                is_placeholder: false,
+                ..ok
+            },
+            InSyncRepairInput {
+                has_pending_change: true,
+                ..ok
+            },
+            InSyncRepairInput {
+                snapshot_matches: false,
+                ..ok
+            },
+        ] {
+            assert_eq!(
+                in_sync_repair_action(bad),
+                InSyncRepair::Skip,
+                "内容可能被本地改过时绝不能置为已同步: {bad:?}"
+            );
+        }
     }
 
     /// 非占位符（事故现场实测的脱云属性）→ 走 convert 就地修复分支。
