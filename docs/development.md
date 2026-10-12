@@ -123,6 +123,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\set-version.ps1 -Version 0.1.
    这条比"多写测试"更根本：**没有落盘的改动，任何测试都拦不住**。
 4. **提交信息用单引号或 `-F <文件>`**（Windows PowerShell 会把 ASCII 双引号当引号解析，
    消息会被拆成 pathspec 导致提交失败或信息被截断）。
+5. **观测不得改变被观测对象**：对 Cloud Files 占位符做**内容读取**（`sha256`/`Get-FileHash`/读字节）
+   会触发水合，**验证工具可能成为被验证现象的成因**。
+   反例（真实事故，2026-10-12）：部署快照对同步根里的三个文件读内容算 sha256，把"释放空间"刚脱水的
+   文件立刻读了回来，随后被当成"外部神秘读回者"追查了两轮——身份日志（`placeholder opener … image=python.exe`）
+   才证明那是我们自己的取证脚本。
+   **判据**：任何"要读内容"的验证步骤，必须先确认目标**不是**已脱水的占位符，或改为只读元数据
+   （`FileSize` / `LastWriteTime` / 属性探针 / `CfGetPlaceholderInfo` 走**属性句柄**），
+   或对**副本**操作（先拷到 `%TEMP%` 再算哈希）。
 ## Cloud Files 元数据写操作：句柄与权限（权限验证表的依据）
 
 **官方原文（MS Learn）**——两句合起来说明：**句柄本身可以只带属性访问**，
