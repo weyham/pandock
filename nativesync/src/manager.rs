@@ -519,9 +519,10 @@ impl NativeSyncManager {
                         }
                     }
                 }
-                // 顺序很重要：先释放空间，再标记 in-sync。
-                // 反过来会在 dehydrate 之后留下「同步挂起」状态
-                // （2026-10-12 实测：先 mark 后 dehydrate，资源管理器显示蓝色循环箭头）。
+                // 先释放空间，再标记 in-sync —— 使平台侧状态与我们索引里的 hydration_state 保持一致。
+                // （早期注释把"顺序会改变图标"当成实测结论；该解释**已被 2026-10-12 的证据取代**：
+                //  蓝色循环箭头来自"显式 UNPINNED 的语义 = 已登记待脱水"，见 docs/问题与解决.md 相应条目。
+                //  仅保留可验证的事实描述，避免误导后来者。）
                 self.platform.dehydrate(&local)?;
                 self.platform.mark_in_sync(&local)?;
                 self.db
