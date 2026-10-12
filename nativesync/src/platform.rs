@@ -558,10 +558,15 @@ mod windows_impl {
         if path.is_dir() {
             flags |= FILE_FLAGS_AND_ATTRIBUTES(FILE_FLAG_BACKUP_SEMANTICS.0);
         }
+        // **只请求属性访问**（不要 FILE_GENERIC_READ/WRITE）：
+        // 对**已脱水**的占位符做读访问会让平台立刻把内容物化回来（重新水合），
+        // 于是"释放空间"刚成功就被我们自己的元数据调用撤销（真实事故 D1）。
+        // 需要改属性（in-sync / pin / 脱水 / 转换）用 FILE_WRITE_ATTRIBUTES，只读属性用 FILE_READ_ATTRIBUTES。
+        // 数据通路不依赖此句柄：fetch worker 走 CfExecute(TRANSFER_DATA)。
         let access = if write {
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE
+            FILE_WRITE_ATTRIBUTES
         } else {
-            FILE_GENERIC_READ
+            FILE_READ_ATTRIBUTES
         };
         let h = unsafe {
             CreateFileW(
@@ -2477,7 +2482,13 @@ mod windows_impl {
             RequestKey: info.RequestKey,
             ..Default::default()
         };
-        let _ = CfExecute(&op, params);
+        if let Err(error) = CfExecute(&op, params) {
+            // **不许静默**：ACK 失败会让调用方（Explorer）一直等下去，必须有痕迹。
+            log::warn!(
+                "native-sync CfExecute(ack) failed hr=0x{:08X}",
+                error.code().0 as u32
+            );
+        }
     }
 
     /// ACK 前不得有任何 I/O、加锁或日志落盘：Explorer 正阻塞等待这个响应。
@@ -2513,9 +2524,11 @@ mod windows_impl {
         params.Anonymous.AckDehydrate = CF_OPERATION_PARAMETERS_0_1 {
             Flags: CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE,
             CompletionStatus: NTSTATUS(0),
-            // 回传回调给定的 identity，供平台把 ACK 关联回该占位符。
-            FileIdentity: info.FileIdentity,
-            FileIdentityLength: info.FileIdentityLength,
+            // **不传身份**：ACK 里的 identity 应是提供程序自备的数据，而 info.FileIdentity
+            // 是平台自己的缓冲区指针；ParamSize 也不含内联 blob。实测（D2）：回传该指针会让
+            // 外部发起的 CfDehydratePlaceholder **永远不返回**（Explorer「释放空间」卡在半路）。
+            FileIdentity: std::ptr::null(),
+            FileIdentityLength: 0,
         };
         ack_operation(info, CF_OPERATION_TYPE_ACK_DEHYDRATE, &mut params);
     }
