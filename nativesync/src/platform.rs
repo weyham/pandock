@@ -1423,6 +1423,7 @@ mod windows_impl {
                     ..Default::default()
                 },
                 fs_id: Some(fs_id),
+                identity: None,
             }
         }
 
@@ -1446,6 +1447,60 @@ mod windows_impl {
                 pending_since: None,
             })
             .unwrap();
+        }
+
+        /// 打开者身份解码：正常结构、空指针、过短 StructSize、空 ImagePath 四种形态。
+        /// 全部只用栈上构造的假结构，不依赖真实 Explorer 或云文件驱动。
+        #[test]
+        fn process_identity_decodes_opener_and_rejects_short_structures() {
+            let image: Vec<u16> = "C:\\Windows\\explorer.exe\0".encode_utf16().collect();
+            let mut process = CF_PROCESS_INFO {
+                StructSize: std::mem::size_of::<CF_PROCESS_INFO>() as u32,
+                ProcessId: 4242,
+                ImagePath: PCWSTR(image.as_ptr()),
+                ..Default::default()
+            };
+            let mut info: CF_CALLBACK_INFO = unsafe { std::mem::zeroed() };
+            info.ProcessInfo = &mut process;
+            assert_eq!(
+                unsafe { process_identity(&info) },
+                Some(crate::notify::ProcessIdentity {
+                    pid: Some(4242),
+                    image: Some("explorer.exe".into()),
+                })
+            );
+
+            // 系统没给 ProcessInfo（或连接未要求）⇒ 一律 None，不得解引用。
+            let mut bare: CF_CALLBACK_INFO = unsafe { std::mem::zeroed() };
+            bare.ProcessInfo = std::ptr::null_mut();
+            assert_eq!(unsafe { process_identity(&bare) }, None);
+
+            // StructSize 比我们读的字段还短 ⇒ 不猜，直接放弃。
+            let mut short = CF_PROCESS_INFO {
+                StructSize: 4,
+                ProcessId: 1,
+                ..Default::default()
+            };
+            let mut short_info: CF_CALLBACK_INFO = unsafe { std::mem::zeroed() };
+            short_info.ProcessInfo = &mut short;
+            assert_eq!(unsafe { process_identity(&short_info) }, None);
+
+            // ImagePath 为空指针 ⇒ 只留 pid，绝不 panic。
+            let mut no_image = CF_PROCESS_INFO {
+                StructSize: std::mem::size_of::<CF_PROCESS_INFO>() as u32,
+                ProcessId: 7,
+                ImagePath: PCWSTR(std::ptr::null::<u16>()),
+                ..Default::default()
+            };
+            let mut no_image_info: CF_CALLBACK_INFO = unsafe { std::mem::zeroed() };
+            no_image_info.ProcessInfo = &mut no_image;
+            assert_eq!(
+                unsafe { process_identity(&no_image_info) },
+                Some(crate::notify::ProcessIdentity {
+                    pid: Some(7),
+                    image: None,
+                })
+            );
         }
 
         /// 回调表必须自洽：13 个真实回调 + NONE 终止项，类型不得重复。
@@ -1499,6 +1554,7 @@ mod windows_impl {
                     ..Default::default()
                 },
                 fs_id: Some(1),
+                identity: None,
             };
 
             // 未启动消费者：投递失败但不阻塞、不 panic。
@@ -1643,6 +1699,10 @@ mod windows_impl {
                     ..Default::default()
                 },
                 fs_id: Some(61),
+                identity: Some(crate::notify::ProcessIdentity {
+                    pid: Some(9999),
+                    image: Some("explorer.exe".into()),
+                }),
             };
 
             // 打开 → 关闭（只读一遍）：不得留下任何 local_change，也不得产生待同步。
@@ -1689,6 +1749,7 @@ mod windows_impl {
                         ..Default::default()
                     },
                     fs_id: Some(11),
+                    identity: None,
                 },
             );
 
@@ -1730,6 +1791,7 @@ mod windows_impl {
                         ..Default::default()
                     },
                     fs_id: Some(12),
+                    identity: None,
                 },
             );
 
@@ -1989,9 +2051,16 @@ mod windows_impl {
     const APP_OP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
     const NOTIFY_QUEUE_DEPTH: usize = 256;
 
+    /// 打开者身份日志的记账表（进程级，键是 `(fs_id, image)`）：同一个文件被同一个程序
+    /// 反复打开时只留一条 info 证据，不刷日志。
+    static IDENTITY_LOG: OnceLock<Mutex<crate::notify::IdentityLogLimiter>> = OnceLock::new();
+
     struct NotifyTask {
         input: crate::notify::NotifyInput,
         fs_id: Option<u64>,
+        /// 打开者身份。`CF_PROCESS_INFO` 只在回调期间有效，回调线程已把它拷成
+        /// 拥有所有权的值，worker 线程拿到的绝不是裸指针。
+        identity: Option<crate::notify::ProcessIdentity>,
     }
 
     fn now_iso() -> String {
@@ -2006,6 +2075,50 @@ mod windows_impl {
     /// 回调线程内只用它做「字符串 → 相对路径」的便宜计算（无 I/O、无 DB）。
     unsafe fn normalized_text(info: &CF_CALLBACK_INFO) -> Option<String> {
         info.NormalizedPath.to_string().ok()
+    }
+
+    /// 读取 `CF_CALLBACK_INFO.ProcessInfo`（连接已要求 `CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO`）。
+    ///
+    /// 安全前提：`ProcessInfo` 指向的结构体与其字符串**只在回调期间有效**，因此这里立刻
+    /// 把需要的两项拷成拥有所有权的值，绝不把指针带出回调。结构体短于我们要读的字段
+    /// 一律拒绝（先校验 `StructSize`，再读字段）。
+    unsafe fn process_identity(info: &CF_CALLBACK_INFO) -> Option<crate::notify::ProcessIdentity> {
+        let process = info.ProcessInfo;
+        if process.is_null() {
+            return None;
+        }
+        let minimal =
+            std::mem::offset_of!(CF_PROCESS_INFO, ImagePath) + std::mem::size_of::<PCWSTR>();
+        if ((*process).StructSize as usize) < minimal {
+            return None;
+        }
+        let image = pcwstr_text((*process).ImagePath).and_then(|p| crate::notify::image_label(&p));
+        Some(crate::notify::ProcessIdentity {
+            pid: Some((*process).ProcessId),
+            image,
+        })
+    }
+
+    /// `PCWSTR` → `String`：显式判空 + 有界扫描，不依赖「字符串一定已终止」。
+    unsafe fn pcwstr_text(p: PCWSTR) -> Option<String> {
+        if p.0.is_null() {
+            return None;
+        }
+        const MAX_CHARS: usize = 4096;
+        let mut len = 0usize;
+        while len < MAX_CHARS && *p.0.add(len) != 0 {
+            len += 1;
+        }
+        if len == 0 {
+            return None;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(p.0, len));
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     /// 记录一次「应用自身发起」的操作，用于去重随之而来的自杀回调。
@@ -2111,14 +2224,63 @@ mod windows_impl {
         }
     }
 
+    /// 记录「谁打开了这个占位符」。
+    ///
+    /// 目的：回答「释放空间之后是谁把文件读了回来」。只在 info 级、按 `(fs_id, image)`
+    /// 60 秒限频，且**绝不记录文件名**（只记录可执行文件基名与 pid）。
+    /// `identity` 缺失时照记 `image=unknown`——「拿不到身份」本身也是证据。
+    fn log_opener_identity(
+        fs_id: Option<u64>,
+        kind: crate::notify::NotifyKind,
+        identity: Option<&crate::notify::ProcessIdentity>,
+    ) {
+        let key_id = fs_id.unwrap_or(0);
+        let image = identity
+            .and_then(|i| i.image.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let pid = identity.and_then(|i| i.pid);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let allowed = IDENTITY_LOG
+            .get_or_init(|| {
+                Mutex::new(crate::notify::IdentityLogLimiter::new(
+                    crate::notify::IDENTITY_LOG_WINDOW_MS,
+                ))
+            })
+            .lock()
+            .map(|mut limiter| limiter.should_log(key_id, &image, now_ms))
+            .unwrap_or(false);
+        if allowed {
+            log::info!(
+                "native-sync placeholder opener kind={} fs_id={} image={} pid={:?}",
+                kind.as_str(),
+                key_id,
+                image,
+                pid
+            );
+        }
+    }
+
     /// 非阻塞通知的统一入口：**不得**在这里做 I/O / 查库 / 落盘。
     fn dispatch_notification(info: &CF_CALLBACK_INFO, input: crate::notify::NotifyInput) {
         let Some(runtime) = (unsafe { runtime_from_callback(info) }) else {
             return;
         };
+        // 只在打开/关闭通知上取发起者身份：这两条正是「谁把文件读了回来」的证据面；
+        // 其余回调不取，避免无谓的字符串拷贝。
+        let identity = match input.kind {
+            Some(
+                crate::notify::NotifyKind::OpenCompleted
+                | crate::notify::NotifyKind::CloseCompleted,
+            ) => unsafe { process_identity(info) },
+            _ => None,
+        };
         let task = NotifyTask {
             input,
             fs_id: file_id_from_identity(info),
+            identity,
         };
         enqueue_notification(&runtime, task);
     }
@@ -2160,6 +2322,18 @@ mod windows_impl {
             (Some(_), false) => crate::notify::NotifySource::System,
             (None, _) => crate::notify::NotifySource::Unknown,
         };
+        // A：打开者身份（打开/关闭通知）——落库/落日志都在 worker 线程，回调线程只投递。
+        if matches!(
+            task.input.kind,
+            Some(
+                crate::notify::NotifyKind::OpenCompleted
+                    | crate::notify::NotifyKind::CloseCompleted,
+            )
+        ) {
+            if let Some(kind) = task.input.kind {
+                log_opener_identity(task.fs_id, kind, task.identity.as_ref());
+            }
+        }
         let scope = crate::notify::NotifyScope {
             root: &root_text,
             fs_id: task.fs_id,

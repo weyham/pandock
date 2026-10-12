@@ -7,6 +7,7 @@
 
 use crate::model::NativeSyncChangeEvent;
 use crate::path::sanitize_component;
+use std::collections::HashMap;
 
 /// 本地变更通知捕获的紧急开关（环境变量）。
 ///
@@ -22,6 +23,71 @@ pub fn resolve_notifications_enabled(config_value: bool) -> bool {
             "0" | "false" | "no" | "off"
         ),
         Err(_) => config_value,
+    }
+}
+
+/// 「打开者身份」日志的限频窗口：同一 `(fs_id, image)` 60 秒最多记一条。
+pub const IDENTITY_LOG_WINDOW_MS: i64 = 60_000;
+
+/// 回调发起者身份（`CF_CALLBACK_INFO.ProcessInfo` 的解码结果）。
+///
+/// **隐私口径**：`image` 只保留可执行文件基名（小写）；完整映像路径可能含用户名，
+/// 绝不记录。被打开文件的文件名同样绝不记录。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: Option<u32>,
+    pub image: Option<String>,
+}
+
+/// 从映像路径取出可安全记录的标签：最后一个路径分量、小写、去空白。
+pub fn image_label(image: &str) -> Option<String> {
+    let trimmed = image.trim().trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let base = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed).trim();
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_ascii_lowercase())
+    }
+}
+
+/// `(fs_id, image)` → 上次记录时刻 的限频器。时钟由调用方注入，便于单测。
+#[derive(Debug)]
+pub struct IdentityLogLimiter {
+    window_ms: i64,
+    last: HashMap<(u64, String), i64>,
+}
+
+impl IdentityLogLimiter {
+    pub fn new(window_ms: i64) -> Self {
+        Self {
+            window_ms: window_ms.max(0),
+            last: HashMap::new(),
+        }
+    }
+
+    /// 这一次打开者身份该不该写日志；返回 `true` 时顺带记账。
+    pub fn should_log(&mut self, fs_id: u64, image: &str, now_ms: i64) -> bool {
+        let key = (fs_id, image.to_string());
+        let allow = match self.last.get(&key) {
+            Some(previous) => now_ms.saturating_sub(*previous) >= self.window_ms,
+            None => true,
+        };
+        if allow {
+            // 顺手清掉过期项：键集合最坏是「fs_id × 见过的映像数」，不会无界增长。
+            self.last
+                .retain(|_, at| now_ms.saturating_sub(*at) < self.window_ms);
+            self.last.insert(key, now_ms);
+        }
+        allow
+    }
+
+    /// 当前记账的键数量（测试用；发布构建不保留）。
+    #[cfg(test)]
+    pub fn tracked(&self) -> usize {
+        self.last.len()
     }
 }
 
@@ -551,5 +617,56 @@ mod tests {
         std::env::set_var(key, "1");
         assert!(resolve_notifications_enabled(false), "显式开启也要生效");
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn image_label_keeps_only_the_executable_basename() {
+        assert_eq!(
+            image_label("C:\\Windows\\explorer.exe").as_deref(),
+            Some("explorer.exe")
+        );
+        assert_eq!(
+            image_label("C:/Program Files/Pandock/pandock.exe").as_deref(),
+            Some("pandock.exe")
+        );
+        // 设备前缀（\\?\ 形态）也要能吃下。
+        assert_eq!(
+            image_label("\\\\?\\C:\\Windows\\System32\\dllhost.exe").as_deref(),
+            Some("dllhost.exe")
+        );
+        // 大小写归一，便于按映像聚合。
+        assert_eq!(
+            image_label("  C:\\Windows\\Explorer.EXE  ").as_deref(),
+            Some("explorer.exe")
+        );
+        assert_eq!(image_label(""), None);
+        assert_eq!(image_label("   "), None);
+        assert_eq!(image_label("C:\\Windows\\").as_deref(), Some("windows"));
+    }
+
+    #[test]
+    fn identity_log_limiter_collapses_repeats_inside_the_window() {
+        let mut limiter = IdentityLogLimiter::new(IDENTITY_LOG_WINDOW_MS);
+        assert!(limiter.should_log(1, "explorer.exe", 1_000));
+        // 同一 (fs_id, image) 在窗口内只记一条。
+        assert!(!limiter.should_log(1, "explorer.exe", 1_000 + IDENTITY_LOG_WINDOW_MS - 1));
+        // 换文件（fs_id）或换打开者（image）都算新键，必须能看到。
+        assert!(limiter.should_log(2, "explorer.exe", 1_100));
+        assert!(limiter.should_log(1, "pandock.exe", 1_100));
+        // 到期后再次放行。
+        assert!(limiter.should_log(1, "explorer.exe", 1_000 + IDENTITY_LOG_WINDOW_MS));
+        assert_eq!(limiter.tracked(), 3);
+    }
+
+    #[test]
+    fn identity_log_limiter_prunes_expired_keys() {
+        let mut limiter = IdentityLogLimiter::new(IDENTITY_LOG_WINDOW_MS);
+        for fs_id in 0..50 {
+            assert!(limiter.should_log(fs_id, "explorer.exe", 10_000));
+        }
+        assert_eq!(limiter.tracked(), 50);
+        // 一个窗口之后旧键全部过期，只留刚记下的这一条。
+        assert!(limiter.should_log(999, "explorer.exe", 10_000 + IDENTITY_LOG_WINDOW_MS));
+        assert_eq!(limiter.tracked(), 1);
     }
 }
