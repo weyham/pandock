@@ -73,6 +73,33 @@ Secret Key、Refresh Token 和 WebDAV 密码存储于系统凭据库。普通配
 
 在设置窗口点击“断开连接”。该操作删除当前 Refresh Token，但保留 App Key、应用名称和非敏感配置。之后可重新发起设备码授权。
 
+## NativeSync 本地变更捕获的紧急开关
+
+NativeSync 会注册删除 / 改名 / 脱水 / 开闭完成的 Cloud Files 回调，用来把本地变更
+实时记成「本地已变更、尚未同步到云端」（S1 **不上传**）。若这些回调在某些环境下
+导致资源管理器操作卡顿，可以整体关闭捕获——**只读召回（双击打开）与占位符创建不受影响**。
+
+关闭顺序（从最轻到最终手段）：
+
+1. 在 `config.json` 里设 `"nativeSyncNotifications": false`，重启应用；
+2. 若配置无法编辑，改用环境变量（**优先级最高**，用于免编辑恢复）：
+
+   ```powershell
+   $env:PANDOCK_NATIVESYNC_NOTIFICATIONS = "0"
+   ```
+
+3. 启动日志会打印生效值，可用于确认：
+
+   ```text
+   native-sync notifications effective=false config=false env=0
+   ```
+
+恢复：删除该环境变量、或把 `nativeSyncNotifications` 改回 `true`，重启应用。
+
+关闭捕获后，`native_sync_status` 的 `notificationsEnabled` 为 `false`，
+`pandock://nativesync/change` 不再有事件；此前已记录的待同步标记仍保留在
+`data/native-sync/sync.db` 里，重新开启后继续生效。
+
 ## 诊断日志
 
 日志用于定位连接和协议错误，不得记录凭据、完整授权头或用户文件内容。对外提供日志前必须删除账号、路径、Token、Cookie、文件名和 IP 等敏感信息。

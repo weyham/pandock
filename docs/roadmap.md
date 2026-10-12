@@ -50,6 +50,7 @@
 - 同步时回读 `FILE_ATTRIBUTE_PINNED` / `FILE_ATTRIBUTE_UNPINNED`，修正固定状态错位。
 - `remote_entry` upsert 兼容 `remote_path` 唯一约束，消除「目录建出但文件缺失」的同步中断。
 - 已知限制：本地新建/编辑/删除/改名不上传云端（单向 remote -> local），原因见 ADR-108。
+- 已知限制：本地新建/编辑/删除/改名**已实时捕获**（`pendingEntries` / `pandock://nativesync/change`），但仍不上传云端（S1 单向），见 ADR-109；视觉呈现待 UI 小切片。
 ## 1.3.0 候选
 
 - NativeSync 双向同步与冲突处理。
