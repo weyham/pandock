@@ -196,6 +196,10 @@ impl NativeSyncManager {
         self.status()
     }
     pub async fn sync_now(&mut self) -> Result<NativeSyncStatusView, NativeSyncError> {
+        // 每轮一个 run id：串联该轮全部相关日志，便于判定“一次运行 vs 两次运行”。
+        static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let run_id = RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.platform.set_run_id(run_id);
         let Some((root, enabled, _)) = self.db.root().map_err(NativeSyncError::Message)? else {
             return Err(NativeSyncError::Message("请先启用 NativeSync".into()));
         };
@@ -345,10 +349,10 @@ impl NativeSyncManager {
             }
         }
         // 每轮对账一行 info 汇总：一眼看出"有没有重复转换"，便于与 fsutil 对照。
-        let (checked, placeholders, converted) = self.platform.take_probe_summary();
+        let (checked, placeholders, converted, convert_failed) = self.platform.take_probe_summary();
         if checked > 0 {
             log::info!(
-                "native-sync existing-path probe checked={checked} placeholders={placeholders} converted={converted}"
+                "native-sync existing-path probe run={run_id} checked={checked} placeholders={placeholders} converted={converted} convert_failed={convert_failed}"
             );
         }
         let missing = self

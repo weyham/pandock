@@ -174,8 +174,9 @@ pub trait PlatformSync: Send + Sync {
     /// 紧急开关：关闭后不再注册/处理本地变更通知（保留只读召回与占位符创建）。
     fn set_notifications_enabled(&mut self, _enabled: bool) {}
     /// 取出并清空"已存在路径判定"的一次性统计 `(checked, placeholders, converted)`。
-    fn take_probe_summary(&mut self) -> (usize, usize, usize) {
-        (0, 0, 0)
+    fn set_run_id(&mut self, _run_id: u64) {}
+    fn take_probe_summary(&mut self) -> (usize, usize, usize, usize) {
+        (0, 0, 0, 0)
     }
     /// 若占位符被平台标成"未同步"且**内容确实与云端一致**，把它恢复为 in-sync。
     /// 前置条件（`has_pending_change` / `snapshot_matches`）由调用方从索引库给出。
@@ -425,7 +426,8 @@ mod windows_impl {
         connection: Option<CF_CONNECTION_KEY>,
         runtime: Arc<Runtime>,
         /// 每次 `sync_now` 期间"已存在路径判定"的统计：(检查数, 判为占位符数, 实际转换数)。
-        probe_stats: Mutex<(usize, usize, usize)>,
+        probe_stats: Mutex<(usize, usize, usize, usize)>,
+        run_id: std::sync::atomic::AtomicU64,
     }
     type EventSink = Arc<dyn Fn(crate::model::NativeSyncEvent) + Send + Sync>;
     type ChangeSink = Arc<dyn Fn(crate::model::NativeSyncChangeEvent) + Send + Sync>;
@@ -2942,15 +2944,19 @@ mod windows_impl {
             self.root.take();
             Ok(())
         }
-        fn take_probe_summary(&mut self) -> (usize, usize, usize) {
+        fn set_run_id(&mut self, run_id: u64) {
+            self.run_id
+                .store(run_id, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn take_probe_summary(&mut self) -> (usize, usize, usize, usize) {
             self.probe_stats
                 .lock()
                 .map(|mut s| {
                     let out = *s;
-                    *s = (0, 0, 0);
+                    *s = (0, 0, 0, 0);
                     out
                 })
-                .unwrap_or((0, 0, 0))
+                .unwrap_or((0, 0, 0, 0))
         }
         fn repair_in_sync_if_needed(
             &mut self,
@@ -3076,7 +3082,8 @@ mod windows_impl {
                         // 恢复条件：用诊断模式证明"探测结论 == CF 真值"后，才允许重新启用
                         // （届时单独提交 + 失败测试）。
                         log::warn!(
-                            "native-sync would convert existing path back to a placeholder, but auto-conversion is gated pending probe validation (dir={is_dir}) attrs=0x{attrs:08X}"
+                            "native-sync would convert existing path back to a placeholder, but auto-conversion is gated pending probe validation run={} (dir={is_dir}) attrs=0x{attrs:08X}",
+                            self.run_id.load(std::sync::atomic::Ordering::Relaxed)
                         );
                     }
                 }
