@@ -504,6 +504,51 @@ mod windows_impl {
         Some(u64::from_le_bytes(bytes.try_into().ok()?))
     }
 
+    /// 只读探测占位符的 in-sync 状态（**纯观测，不改任何行为**）。
+    ///
+    /// CFAPI **没有** `CfGetInSyncState`（只有 `CfSetInSyncState`），读状态必须用
+    /// `CfGetPlaceholderInfo(CF_PLACEHOLDER_INFO_BASIC)` 取 `CF_PLACEHOLDER_BASIC_INFO.InSyncState`。
+    ///
+    /// 为什么把它做成常驻告警而不是临时探针：这个状态**没有任何外部只读路径**
+    /// （外部进程调用被 0x8007018B 拒、`fsutil` 不暴露、索引库不记录），
+    /// 一旦它错了——Explorer 会因此禁用「释放空间」并显示"同步挂起"箭头——我们就是盲的。
+    /// 所以：**只在不是 `IN_SYNC` 时 `warn`**，正常与查询失败都走 `debug`，避免刷屏。
+    /// 只记 `kind`（file/dir），不记文件名（隐私纪律）。
+    fn probe_in_sync(path: &Path, kind: &str) {
+        let Ok(handle) = file_handle(path, false) else {
+            return;
+        };
+        // `FileIdentity` 是柔性数组，缓冲区留出余量，避免 ERROR_MORE_DATA 而拿不到状态。
+        let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 64];
+        let mut returned = 0u32;
+        let r = unsafe {
+            CfGetPlaceholderInfo(
+                handle,
+                CF_PLACEHOLDER_INFO_BASIC,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                Some(&mut returned),
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        match r {
+            Ok(()) => {
+                let info = unsafe { &*(buf.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO) };
+                if info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC {
+                    log::debug!("native-sync in-sync probe in_sync=true kind={kind}");
+                } else {
+                    log::warn!("native-sync in-sync probe not_in_sync=true kind={kind}");
+                }
+            }
+            Err(error) => log::debug!(
+                "native-sync in-sync probe unavailable kind={kind} hr=0x{:08X}",
+                error.code().0 as u32
+            ),
+        }
+    }
+
     /// 把单个路径标记为「与云端已同步」。
     ///
     /// 不标记时资源管理器的「状态」列会显示为**同步挂起**（蓝色循环箭头）——
@@ -2753,6 +2798,7 @@ mod windows_impl {
                                 path.display()
                             );
                         }
+                        probe_in_sync(path, if is_dir { "dir" } else { "file" });
                     }
                     // 已存在但**不是占位符**（例如曾被注销转成普通文件）：就地转回占位符。
                     // 这是唯一非破坏性的自愈手段——保留内容与 PINNED 位。
@@ -2783,6 +2829,7 @@ mod windows_impl {
                         log::info!(
                             "native-sync self-healed existing path back to a placeholder (dir={is_dir})"
                         );
+                        probe_in_sync(path, if is_dir { "dir" } else { "file" });
                     }
                 }
                 return Ok(());
@@ -2808,18 +2855,22 @@ mod windows_impl {
                 unsafe {
                     let _ = CloseHandle(h);
                 }
-                return r.map_err(|e| {
+                r.map_err(|e| {
                     log::warn!(
                         "native-sync dir placeholder convert failed: {} error={e}",
                         path.display()
                     );
                     PlatformError::Api(e.to_string())
-                });
+                })?;
+                probe_in_sync(path, "dir");
+                return Ok(());
             }
             // P0-1: 在线文件占位符必须无磁盘数据。MARK_IN_SYNC + set_len 的满尺寸文件
             // 会被 Explorer 视为内容已在本地，双击不触发 FETCH_DATA，消费者读到全零。
             // 必须用 CfCreatePlaceholders 通过 CF_FS_METADATA 声明 FileSize。
-            create_dataless_file_placeholder(path, size, identity)
+            create_dataless_file_placeholder(path, size, identity)?;
+            probe_in_sync(path, "file");
+            Ok(())
         }
         fn pin(&mut self, path: &Path, pinned: bool) -> Result<(), PlatformError> {
             let h = file_handle(path, false)?;
