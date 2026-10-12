@@ -436,6 +436,34 @@ mod windows_impl {
             .map(|rest| rest.trim_start_matches('/').to_string())
             .filter(|rel| !rel.is_empty())
     }
+    /// 把单个路径标记为「与云端已同步」。
+    ///
+    /// 不标记时资源管理器的「状态」列会显示为**同步挂起**（蓝色循环箭头）——
+    /// 这是 2026-10-12 实测定位的根因：`CfSetInSyncState` 此前只在「释放空间」
+    /// 流程里被调用，占位符创建与水合完成两处都漏了。
+    ///
+    /// 关于旧注释「完整 hydration 后不得调用 CfSetInSyncState」：该结论来自更早的
+    /// `set_len` 满尺寸文件 + MARK_IN_SYNC 组合（那种文件本是普通文件）。当前实现用
+    /// `CfCreatePlaceholders` 创建**标准无数据占位符**，2026-10-12 在真机实验验证：
+    /// 调用成功、REPARSE 保持不变（attrs 0x420 前后一致），状态列随即从「挂起」变
+    /// 为正常图标。旧结论对当前实现不适用。
+    fn mark_path_in_sync(path: &Path) -> Result<(), PlatformError> {
+        let handle = file_handle(path, true)?;
+        let mut usn = 0i64;
+        let result = unsafe {
+            CfSetInSyncState(
+                handle,
+                CF_IN_SYNC_STATE_IN_SYNC,
+                CF_SET_IN_SYNC_FLAG_NONE,
+                Some(&mut usn),
+            )
+        };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        result.map_err(|e| PlatformError::Api(e.to_string()))
+    }
+
     fn placeholder_fs_metadata(size: u64) -> CF_FS_METADATA {
         let mut metadata: CF_FS_METADATA = unsafe { std::mem::zeroed() };
         metadata.BasicInfo.FileAttributes = FILE_ATTRIBUTE_NORMAL.0;
@@ -489,6 +517,15 @@ mod windows_impl {
             );
             PlatformError::Api(format!("CfCreatePlaceholders 调用失败: {e}"))
         })?;
+        if infos[0].Result.is_ok() {
+            // 标记为已同步，否则 Explorer 状态列显示「同步挂起」。
+            if let Err(error) = mark_path_in_sync(path) {
+                log::warn!(
+                    "native-sync mark in-sync failed after placeholder create: {} error={error}",
+                    path.display()
+                );
+            }
+        }
         if infos[0].Result.is_err() {
             log::warn!(
                 "native-sync file placeholder failed: {} size={size} hr=0x{:08X}",
@@ -537,8 +574,10 @@ mod windows_impl {
         };
         // 自愈：db 解析结果写回内存，后续回调直接命中。
         if let Ok(mut by_id) = runtime.by_id.write() {
-            by_id.insert(file_id, (remote.clone(), relative));
+            by_id.insert(file_id, (remote.clone(), relative.clone()));
         }
+        // 水合完成后标记 in-sync 需要本地路径；relative 稍后会被 move，这里先留一份。
+        let relative_for_mark = relative.clone();
         let job_id = db
             .as_ref()
             .and_then(|db| db.hydration_started(file_id, 0).ok());
@@ -627,10 +666,9 @@ mod windows_impl {
             })
             .map_err(|e| e.to_string())
         })();
-        // 注意：完整 hydration 后不得调用 CfSetInSyncState。真实机取证 + spike 对照
-        // （POST-READ ATTR 证据）证明：对已充满数据的占位符设置 in-sync 会把占位符
-        // 提升为普通文件（丢失 REPARSE，dehydrate/远端删除策略随之失效）。
-        // 保持占位符原状即可：数据已在本地，后续读取由 cldflt 直接服务。
+        // 完整 hydration 后同样要标记 in-sync，否则已下载文件在 Explorer 里
+        // 一直显示「同步挂起」。旧注释所称「会把占位符提升为普通文件」已被
+        // 2026-10-12 真机实验推翻（标准无数据占位符上调用的前后 attrs 与 REPARSE 不变）。
         match &result {
             Ok(hydrated) => log::info!(
                 "native-sync fetch done fs_id={file_id} bytes={} full_file={}",
@@ -638,6 +676,19 @@ mod windows_impl {
                 hydrated.full_file
             ),
             Err(error) => log::warn!("native-sync fetch failed fs_id={file_id} error={error}"),
+        }
+        // 完整水合成功后标记 in-sync，使 Explorer 状态列从「同步挂起」变为正常图标。
+        if let Ok(hydrated) = &result {
+            if hydrated.full_file {
+                if let Some(root) = runtime.root.read().ok().and_then(|guard| guard.clone()) {
+                    let local = root.join(relative_for_mark.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    if let Err(error) = mark_path_in_sync(&local) {
+                        log::warn!(
+                            "native-sync mark in-sync failed after hydration: fs_id={file_id} error={error}"
+                        );
+                    }
+                }
+            }
         }
         if let (Some(db), Some(job_id)) = (db.as_ref(), job_id) {
             match &result {
@@ -1171,9 +1222,14 @@ mod windows_impl {
             identity: &[u8],
         ) -> Result<(), PlatformError> {
             if path.exists() {
-                // 已存在即跳过。若该路径是被 create_dir_all 顺带建出的普通目录，
-                // 它会永远停留在"非占位符"状态——这是待修缺陷，先记录以便定位。
-                log::debug!("native-sync placeholder skipped (exists): {}", path.display());
+                // 已存在（重启后的正常路径）：只需确保它被标记为「与云端已同步」，
+                // 否则 Explorer 状态列会一直显示「同步挂起」。
+                if let Err(error) = mark_path_in_sync(path) {
+                    log::debug!(
+                        "native-sync mark in-sync skipped for existing path: {} error={error}",
+                        path.display()
+                    );
+                }
                 return Ok(());
             }
             if let Some(p) = path.parent() {
