@@ -241,6 +241,13 @@ impl NativeSyncManager {
                     snapshot.size,
                     &fs_id.to_le_bytes(),
                 )?;
+                // 回读文件系统上的真实 pin 状态：只跟自己的操作走会与磁盘不一致
+                // （实测：磁盘 PINNED、数据库 unpinned，界面与 Explorer 互相矛盾）。
+                if !snapshot.is_dir() {
+                    if let Some(pinned) = self.platform.pin_state(&local) {
+                        let _ = self.db.set_pin_state(fs_id, pinned);
+                    }
+                }
                 if snapshot.is_dir() {
                     queue.push(snapshot.path.clone());
                 }
@@ -398,8 +405,11 @@ impl NativeSyncManager {
                         }
                     }
                 }
-                self.platform.mark_in_sync(&local)?;
+                // 顺序很重要：先释放空间，再标记 in-sync。
+                // 反过来会在 dehydrate 之后留下「同步挂起」状态
+                // （2026-10-12 实测：先 mark 后 dehydrate，资源管理器显示蓝色循环箭头）。
                 self.platform.dehydrate(&local)?;
+                self.platform.mark_in_sync(&local)?;
                 self.db
                     .set_state_by_fs_id(fs_id, "online_only", None)
                     .map_err(NativeSyncError::Message)?;
@@ -567,6 +577,9 @@ mod manager_tests {
                 .unwrap()
                 .push(format!("dehydrate:{}", path.display()));
             Ok(())
+        }
+        fn pin_state(&self, _path: &Path) -> Option<bool> {
+            None
         }
         fn mark_in_sync(&mut self, _path: &Path) -> Result<(), PlatformError> {
             self.calls.lock().unwrap().push("mark_in_sync".into());

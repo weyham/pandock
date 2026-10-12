@@ -24,15 +24,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("== remote_entry ==");
     let mut st = conn.prepare(
-        "SELECT fs_id,parent_fs_id,remote_path,is_dir,tombstone FROM remote_entry ORDER BY remote_path",
+        "SELECT fs_id,parent_fs_id,remote_path,is_dir,tombstone,size FROM remote_entry ORDER BY remote_path",
     )?;
     let rows = st.query_map([], |r| {
         Ok(format!(
-            "  fs_id={:<22} parent={:<22} dir={} tomb={} path={}",
+            "  fs_id={:<22} dir={} size={:<12} path={}",
             r.get::<_, i64>(0)?,
-            r.get::<_, Option<i64>>(1)?.unwrap_or(-1),
             r.get::<_, i64>(3)?,
-            r.get::<_, i64>(4)?,
+            r.get::<_, i64>(5)?,
             r.get::<_, String>(2)?
         ))
     })?;

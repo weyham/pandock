@@ -38,6 +38,9 @@ pub trait PlatformSync: Send + Sync {
     fn pin(&mut self, path: &Path, pinned: bool) -> Result<(), PlatformError>;
     fn dehydrate(&mut self, path: &Path) -> Result<(), PlatformError>;
     fn mark_in_sync(&mut self, path: &Path) -> Result<(), PlatformError>;
+    /// 从文件系统回读 pin 状态（None = 未知/非占位符）。
+    /// CFAPI 会把「固定到本地」镜像到 FILE_ATTRIBUTE_PINNED 属性位。
+    fn pin_state(&self, path: &Path) -> Option<bool>;
     fn remove_placeholder(&mut self, path: &Path, is_dir: bool) -> Result<(), PlatformError>;
 }
 
@@ -87,6 +90,9 @@ impl PlatformSync for StubPlatform {
     }
     fn dehydrate(&mut self, _: &Path) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported("Windows Cloud Files API".into()))
+    }
+    fn pin_state(&self, _: &Path) -> Option<bool> {
+        None
     }
     fn mark_in_sync(&mut self, _: &Path) -> Result<(), PlatformError> {
         Err(PlatformError::Unsupported("Windows Cloud Files API".into()))
@@ -1286,6 +1292,19 @@ mod windows_impl {
                 let _ = CloseHandle(h);
             }
             r.map_err(|e| PlatformError::Api(e.to_string()))
+        }
+        fn pin_state(&self, path: &Path) -> Option<bool> {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_PINNED: u32 = 0x0008_0000;
+            const FILE_ATTRIBUTE_UNPINNED: u32 = 0x0010_0000;
+            let attrs = std::fs::metadata(path).ok()?.file_attributes();
+            if attrs & FILE_ATTRIBUTE_PINNED != 0 {
+                Some(true)
+            } else if attrs & FILE_ATTRIBUTE_UNPINNED != 0 {
+                Some(false)
+            } else {
+                None
+            }
         }
         fn mark_in_sync(&mut self, path: &Path) -> Result<(), PlatformError> {
             let h = file_handle(path, true)?;
