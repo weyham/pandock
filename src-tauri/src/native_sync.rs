@@ -6,7 +6,7 @@ use pandock_nativesync::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager};
 
 /// 命令边界的失败留痕：任何返回给 UI 的错误都在这里 warn 一次（命令名 + 错误内容，不含文件名）。
 fn fail(command: &str, error: NativeSyncError) -> String {
@@ -260,31 +260,6 @@ pub async fn native_sync_action(
     };
     emit_state(&app, &status);
     Ok(status)
-}
-/// 同步资源浏览窗口的创建/聚焦逻辑；托盘菜单与 Tauri 命令共用。
-pub fn open_manager_window(app: &AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("native-sync-manager") {
-        window.unminimize().map_err(|e| e.to_string())?;
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    WebviewWindowBuilder::new(
-        app,
-        "native-sync-manager",
-        WebviewUrl::App("index.html".into()),
-    )
-    .title("同步资源浏览")
-    .inner_size(1100.0, 720.0)
-    .resizable(true)
-    .build()
-    .map(|_| ())
-    .map_err(|e| format!("创建同步资源浏览窗口失败: {e}"))
-}
-
-#[tauri::command]
-pub async fn native_sync_open_manager(app: AppHandle) -> Result<(), String> {
-    open_manager_window(&app)
 }
 #[tauri::command]
 pub async fn native_sync_open_in_explorer(

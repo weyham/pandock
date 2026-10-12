@@ -285,6 +285,11 @@ export function App() {
   const enableNativeSync = () => void runNativeSync("native_sync_enable", "native_sync_enable", { rootPath: nativeSyncRoot.trim() || null });
   const disableNativeSync = () => void runNativeSync("native_sync_disable", "native_sync_disable", { unregister: false });
   const syncNativeNow = () => void runNativeSync("native_sync_sync_now", "native_sync_sync_now");
+  const openNativeSyncRoot = () => {
+    setNativeSyncError("");
+    void busy.run("native_sync_open_root", () => invoke("native_sync_open_in_explorer", { relativePath: "" }))
+      .catch((error) => setNativeSyncError(String(error)));
+  };
 
   const renderUpdateError = () => {
     const error = updateState.error;
@@ -364,7 +369,7 @@ export function App() {
           </div>
         </div>
       </section>}
-      {page === "nativesync" && nativeSyncSupported && <NativeSyncSettings status={nativeSync} statusError={nativeSyncError} rootPath={nativeSyncRoot} setRootPath={setNativeSyncRoot} onRefresh={() => void refreshNativeSync()} onEnable={enableNativeSync} onDisable={disableNativeSync} onSyncNow={syncNativeNow} busy={busy} />}
+      {page === "nativesync" && nativeSyncSupported && <NativeSyncSettings status={nativeSync} statusError={nativeSyncError} rootPath={nativeSyncRoot} setRootPath={setNativeSyncRoot} onRefresh={() => void refreshNativeSync()} onEnable={enableNativeSync} onDisable={disableNativeSync} onSyncNow={syncNativeNow} onOpenRoot={openNativeSyncRoot} busy={busy} />}
       {page === "about" && <>
         <div className="page-head">
           <div>

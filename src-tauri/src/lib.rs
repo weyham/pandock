@@ -1228,9 +1228,6 @@ pub fn run() {
             let status_item = MenuItemBuilder::with_id("status", "Pandock · 未配置")
                 .enabled(false)
                 .build(app)?;
-            let sync_manager = MenuItemBuilder::with_id("sync-manager", "打开同步资源浏览")
-                .enabled(true)
-                .build(app)?;
             let settings = MenuItemBuilder::with_id("settings", "打开设置")
                 .enabled(true)
                 .build(app)?;
@@ -1247,7 +1244,7 @@ pub fn run() {
                 .enabled(true)
                 .build(app)?;
             let menu = MenuBuilder::new(app)
-                .items(&[&status_item, &sync_manager, &settings, &autostart, &quit])
+                .items(&[&status_item, &settings, &autostart, &quit])
                 .build()?;
             *state.status_item.lock().unwrap() = Some(status_item);
             *state.autostart_item.lock().unwrap() = Some(autostart);
@@ -1259,9 +1256,6 @@ pub fn run() {
                 .on_menu_event(move |app, event| {
                     log::info!("tray menu event: {}", event.id.as_ref());
                     match event.id.as_ref() {
-                    "sync-manager" => {
-                        let _ = crate::native_sync::open_manager_window(app);
-                    }
                     "settings" => show_settings(app),
 
                     "autostart" => {
@@ -1284,25 +1278,8 @@ pub fn run() {
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::DoubleClick { .. } = event {
-                        // 双击：NativeSync 已启用 → 同步资源浏览；未启用 → 回退设置面板。
-                        let app = tray.app_handle().clone();
-                        tauri::async_runtime::spawn(async move {
-                            let open_sync = {
-                                let state = app.state::<AppState>();
-                                let guard = state.native_sync.lock().await;
-                                match guard.as_ref() {
-                                    Some(manager) => {
-                                        matches!(manager.status(), Ok(s) if s.enabled)
-                                    }
-                                    None => false,
-                                }
-                            };
-                            if open_sync {
-                                let _ = crate::native_sync::open_manager_window(&app);
-                            } else {
-                                show_settings(&app);
-                            }
-                        });
+                        // 退役独立窗口后，双击一律打开设置页（不再按 NativeSync 状态分流）。
+                        show_settings(tray.app_handle());
                     }
                 })
                 .build(app)?;
@@ -1425,7 +1402,6 @@ pub fn run() {
             native_sync::native_sync_sync_now,
             native_sync::native_sync_list,
             native_sync::native_sync_action,
-            native_sync::native_sync_open_manager,
             native_sync::native_sync_open_in_explorer
         ])
         .run(tauri::generate_context!())

@@ -49,25 +49,6 @@ const FileIcon = () => (
     <path d="M4 1.5h4.5L12 5v8.5a1.5 1.5 0 0 1-1.5 1.5h-6A1.5 1.5 0 0 1 3 13.5v-11A1.5 1.5 0 0 1 4.5 1z" fill="#8ea2b8" />
   </svg>
 );
-const FolderIconLarge = () => (
-  <svg className="native-sync-icon-lg" width="44" height="44" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-    <path d="M1.5 3.5A1.5 1.5 0 0 1 3 2h3.2a1.5 1.5 0 0 1 1.1.5L8.5 4H13a1.5 1.5 0 0 1 1.5 1.5v6A1.5 1.5 0 0 1 13 13H3a1.5 1.5 0 0 1-1.5-1.5v-8z" fill="#d5b34c" />
-  </svg>
-);
-const FileIconLarge = () => (
-  <svg className="native-sync-icon-lg" width="40" height="44" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-    <path d="M4 1.5h4.5L12 5v8.5a1.5 1.5 0 0 1-1.5 1.5h-6A1.5 1.5 0 0 1 3 13.5v-11A1.5 1.5 0 0 1 4.5 1z" fill="#8ea2b8" />
-  </svg>
-);
-
-const shortStateLabels: Record<string, string> = {
-  online_only: "仅在线", hydrating: "下载中", hydrated: "已下载", error: "错误", remote_missing: "远端已删", stale: "有更新",
-};
-function shortStateLabel(entry: NativeSyncEntry) {
-  if (entry.state === "hydrating" && entry.progress != null) return formatNativeSyncProgress(entry.progress);
-  return shortStateLabels[entry.state] || entry.state;
-}
-
 export function formatNativeSyncSize(size: number) {
   if (!Number.isFinite(size) || size < 1024) return `${Math.max(0, size || 0)} B`;
   const units = ["KB", "MB", "GB", "TB"];
@@ -109,10 +90,10 @@ export function syncStateLabel(status: NativeSyncStatus | null) {
 }
 
 export function NativeSyncSettings({
-  status, statusError, rootPath, setRootPath, onRefresh, onEnable, onDisable, onSyncNow, busy,
+  status, statusError, rootPath, setRootPath, onRefresh, onEnable, onDisable, onSyncNow, onOpenRoot, busy,
 }: {
   status: NativeSyncStatus | null; statusError: string; rootPath: string; setRootPath: (value: string) => void;
-  onRefresh: () => void; onEnable: () => void; onDisable: () => void; onSyncNow: () => void;
+  onRefresh: () => void; onEnable: () => void; onDisable: () => void; onSyncNow: () => void; onOpenRoot: () => void;
   busy: ReturnType<typeof useDelayedBusy>;
 }) {
   const supported = status?.supported ?? true;
@@ -136,231 +117,151 @@ export function NativeSyncSettings({
             : <button className="secondary" disabled={busy.pending("native_sync_disable")} onClick={onDisable}>{busy.spinning("native_sync_disable") && <Spinner />}停止同步</button>}
           <button className="secondary" disabled={!enabled || busy.pending("native_sync_sync_now")} onClick={onSyncNow}>{busy.spinning("native_sync_sync_now") && <Spinner />}立即同步</button>
           <button className="link-button native-sync-refresh" disabled={busy.pending("native_sync_status")} onClick={onRefresh}>{busy.spinning("native_sync_status") && <Spinner />}刷新状态</button>
+          {enabled && <button className="secondary" disabled={busy.pending("native_sync_open_root")} onClick={onOpenRoot}>{busy.spinning("native_sync_open_root") && <Spinner />}打开根目录</button>}
         </div>
+        {enabled && <NativeSyncEntryList busy={busy} />}
       </>}
     </div>
   </section>;
 }
 
-type TreeNodeState = { dirs: NativeSyncEntry[] | null; expanded: boolean; loading: boolean; error: string | null };
-
-export function ManagerApp() {
-  const [status, setStatus] = React.useState<NativeSyncStatus | null>(null);
-  const [statusError, setStatusError] = React.useState("");
+/** 同步条目列表（设置页内的操作面）。
+ *
+ * 默认视图 = 「可操作的条目」：全树扁平、显示相对路径，只收**已下载 / 已固定 / 需处理 / 本地新建**
+ *（由后端 `native_sync_list` 的 `filter: "actionable"` 给出）——用户来这里是要操作，不是浏览。
+ * 「按目录浏览全部」可下钻到某个目录（顶部一行路径 + 「返回」），数据走现有 `native_sync_list(parentPath)`。
+ * 不做目录树 / 面包屑 / 地址栏 / 双栏 / 大图标网格——那是退役的独立窗口的职责。 */
+export function NativeSyncEntryList({ busy }: { busy: ReturnType<typeof useDelayedBusy> }) {
+  const [mode, setMode] = React.useState<"actionable" | "browse">("actionable");
+  const [browsePath, setBrowsePath] = React.useState("");
   const [entries, setEntries] = React.useState<NativeSyncEntry[]>([]);
   const [nextCursor, setNextCursor] = React.useState<string | null>(null);
-  const [currentPath, setCurrentPath] = React.useState("");
   const [loading, setLoading] = React.useState(true);
   const [listError, setListError] = React.useState("");
   const [actionError, setActionError] = React.useState("");
   const [acknowledgedMissing, setAcknowledgedMissing] = React.useState<ReadonlySet<string>>(new Set());
-  const [selectedFsId, setSelectedFsId] = React.useState<string | null>(null);
-  const [treeNodes, setTreeNodes] = React.useState<Record<string, TreeNodeState>>({});
-  const statusRef = React.useRef<NativeSyncStatus | null>(null);
+  const [selectedPath, setSelectedPath] = React.useState<string | null>(null);
 
-  /** 后端 db.root() 失败时 status() 会返回 enabled=false 的错误默认值（manager.rs unwrap_or），
-   *  保留上一次可信状态，避免整个浏览区被瞬时拆除导致目录树/节点消失。 */
-  const applyStatus = React.useCallback((next: NativeSyncStatus) => {
-    const previous = statusRef.current;
-    const looksLikeErrorDefault = !next.enabled && next.state === "disabled" && !next.rootPath && !next.lastError;
-    if (previous?.enabled && looksLikeErrorDefault) return;
-    statusRef.current = next;
-    setStatus(next);
-  }, []);
-  const busy = useDelayedBusy();
-
-  const loadStatus = React.useCallback(async () => {
-    try { applyStatus(await invoke<NativeSyncStatus>("native_sync_status")); setStatusError(""); }
-    catch (error) { setStatusError(String(error)); throw error; }
-  }, []);
-  const loadEntries = React.useCallback(async (parentPath: string, cursor?: string | null, append = false) => {
-    const result = await invoke<NativeSyncListResult>("native_sync_list", { parentPath: parentPath || null, cursor: cursor || null, limit: 50 });
+  /** 拉一页；`append=true` 时按 relativePath 去重合并（分页追加）。
+   *  注意：本地新建条目没有云端 fsId ⇒ 一律按 relativePath 键合（它总是存在且在视图内唯一）。 */
+  const loadPage = React.useCallback(async (cursor?: string | null, append = false) => {
+    const args = mode === "actionable"
+      ? { parentPath: null as string | null, cursor: cursor || null, limit: 50, filter: "actionable" as string | null }
+      : { parentPath: browsePath || null, cursor: cursor || null, limit: 50, filter: null as string | null };
+    const result = await invoke<NativeSyncListResult>("native_sync_list", args);
     setEntries((previous) => {
       if (!append) return result.entries || [];
-      const merged = new Map(previous.map((entry) => [entry.fsId, entry]));
-      for (const entry of result.entries || []) merged.set(entry.fsId, entry);
+      const merged = new Map(previous.map((entry) => [entry.relativePath, entry]));
+      for (const entry of result.entries || []) merged.set(entry.relativePath, entry);
       return [...merged.values()];
     });
     setNextCursor(result.nextCursor || null);
-  }, []);
-  const loadTreeChildren = React.useCallback(async (path: string) => {
-    try {
-      const result = await invoke<NativeSyncListResult>("native_sync_list", { parentPath: path || null, cursor: null, limit: 50 });
-      setTreeNodes((previous) => {
-        const current = previous[path] ?? { dirs: null, expanded: path === "", loading: false, error: null };
-        return { ...previous, [path]: { ...current, dirs: (result.entries || []).filter((entry) => entry.isDir), loading: false, error: null } };
-      });
-    } catch (error) {
-      setTreeNodes((previous) => {
-        const current = previous[path] ?? { dirs: null, expanded: false, loading: false, error: null };
-        return { ...previous, [path]: { ...current, loading: false, error: String(error) } };
-      });
-    }
-  }, []);
+  }, [mode, browsePath]);
+
   const refresh = React.useCallback(async () => {
     setListError("");
-    const outcomes = await Promise.allSettled([loadStatus(), loadEntries(currentPath)]);
-    const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
-    if (failure) setListError(String(failure.reason));
+    try { await loadPage(null, false); } catch (error) { setListError(String(error)); }
     setLoading(false);
-  }, [currentPath, loadEntries, loadStatus]);
-  React.useEffect(() => { setLoading(true); void refresh(); }, [refresh]);
-  React.useEffect(() => { void loadTreeChildren(""); }, [loadTreeChildren]);
+  }, [loadPage]);
+
   React.useEffect(() => {
-    const unlisten = listen<NativeSyncStatus>("pandock://nativesync/state", (event) => {
-      applyStatus(event.payload);
-      void loadEntries(currentPath).catch(() => undefined);
+    setLoading(true);
+    setSelectedPath(null);
+    void refresh();
+  }, [refresh]);
+  // 状态变化（同步完成 / 水合终态等）→ 重拉当前视图的第一页（与退役窗口同语义）。
+  React.useEffect(() => {
+    const unlisten = listen<NativeSyncStatus>("pandock://nativesync/state", () => {
+      void loadPage(null, false).catch(() => undefined);
     });
     return () => { void unlisten.then((off) => off()); };
-  }, [currentPath, loadEntries]);
+  }, [loadPage]);
 
-  const openPath = (path: string) => { if (path === currentPath) return; setCurrentPath(path); setSelectedFsId(null); setLoading(true); setListError(""); };
-  const toggleTreeNode = (path: string) => {
-    const node = treeNodes[path];
-    if (!node || (node.dirs === null && !node.loading)) {
-      setTreeNodes((previous) => ({ ...previous, [path]: { dirs: null, expanded: true, loading: true, error: null } }));
-      void loadTreeChildren(path);
-      return;
-    }
-    if (node.loading) return;
-    setTreeNodes((previous) => ({ ...previous, [path]: { ...node, expanded: !node.expanded } }));
+  const browseTo = (path: string) => { setMode("browse"); setBrowsePath(path); };
+  const browseBack = () => {
+    if (browsePath === "") { backToActionable(); return; }
+    setBrowsePath(browsePath.split("/").slice(0, -1).join("/"));
   };
+  const backToActionable = () => { setMode("actionable"); setBrowsePath(""); };
+
   const runAction = async (entry: NativeSyncEntry, action: NativeSyncAction) => {
-    const key = `native_sync_action_${entry.fsId}_${action}`;
+    const key = `native_sync_action_${entry.relativePath}_${action}`;
     setActionError("");
     try {
       const result = await busy.run(key, () => invoke<NativeSyncEntry | NativeSyncStatus>("native_sync_action", { relativePath: entry.relativePath, action }));
-      if (action === "ack_remote_missing") setAcknowledgedMissing((previous) => new Set(previous).add(entry.fsId));
-      if (result && "fsId" in result) {
-        setEntries((previous) => previous.map((item) => {
-          if (item.fsId !== entry.fsId) return item;
-          if (action === "ack_remote_missing") return item;
-          return { ...item, ...result };
-        }));
-      } else if (result && "enabled" in result) applyStatus(result);
-      await loadStatus();
-      await loadEntries(currentPath);
+      if (action === "ack_remote_missing") {
+        setAcknowledgedMissing((previous) => new Set(previous).add(entry.relativePath));
+      }
+      if (result && "fsId" in result && action !== "ack_remote_missing") {
+        setEntries((previous) => previous.map((item) => (item.relativePath === entry.relativePath ? { ...item, ...result } : item)));
+      }
+      await loadPage(null, false);
     } catch (error) { setActionError(String(error)); }
   };
   const openInExplorer = async (relativePath: string) => {
     const key = `native_sync_open_explorer_${relativePath}`;
+    setActionError("");
     try { await busy.run(key, () => invoke("native_sync_open_in_explorer", { relativePath })); }
     catch (error) { setActionError(String(error)); }
-  };
-  const syncNow = async () => {
-    setActionError("");
-    try { applyStatus(await busy.run("native_sync_sync_now", () => invoke<NativeSyncStatus>("native_sync_sync_now"))); }
-    catch (error) { setActionError(String(error)); }
-  };
-  const openRoot = async () => { await openInExplorer(""); };
-  const refreshNow = async () => {
-    setLoading(true);
-    try { await busy.run("native_sync_refresh", async () => { await refresh(); await loadTreeChildren(""); }); }
-    catch (error) { setListError(String(error)); setLoading(false); }
   };
   const loadMore = async () => {
     if (!nextCursor) return;
     setListError("");
-    try { await busy.run("native_sync_load_more", () => loadEntries(currentPath, nextCursor, true)); }
+    try { await busy.run("native_sync_load_more", () => loadPage(nextCursor, true)); }
     catch (error) { setListError(String(error)); }
   };
 
-  const breadcrumbs = currentPath ? currentPath.split("/").filter(Boolean) : [];
-  const unsupported = status?.supported === false;
-  const disabled = status?.supported === true && !status.enabled;
-  const selected = selectedFsId ? entries.find((entry) => entry.fsId === selectedFsId) ?? null : null;
+  const selected = selectedPath ? entries.find((entry) => entry.relativePath === selectedPath) ?? null : null;
+  const actionKey = (action: string) => (selected ? `native_sync_action_${selected.relativePath}_${action}` : "");
 
-  const renderTreeNode = (path: string, name: string, depth: number): React.ReactNode => {
-    const node = treeNodes[path] ?? { dirs: null, expanded: path === "", loading: false, error: null };
-    const expandable = node.dirs === null ? true : node.dirs.length > 0;
-    return <React.Fragment key={path || "root"}>
-      <div className={`native-sync-tree-row ${currentPath === path ? "current" : ""}`} style={{ paddingLeft: 8 + depth * 14 }}>
-        <button
-          type="button"
-          className="native-sync-tree-toggle"
-          aria-label={node.expanded ? `收起 ${name}` : `展开 ${name}`}
-          disabled={!expandable}
-          onClick={() => toggleTreeNode(path)}
-        >{node.loading ? <Spinner /> : node.expanded ? "▾" : "▸"}</button>
-        <button type="button" className="native-sync-tree-label" onClick={() => openPath(path)}>
-          <FolderIcon />
-          <span>{name}</span>
-        </button>
-      </div>
-      {node.error && <div className="native-sync-tree-error" style={{ paddingLeft: 34 + depth * 14 }}>{node.error}</div>}
-      {node.expanded && node.dirs?.map((dir) => renderTreeNode(dir.relativePath, dir.name, depth + 1))}
-    </React.Fragment>;
-  };
-
-  return <main className="native-sync-manager" data-testid="native-sync-manager">
-    <header className="native-sync-manager-header">
-      <div><p className="eyebrow">Pandock NativeSync</p><h1>同步资源浏览</h1><p className="status-line">只管理同步状态与按需下载，文件打开交给资源管理器。</p></div>
-      <div className="native-sync-header-actions">
-        {status && <span className={`chip ${status.enabled ? "chip-connected" : status.supported ? "chip-muted" : "chip-error"}`}>{syncStateLabel(status)}</span>}
-        <button className="secondary" disabled={busy.pending("native_sync_refresh")} onClick={() => void refreshNow()}>{busy.spinning("native_sync_refresh") && <Spinner />}刷新</button>
-        <button className="secondary" disabled={!status?.enabled || busy.pending("native_sync_sync_now")} onClick={() => void syncNow()}>{busy.spinning("native_sync_sync_now") && <Spinner />}立即同步</button>
-        <button className="secondary" disabled={!status?.enabled || busy.pending("native_sync_open_root")} onClick={() => void openRoot()}>{busy.spinning("native_sync_open_root") && <Spinner />}打开根目录</button>
-      </div>
-    </header>
-    {status && <p className="native-sync-oneline">
-      同步根 {status.rootPath || "未设置"} · 占位符 {status.placeholderEntries} · 已下载 {status.hydratedEntries} · 需处理 {status.attentionEntries}
-      {status.lastSyncAt ? ` · 上次同步 ${formatNativeSyncDate(status.lastSyncAt)}` : ""}{status.activeJobs ? ` · ${status.activeJobs} 个任务进行中` : ""}
-    </p>}
-    {statusError && !status && !loading && <div className="native-sync-manager-state" role="alert"><h2>无法读取 NativeSync 状态</h2><p>{statusError}</p><button onClick={() => void refreshNow()}>重试</button></div>}
-    {unsupported && <div className="native-sync-manager-state" role="alert"><h2>当前系统不支持 NativeSync</h2><p>{status?.supportReason || "需要 Windows 1903 或更高版本。"}</p></div>}
-    {disabled && <div className="native-sync-manager-state"><h2>NativeSync 尚未启用</h2><p>请先在 Pandock 设置中选择同步根目录并启用同步。</p></div>}
-    {!loading && !status && !statusError && <div className="native-sync-manager-state" role="status"><Spinner /><p>正在加载 NativeSync 状态…</p></div>}
-    {!unsupported && !disabled && status?.enabled && <>
-      <nav className="native-sync-addressbar" aria-label="地址栏">
-        <button type="button" className={`native-sync-crumb ${!currentPath ? "current" : ""}`} onClick={() => openPath("")}>同步根目录</button>
-        {breadcrumbs.map((part, index) => {
-          const path = breadcrumbs.slice(0, index + 1).join("/");
-          const last = index === breadcrumbs.length - 1;
-          return <React.Fragment key={path}>
-            <span className="native-sync-crumb-sep" aria-hidden="true">/</span>
-            <button type="button" className={`native-sync-crumb ${last ? "current" : ""}`} onClick={() => openPath(path)}>{part}</button>
-          </React.Fragment>;
-        })}
-      </nav>
-      <section className="native-sync-browser">
-        <aside className="native-sync-sidebar" aria-label="目录树">
-          {renderTreeNode("", "同步根目录", 0)}
-        </aside>
-        <div className="native-sync-content">
-          <div className="native-sync-content-header"><div><h2>{currentPath || "同步根目录"}</h2><p className="note">每页最多 50 项</p></div><span className="note">共 {status.totalEntries} 项</span></div>
-          {actionError && <div className="error-banner native-sync-inline-error" role="alert"><strong>操作失败</strong><p>{actionError}</p></div>}
-          {status.lastError && <div className="error-banner native-sync-inline-error" role="alert"><strong>同步需要处理</strong><p>{status.lastError}</p></div>}
-          {loading && <div className="native-sync-manager-state" role="status"><Spinner /><p>正在加载同步目录…</p></div>}
-          {!loading && listError && <div className="native-sync-manager-state" role="alert"><h2>无法加载同步目录</h2><p>{listError}</p><button onClick={() => void refreshNow()}>重试</button></div>}
-          {!loading && !listError && entries.length === 0 && <div className="native-sync-manager-state"><h2>此目录为空</h2><p>同步目录中暂时没有可显示的项目。</p></div>}
-          {!loading && !listError && entries.length > 0 && <>
-            <div className="native-sync-grid" data-testid="entry-grid" aria-label="同步条目">
-              {entries.map((entry) => <button type="button" key={entry.fsId} aria-label={entry.name} title={entry.error || entry.name}
-                className={`native-sync-cell ${selectedFsId === entry.fsId ? "selected" : ""}`}
-                onClick={() => setSelectedFsId(entry.fsId)}
-                onDoubleClick={() => entry.isDir ? openPath(entry.relativePath) : void openInExplorer(entry.relativePath)}>
-                <span className="native-sync-cell-icon">{entry.isDir ? <FolderIconLarge /> : <FileIconLarge />}
-                  <span className={`native-sync-cell-badge ${stateClasses[entry.state] || "native-sync-badge-online"}`}>{shortStateLabel(entry)}</span>
-                </span>
-                <span className="native-sync-cell-name">{entry.name}</span>
-              </button>)}
+  return <section className="native-sync-entrylist" aria-label="同步条目">
+    <div className="native-sync-entrylist-header">
+      {mode === "actionable"
+        ? <span className="note">可操作的条目（已下载 / 已固定 / 需处理）</span>
+        : <span className="note">浏览：{browsePath || "同步根目录"}</span>}
+      {mode === "actionable"
+        ? <button type="button" className="link-button native-sync-entrylist-browse" onClick={() => browseTo("")}>按目录浏览全部</button>
+        : <button type="button" className="link-button native-sync-entrylist-back" onClick={browseBack}>{browsePath === "" ? "返回可操作列表" : "返回上一级"}</button>}
+    </div>
+    {actionError && <div className="error-banner native-sync-inline-error" role="alert"><strong>操作失败</strong><p>{actionError}</p></div>}
+    {listError && <div className="native-sync-entrylist-error" role="alert"><strong>无法加载同步条目</strong><p>{listError}</p><button className="secondary" onClick={() => void refresh()}>重试</button></div>}
+    {loading && <div className="native-sync-entrylist-loading" role="status"><Spinner /><p className="note">正在加载同步条目…</p></div>}
+    {!loading && !listError && entries.length === 0 && (
+      <p className="note native-sync-entrylist-empty">{mode === "actionable" ? "当前没有可操作的条目（云端文件会先出现在资源管理器里）。" : "此目录为空。"}</p>
+    )}
+    {!loading && !listError && entries.length > 0 && <ul className="native-sync-entry-rows" data-testid="entry-rows">
+      {entries.map((entry) => {
+        const isSelected = entry.relativePath === selectedPath;
+        return <li key={entry.relativePath}>
+          <button type="button"
+            className={`native-sync-entry-row ${isSelected ? "selected" : ""}`}
+            title={entry.error || entry.name}
+            onClick={() => {
+              if (mode === "browse" && entry.isDir) { browseTo(entry.relativePath); return; }
+              setSelectedPath(isSelected ? null : entry.relativePath);
+            }}>
+            <span className="native-sync-entry-row-icon">{entry.isDir ? <FolderIcon /> : <FileIcon />}</span>
+            <span className="native-sync-entry-row-main">
+              <span className="native-sync-entry-row-name">{entry.name}</span>
+              {entry.relativePath !== entry.name && <span className="native-sync-entry-row-path">{entry.relativePath}</span>}
+            </span>
+            <NativeSyncBadge entry={entry} />
+            <span className="native-sync-entry-row-meta">{entry.isDir ? "目录" : formatNativeSyncSize(entry.size)}{entry.modifiedAt ? ` · ${formatNativeSyncDate(entry.modifiedAt)}` : ""}</span>
+          </button>
+          {isSelected && !loading && <div className="native-sync-entry-actions" aria-label="选中条目操作">
+            <span className="native-sync-entry-actions-name">{entry.isDir ? <FolderIcon /> : <FileIcon />}{entry.name}</span>
+            <div className="native-sync-entry-actions-buttons">
+              {!entry.isDir && entry.pinState !== "pinned" && <button className="secondary" title="始终保留在此设备上，不会被释放空间" disabled={busy.pending(actionKey("pin"))} onClick={() => void runAction(entry, "pin")}>{busy.spinning(actionKey("pin")) && <Spinner />}固定到本地</button>}
+              {!entry.isDir && entry.pinState === "pinned" && <button className="secondary" title="恢复为按需下载" disabled={busy.pending(actionKey("unpin"))} onClick={() => void runAction(entry, "unpin")}>{busy.spinning(actionKey("unpin")) && <Spinner />}取消固定</button>}
+              {!entry.isDir && entry.state === "hydrated" && entry.pinState !== "pinned" && <button className="secondary" disabled={busy.pending(actionKey("dehydrate"))} onClick={() => void runAction(entry, "dehydrate")}>{busy.spinning(actionKey("dehydrate")) && <Spinner />}释放空间</button>}
+              {entry.state === "error" && <button className="secondary" disabled={busy.pending(actionKey("retry"))} onClick={() => void runAction(entry, "retry")}>{busy.spinning(actionKey("retry")) && <Spinner />}重试</button>}
+              {entry.state === "remote_missing" && !acknowledgedMissing.has(entry.relativePath) && <button className="secondary" disabled={busy.pending(actionKey("ack_remote_missing"))} onClick={() => void runAction(entry, "ack_remote_missing")}>{busy.spinning(actionKey("ack_remote_missing")) && <Spinner />}已知悉</button>}
+              <button className="secondary" disabled={busy.pending(`native_sync_open_explorer_${entry.relativePath}`)} onClick={() => void openInExplorer(entry.relativePath)}>{busy.spinning(`native_sync_open_explorer_${entry.relativePath}`) && <Spinner />}打开所在位置</button>
             </div>
-            {nextCursor && <div className="native-sync-load-more"><button className="secondary" disabled={busy.pending("native_sync_load_more")} onClick={() => void loadMore()}>{busy.spinning("native_sync_load_more") && <Spinner />}加载更多</button></div>}
-          </>}
-        </div>
-      </section>
-    </>}
-    {selected && !loading && <div className="native-sync-actionbar" aria-label="选中条目操作">
-      <span className="native-sync-actionbar-name">{selected.isDir ? <FolderIcon /> : <FileIcon />}{selected.name}</span>
-      <div className="native-sync-actionbar-actions">
-        {!selected.isDir && selected.pinState !== "pinned" && <button className="secondary" title="始终保留在此设备上，不会被释放空间" disabled={busy.pending(`native_sync_action_${selected.fsId}_pin`)} onClick={() => void runAction(selected, "pin")}>{busy.spinning(`native_sync_action_${selected.fsId}_pin`) && <Spinner />}固定到本地</button>}
-        {!selected.isDir && selected.pinState === "pinned" && <button className="secondary" title="恢复为按需下载" disabled={busy.pending(`native_sync_action_${selected.fsId}_unpin`)} onClick={() => void runAction(selected, "unpin")}>{busy.spinning(`native_sync_action_${selected.fsId}_unpin`) && <Spinner />}取消固定</button>}
-        {!selected.isDir && selected.state === "hydrated" && selected.pinState !== "pinned" && <button className="secondary" disabled={busy.pending(`native_sync_action_${selected.fsId}_dehydrate`)} onClick={() => void runAction(selected, "dehydrate")}>{busy.spinning(`native_sync_action_${selected.fsId}_dehydrate`) && <Spinner />}释放空间</button>}
-        {selected.state === "error" && <button className="secondary" disabled={busy.pending(`native_sync_action_${selected.fsId}_retry`)} onClick={() => void runAction(selected, "retry")}>{busy.spinning(`native_sync_action_${selected.fsId}_retry`) && <Spinner />}重试</button>}
-        {selected.state === "remote_missing" && !acknowledgedMissing.has(selected.fsId) && <button className="secondary" disabled={busy.pending(`native_sync_action_${selected.fsId}_ack_remote_missing`)} onClick={() => void runAction(selected, "ack_remote_missing")}>{busy.spinning(`native_sync_action_${selected.fsId}_ack_remote_missing`) && <Spinner />}已知悉</button>}
-        <button className="secondary" disabled={busy.pending(`native_sync_open_explorer_${selected.relativePath}`)} onClick={() => void openInExplorer(selected.relativePath)}>{busy.spinning(`native_sync_open_explorer_${selected.relativePath}`) && <Spinner />}在资源管理器中打开</button>
-        <button className="link-button" onClick={() => setSelectedFsId(null)}>取消选中</button>
-      </div>
-    </div>}
-  </main>;
+          </div>}
+        </li>;
+      })}
+    </ul>}
+    {nextCursor && <div className="native-sync-entrylist-more"><button className="secondary" disabled={busy.pending("native_sync_load_more")} onClick={() => void loadMore()}>{busy.spinning("native_sync_load_more") && <Spinner />}加载更多</button></div>}
+  </section>;
 }

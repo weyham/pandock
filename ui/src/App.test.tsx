@@ -61,6 +61,7 @@ function mockInvoke(
       case "auth_retry": return beginChallenge;
       case "auth_cancel": return undefined;
       case "auth_disconnect": return undefined;
+      case "native_sync_list": return { entries: [], nextCursor: null, total: 0, parentPath: "/" };
       case "set_autostart": return undefined;
       case "save_config": return typeof saveResult === "function" ? (saveResult as () => unknown)() : saveResult;
       default: return undefined;
