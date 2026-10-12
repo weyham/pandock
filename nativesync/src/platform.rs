@@ -141,6 +141,25 @@ pub(crate) fn in_sync_repair_action(input: InSyncRepairInput) -> InSyncRepair {
     }
 }
 
+/// 脱水成功之后对 pin 状态的处理（纯决策，便于跨平台单测）。
+///
+/// 依据 MS Learn CF_PIN_STATE：**显式 UNPINNED(2) 的语义就是"请提供程序异步脱水"**。
+/// 脱水一旦完成，这个标记就成了"永远待办"——平台会因此一直认为该占位符有活没干
+/// （资源管理器显示同步挂起类图标、「释放空间」该文件灰显）。所以要把它归回 UNSPECIFIED(0)，
+/// 让平台重新"自由决定"。**用户的显式 PINNED(1) 不动**（固定是明确的"保留本地"意图）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DehydratePostAction {
+    NormalizeToUnspecified,
+    LeaveAlone,
+}
+
+pub(crate) fn dehydrate_post_action(pin_state: u32) -> DehydratePostAction {
+    match pin_state {
+        2 /* CF_PIN_STATE_UNPINNED */ => DehydratePostAction::NormalizeToUnspecified,
+        _ => DehydratePostAction::LeaveAlone,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
     #[error("NativeSync 当前平台不可用: {0}")]
@@ -3150,7 +3169,47 @@ mod windows_impl {
             // 应用自身发起的脱水会产生 NOTIFY_DEHYDRATE「自杀回调」，先立守卫。
             note_app_path_op(&self.runtime, path);
             let h = file_handle(path, true)?;
+            // 脱水前读 pin：显式 UNPINNED = "请脱水"，脱水完成后必须归一回 UNSPECIFIED，
+            // 否则平台会永远认为该占位符"待办未完成"（图标挂起、「释放空间」灰显）。
+            let mut pin_before: u32 = 0;
+            {
+                let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 64];
+                let mut returned = 0u32;
+                if unsafe {
+                    CfGetPlaceholderInfo(
+                        h,
+                        CF_PLACEHOLDER_INFO_BASIC,
+                        buf.as_mut_ptr() as *mut c_void,
+                        buf.len() as u32,
+                        Some(&mut returned),
+                    )
+                }
+                .is_ok()
+                {
+                    pin_before = unsafe {
+                        (*(buf.as_ptr() as *const CF_PLACEHOLDER_BASIC_INFO))
+                            .PinState
+                            .0 as u32
+                    };
+                }
+            }
             let r = unsafe { CfDehydratePlaceholder(h, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) };
+            if r.is_ok()
+                && dehydrate_post_action(pin_before) == DehydratePostAction::NormalizeToUnspecified
+            {
+                let set = unsafe {
+                    CfSetPinState(h, CF_PIN_STATE_UNSPECIFIED, CF_SET_PIN_FLAG_NONE, None)
+                };
+                match set {
+                    Ok(()) => log::info!(
+                        "native-sync pin normalized to UNSPECIFIED after dehydration (was UNPINNED)"
+                    ),
+                    Err(e) => log::warn!(
+                        "native-sync CfSetPinState(UNSPECIFIED) after dehydrate failed hr=0x{:08X}",
+                        e.code().0 as u32
+                    ),
+                }
+            }
             unsafe {
                 let _ = CloseHandle(h);
             }
@@ -3325,6 +3384,23 @@ mod placeholder_repair_tests {
                 classify_placeholder_probe(Err(hr)),
                 PlaceholderProbe::Unknown,
                 "hr=0x{hr:08X} 必须保守处理，不得当作\"不是占位符\""
+            );
+        }
+    }
+
+    /// 脱水后的 pin 归一：UNPINNED → 归一；PINNED / UNSPECIFIED → 不动。
+    #[test]
+    fn dehydrate_post_action_normalizes_only_explicit_unpinned() {
+        assert_eq!(
+            dehydrate_post_action(2),
+            DehydratePostAction::NormalizeToUnspecified,
+            "显式 UNPINNED 的语义就是'请脱水'，脱水完成后必须归一回 UNSPECIFIED"
+        );
+        for pin in [0u32, 1, 3, 4] {
+            assert_eq!(
+                dehydrate_post_action(pin),
+                DehydratePostAction::LeaveAlone,
+                "pin={pin} 不得被动（尤其用户的显式 PINNED）"
             );
         }
     }
