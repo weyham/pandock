@@ -32,6 +32,11 @@ try {
     & cargo test -p pandock-core
     if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
 
+    # NativeSync 引擎单测（Windows Cloud Files 回调/路径/索引/状态机）。
+    # 不设覆盖率阈值：其主体在 cfg(windows) 下，跨平台统计会得到假指标（ADR-109）。
+    & cargo test -p pandock-nativesync
+    if ($LASTEXITCODE -ne 0) { throw "nativesync tests failed with exit code $LASTEXITCODE" }
+
     & cargo check -p pandock-app
     if ($LASTEXITCODE -ne 0) { throw "cargo check failed with exit code $LASTEXITCODE" }
 

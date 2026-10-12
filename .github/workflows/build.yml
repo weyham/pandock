@@ -37,6 +37,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: core tests
         run: cargo test -p pandock-core
+      - name: nativesync tests
+        run: cargo test -p pandock-nativesync
       - name: app compile check
         run: |
           cargo check -p pandock-app
