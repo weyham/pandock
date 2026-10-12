@@ -441,7 +441,10 @@ mod windows_impl {
     use std::sync::{Condvar, Mutex, OnceLock, RwLock};
     use std::thread;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, NTSTATUS};
+    use windows::Win32::Foundation::{
+        CloseHandle, HANDLE, NTSTATUS, STATUS_CLOUD_FILE_NOT_IN_SYNC,
+        STATUS_CLOUD_FILE_UNSUCCESSFUL,
+    };
     use windows::Win32::Storage::CloudFilters::*;
     use windows::Win32::Storage::FileSystem::*;
 
@@ -557,6 +560,29 @@ mod windows_impl {
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
+    /// `CfGetPlaceholderInfo(STANDARD).OnDiskDataSize`：本地实际占用的字节数。
+    ///
+    /// **只读属性、不触发水合**；句柄由调用方持有并负责关闭（本函数不关）。
+    unsafe fn on_disk_size_of_handle(handle: HANDLE) -> Option<i64> {
+        let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 64];
+        let mut returned = 0u32;
+        let ok = unsafe {
+            CfGetPlaceholderInfo(
+                handle,
+                CF_PLACEHOLDER_INFO_STANDARD,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as u32,
+                Some(&mut returned),
+            )
+        }
+        .is_ok();
+        if ok {
+            Some(unsafe { (*(buf.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO)).OnDiskDataSize })
+        } else {
+            None
+        }
+    }
+
     fn file_handle(path: &Path, write: bool) -> Result<HANDLE, PlatformError> {
         let full = path.to_string_lossy().replace('/', "\\");
         let w = wide(&full);
@@ -1449,6 +1475,73 @@ mod windows_impl {
             .unwrap();
         }
 
+        /// 脱水判定表 + ACK 状态映射（纯函数，不碰真实 CFAPI）。
+        #[test]
+        fn dehydration_gate_is_conservative_and_maps_ack_status() {
+            assert_eq!(
+                dehydration_gate(false, false, true),
+                None,
+                "三项全通过才真的脱水"
+            );
+            assert_eq!(
+                dehydration_gate(true, false, true),
+                Some(InlineDehydrate::SelfCallback)
+            );
+            assert_eq!(
+                dehydration_gate(false, true, true),
+                Some(InlineDehydrate::RefusedPending)
+            );
+            assert_eq!(
+                dehydration_gate(false, false, false),
+                Some(InlineDehydrate::Unavailable)
+            );
+            // 有未同步本地改动优先于"路径不可解析"：宁可拒绝，也不丢用户改动。
+            assert_eq!(
+                dehydration_gate(false, true, false),
+                Some(InlineDehydrate::RefusedPending)
+            );
+            assert_eq!(InlineDehydrate::Done.completion_status(), NTSTATUS(0));
+            assert_eq!(
+                InlineDehydrate::SelfCallback.completion_status(),
+                NTSTATUS(0)
+            );
+            assert_eq!(
+                InlineDehydrate::Unavailable.completion_status(),
+                NTSTATUS(0)
+            );
+            assert_eq!(
+                InlineDehydrate::RefusedPending.completion_status(),
+                STATUS_CLOUD_FILE_NOT_IN_SYNC
+            );
+            // STATUS_CLOUD_FILE_* 原样透传；区间外的错误归一为 UNSUCCESSFUL。
+            assert_eq!(
+                InlineDehydrate::Failed(STATUS_CLOUD_FILE_UNSUCCESSFUL.0).completion_status(),
+                STATUS_CLOUD_FILE_UNSUCCESSFUL
+            );
+            assert_eq!(
+                InlineDehydrate::Failed(0x8000_0005u32 as i32).completion_status(),
+                STATUS_CLOUD_FILE_UNSUCCESSFUL
+            );
+            assert_eq!(
+                InlineDehydrate::Failed(0xC000_CF14u32 as i32).completion_status(),
+                NTSTATUS(0xC000_CF14u32 as i32)
+            );
+            assert_eq!(InlineDehydrate::Done.as_str(), "done");
+            assert_eq!(InlineDehydrate::SelfCallback.as_str(), "self");
+            assert_eq!(InlineDehydrate::RefusedPending.as_str(), "refused_pending");
+            assert_eq!(InlineDehydrate::Unavailable.as_str(), "unavailable");
+            assert_eq!(InlineDehydrate::Failed(0).as_str(), "failed");
+        }
+
+        /// 拿不到回调上下文（已断开）时不得 panic，也不得声称脱水成功。
+        #[test]
+        fn inline_dehydration_without_context_is_unavailable() {
+            let info: CF_CALLBACK_INFO = unsafe { std::mem::zeroed() };
+            let outcome = unsafe { complete_dehydration_inline(&info) };
+            assert_eq!(outcome, InlineDehydrate::Unavailable);
+            assert_eq!(outcome.completion_status(), NTSTATUS(0));
+        }
+
         /// 打开者身份解码：正常结构、空指针、过短 StructSize、空 ImagePath 四种形态。
         /// 全部只用栈上构造的假结构，不依赖真实 Explorer 或云文件驱动。
         #[test]
@@ -2263,6 +2356,180 @@ mod windows_impl {
         }
     }
 
+    /// 回调内联脱水的结论（决定 ACK 的 `CompletionStatus`）。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InlineDehydrate {
+        /// 我们自己完成了脱水。
+        Done,
+        /// 这条通知由我们自己的 `CfDehydratePlaceholder` 触发（自杀回调）：只确认，不再脱水。
+        SelfCallback,
+        /// 该条目有未同步的本地改动：**拒绝脱水**（S1 单向同步，脱水会把改动丢掉）。
+        RefusedPending,
+        /// 路径解析不到 / 句柄打不开 / 拿不到上下文：只能确认 + warn（不能让调用方无限等）。
+        Unavailable,
+        /// 脱水调用失败，或调用"成功"但验真不通过（`OnDisk` 不为 0）。
+        Failed(i32),
+    }
+
+    impl InlineDehydrate {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Done => "done",
+                Self::SelfCallback => "self",
+                Self::RefusedPending => "refused_pending",
+                Self::Unavailable => "unavailable",
+                Self::Failed(_) => "failed",
+            }
+        }
+
+        /// ACK_DEHYDRATE 的完成状态：`STATUS_SUCCESS` = 允许（且已完成）脱水；
+        /// `STATUS_CLOUD_FILE_*` = 拒绝/失败，平台会把它转达给发起方。
+        fn completion_status(self) -> NTSTATUS {
+            match self {
+                Self::Done | Self::SelfCallback | Self::Unavailable => NTSTATUS(0),
+                // 状态语义要诚实：我们**没能证明**该条目已与云端一致（身份未知或有本地改动）。
+                Self::RefusedPending => STATUS_CLOUD_FILE_NOT_IN_SYNC,
+                Self::Failed(code) => {
+                    let code = code as u32;
+                    // 只有 STATUS_CLOUD_FILE_* 区间原样透传，其余归一为 UNSUCCESSFUL
+                    //（区间外的非零状态平台也会自己转成 UNSUCCESSFUL）。
+                    if (0xC000_CF00..=0xC000_CFFF).contains(&code) {
+                        NTSTATUS(code as i32)
+                    } else {
+                        STATUS_CLOUD_FILE_UNSUCCESSFUL
+                    }
+                }
+            }
+        }
+    }
+
+    /// 脱水前的**纯判定**（可单测）：`Some(结论)` = "不要真的脱水，按这个结论 ACK"；
+    /// `None` = 可以继续做脱水。
+    ///
+    /// 优先级刻意保守：自杀回调 → 有未同步本地改动 → 路径不可解析。
+    /// 「有没有未同步改动」答不上来时按**有**处理（数据安全优先于状态精度）。
+    fn dehydration_gate(
+        is_self_callback: bool,
+        has_pending_local_change: bool,
+        path_resolvable: bool,
+    ) -> Option<InlineDehydrate> {
+        if is_self_callback {
+            return Some(InlineDehydrate::SelfCallback);
+        }
+        if has_pending_local_change {
+            return Some(InlineDehydrate::RefusedPending);
+        }
+        if !path_resolvable {
+            return Some(InlineDehydrate::Unavailable);
+        }
+        None
+    }
+
+    /// 乙-①：**在回调里真的把脱水做掉**。
+    ///
+    /// 文档语义：`CF_OPERATION_TYPE_ACK_DEHYDRATE` 是 *Acknowledge **and dehydrate***，
+    /// 而 `CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE` 的说明是「发起脱水的用户应用被阻塞、
+    /// 期待提供程序响应」。此前我们只 ACK、不做脱水 ⇒ 平台在等一个永远不会发生的动作
+    /// ⇒ 发起方无限等待（真机 D2：外部 `CfDehydratePlaceholder` >90 秒不返回）。
+    ///
+    /// 顺序：属性句柄 → 自己 `CfDehydratePlaceholder` → **验真 `OnDiskDataSize == 0`** → 再 ACK。
+    unsafe fn complete_dehydration_inline(info: &CF_CALLBACK_INFO) -> InlineDehydrate {
+        let Some(runtime) = (unsafe { runtime_from_callback(info) }) else {
+            // 连 runtime 都拿不到（通常已断开）：没有日志可写，保守地只确认。
+            return InlineDehydrate::Unavailable;
+        };
+        let fs_id = file_id_from_identity(info);
+        let root = runtime
+            .root
+            .read()
+            .ok()
+            .and_then(|v| v.clone())
+            .map(|p| p.to_string_lossy().to_string());
+        let relative = match (normalized_text(info), root.as_deref()) {
+            (Some(normalized), Some(root)) => {
+                crate::notify::relative_from_normalized(&normalized, root)
+            }
+            _ => None,
+        };
+        // 自杀回调：这条通知是我们自己的 CfDehydratePlaceholder 引起的，绝不能再脱水一次
+        //（否则自我递归）。守卫与 `WindowsPlatform::dehydrate` 用的是同一套。
+        let is_self_callback = relative
+            .as_deref()
+            .map(|rel| consume_app_path_op(&runtime, rel))
+            .unwrap_or(false)
+            || fs_id
+                .map(|id| consume_app_fs_op(&runtime, id))
+                .unwrap_or(false);
+        // 身份未知 ⇒ 无法证明"没有未同步改动" ⇒ 按有改动处理（见 dehydration_gate 注释）。
+        let has_pending_local_change = fs_id.map(crate::pending::is_pending).unwrap_or(true);
+        if let Some(outcome) = dehydration_gate(
+            is_self_callback,
+            has_pending_local_change,
+            relative.is_some(),
+        ) {
+            match outcome {
+                InlineDehydrate::RefusedPending => log::warn!(
+                    "native-sync dehydrate inline refused: unsynced local change fs_id={fs_id:?} action=ack_not_in_sync"
+                ),
+                InlineDehydrate::Unavailable => log::warn!(
+                    "native-sync dehydrate inline unavailable fs_id={fs_id:?} (path/runtime not resolvable); ack only"
+                ),
+                _ => log::info!(
+                    "native-sync dehydrate inline kind={} fs_id={fs_id:?} action=ack_only",
+                    outcome.as_str()
+                ),
+            }
+            return outcome;
+        }
+        let local = Path::new(root.as_deref().unwrap_or_default()).join(
+            relative
+                .as_deref()
+                .unwrap_or_default()
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        );
+        let handle = match file_handle(&local, false) {
+            Ok(handle) => handle,
+            Err(err) => {
+                // 打不开也要 ACK：绝不能让发起方（Explorer）无限等。
+                log::warn!(
+                    "native-sync dehydrate inline cannot open handle fs_id={fs_id:?}: {err}; ack only"
+                );
+                return InlineDehydrate::Unavailable;
+            }
+        };
+        // 立守卫再脱水：我们自己的调用同样会产生 NOTIFY_DEHYDRATE。
+        note_app_path_op(&runtime, &local);
+        let started = std::time::Instant::now();
+        let dehydrate_code =
+            match unsafe { CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) } {
+                Ok(()) => 0i32,
+                Err(error) => error.code().0,
+            };
+        let elapsed_ms = started.elapsed().as_millis();
+        let on_disk = unsafe { on_disk_size_of_handle(handle) };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        // **验真**（D1 事故教训）：只看"调用成功"会把"其实没释放"当成成功。
+        // 拿不到占位符信息同样按失败处理：宁可让发起方看到错误，也不谎报释放成功。
+        let outcome = match (dehydrate_code, on_disk) {
+            (0, Some(0)) => InlineDehydrate::Done,
+            (0, other) => {
+                log::warn!(
+                    "native-sync dehydrate inline verify failed fs_id={fs_id:?} on_disk_bytes={other:?} elapsed_ms={elapsed_ms}"
+                );
+                InlineDehydrate::Failed(STATUS_CLOUD_FILE_UNSUCCESSFUL.0)
+            }
+            (code, _) => InlineDehydrate::Failed(code),
+        };
+        log::info!(
+            "native-sync dehydrate inline kind={} fs_id={fs_id:?} hr=0x{:08X} on_disk_bytes={on_disk:?} elapsed_ms={elapsed_ms}",
+            outcome.as_str(),
+            dehydrate_code as u32
+        );
+        outcome
+    }
+
     /// 非阻塞通知的统一入口：**不得**在这里做 I/O / 查库 / 落盘。
     fn dispatch_notification(info: &CF_CALLBACK_INFO, input: crate::notify::NotifyInput) {
         let Some(runtime) = (unsafe { runtime_from_callback(info) }) else {
@@ -2696,19 +2963,34 @@ mod windows_impl {
         ack_operation(info, CF_OPERATION_TYPE_ACK_RENAME, &mut params);
     }
 
-    unsafe fn ack_dehydrate(info: &CF_CALLBACK_INFO) {
+    /// 候选 ②（**默认关闭**）：ACK_DEHYDRATE 回传**我们自己的** identity（8 字节 fs_id）。
+    ///
+    /// 与候选 ①（回调里自己脱水）是两件互相独立的事，**实验必须单变量**：
+    /// ① 未被单独证明前不要打开它。文档依据：`CF_OPERATION_PARAMETERS.AckDehydrate` 确实带
+    /// `FileIdentity/FileIdentityLength`，且该 identity 应是**提供程序自备数据**
+    ///（前两版分别试过"平台的指针"与"null"，都不是它）。
+    const ACK_DEHYDRATE_WITH_OWN_IDENTITY: bool = false;
+
+    /// ACK 一次脱水。`status` 由 [`InlineDehydrate::completion_status`] 给出
+    ///（`STATUS_SUCCESS` = 允许并已完成；`STATUS_CLOUD_FILE_*` = 拒绝/失败）。
+    unsafe fn ack_dehydrate(info: &CF_CALLBACK_INFO, status: NTSTATUS) {
+        // 候选 ② 的稳定缓冲由本帧持有：长度与占位符创建时写入的 identity 一致（8 字节 fs_id）。
+        let own_identity = if ACK_DEHYDRATE_WITH_OWN_IDENTITY {
+            file_id_from_identity(info).map(|fs_id| fs_id.to_le_bytes())
+        } else {
+            None
+        };
         let mut params = CF_OPERATION_PARAMETERS {
             ParamSize: operation_param_size::<CF_OPERATION_PARAMETERS_0_1>(),
             ..Default::default()
         };
         params.Anonymous.AckDehydrate = CF_OPERATION_PARAMETERS_0_1 {
             Flags: CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE,
-            CompletionStatus: NTSTATUS(0),
-            // **不传身份**：ACK 里的 identity 应是提供程序自备的数据，而 info.FileIdentity
-            // 是平台自己的缓冲区指针；ParamSize 也不含内联 blob。实测（D2）：回传该指针会让
-            // 外部发起的 CfDehydratePlaceholder **永远不返回**（Explorer「释放空间」卡在半路）。
-            FileIdentity: std::ptr::null(),
-            FileIdentityLength: 0,
+            CompletionStatus: status,
+            FileIdentity: own_identity
+                .as_ref()
+                .map_or(std::ptr::null(), |bytes| bytes.as_ptr() as *const c_void),
+            FileIdentityLength: own_identity.as_ref().map_or(0, |bytes| bytes.len() as u32),
         };
         ack_operation(info, CF_OPERATION_TYPE_ACK_DEHYDRATE, &mut params);
     }
@@ -2814,6 +3096,10 @@ mod windows_impl {
         );
     }
 
+    /// 脱水回调（阻塞型）：**先自己把脱水做掉，再 ACK**。
+    ///
+    /// 依据：`ACK_DEHYDRATE` 的语义是 *Acknowledge **and dehydrate***（脱水由提供程序完成），
+    /// 而平台在收到 ACK 前一直阻塞发起方。只 ACK 不脱水 = 发起方等一个永不发生的动作。
     unsafe extern "system" fn on_notify_dehydrate(
         info_ptr: *const CF_CALLBACK_INFO,
         params_ptr: *const CF_CALLBACK_PARAMETERS,
@@ -2822,7 +3108,18 @@ mod windows_impl {
         let params = &*params_ptr;
         let flags = params.Anonymous.Dehydrate.Flags.0 as u32;
         let reason = params.Anonymous.Dehydrate.Reason.0 as u32;
-        ack_dehydrate(info);
+        let started = std::time::Instant::now();
+        let outcome = complete_dehydration_inline(info);
+        let status = outcome.completion_status();
+        ack_dehydrate(info, status);
+        // 成功也要留痕（本次实验期）：结论 + 脱水 HRESULT + ACK 状态 + 耗时，
+        // 便于判定「≤1 秒返回」与「OnDisk==0」。
+        log::info!(
+            "native-sync dehydrate ack kind={} status=0x{:08X} elapsed_ms={}",
+            outcome.as_str(),
+            status.0 as u32,
+            started.elapsed().as_millis()
+        );
         dispatch_notification(
             info,
             crate::notify::NotifyInput {
@@ -3158,28 +3455,11 @@ mod windows_impl {
         }
         fn on_disk_data_size(&self, path: &Path) -> Option<i64> {
             let handle = file_handle(path, false).ok()?;
-            let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 64];
-            let mut returned = 0u32;
-            let ok = unsafe {
-                CfGetPlaceholderInfo(
-                    handle,
-                    CF_PLACEHOLDER_INFO_STANDARD,
-                    buf.as_mut_ptr() as *mut c_void,
-                    buf.len() as u32,
-                    Some(&mut returned),
-                )
-            }
-            .is_ok();
+            let size = unsafe { on_disk_size_of_handle(handle) };
             unsafe {
                 let _ = CloseHandle(handle);
             }
-            if ok {
-                Some(unsafe {
-                    (*(buf.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO)).OnDiskDataSize
-                })
-            } else {
-                None
-            }
+            size
         }
 
         fn set_run_id(&mut self, run_id: u64) {

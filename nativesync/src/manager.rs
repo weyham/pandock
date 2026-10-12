@@ -174,6 +174,11 @@ impl NativeSyncManager {
     }
     fn restore_platform_mappings(&mut self) {
         self.platform.set_state_db(self.db.path());
+        // 脱水安全闸门的内存镜像：启动/重连时从库里预热一次，此后回调线程只读内存。
+        match self.db.pending_fs_ids() {
+            Ok(ids) => crate::pending::preload(ids),
+            Err(err) => log::warn!("native-sync pending mirror preload failed: {err}"),
+        }
         if let Ok(mappings) = self.db.all_mappings() {
             for (fs_id, remote_path, relative) in mappings {
                 if let Ok(remote) = RemotePath::parse(&remote_path) {
