@@ -1099,6 +1099,31 @@ mod windows_impl {
             seen
         }
 
+        fn wait_for(pred: impl Fn() -> bool, what: &str) {
+            for _ in 0..600 {
+                if pred() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("超时等待：{what}");
+        }
+
+        fn delete_task(root: &Path, relative: &str, fs_id: u64) -> NotifyTask {
+            NotifyTask {
+                input: crate::notify::NotifyInput {
+                    kind: Some(crate::notify::NotifyKind::Delete),
+                    normalized_path: Some(format!(
+                        "{}/{}",
+                        root.to_string_lossy().replace('\\', "/"),
+                        relative
+                    )),
+                    ..Default::default()
+                },
+                fs_id: Some(fs_id),
+            }
+        }
+
         fn upsert_file(db: &crate::db::IndexDb, fs_id: i64, relative: &str) {
             db.upsert(&crate::model::EntryRecord {
                 fs_id,
@@ -1213,6 +1238,84 @@ mod windows_impl {
             note_app_fs_op(&runtime, 42);
             assert!(consume_app_fs_op(&runtime, 42));
             assert!(!consume_app_fs_op(&runtime, 42));
+        }
+
+        /// 回归：stop→start（“停用 NativeSync” → “启用同步”）必须能重新建立通道与线程。
+        ///
+        /// 历史缺陷：`stop_notify_worker` 只置空 sender、不复位 `notify_worker_started`，
+        /// 于是下一次 start 直接提前返回，投递从此静默失败——整个 S1 在用户点过一次
+        /// 停用/启用之后永久哑掉，直到重启应用。
+        #[test]
+        fn notify_worker_is_recreated_after_stop_then_start() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            upsert_file(&db, 31, "restart.txt");
+            let runtime = runtime_with(&root, &db_path);
+            runtime.notifications_enabled.store(true, Ordering::Relaxed);
+            let seen = captured(&runtime);
+
+            start_notify_worker(&runtime);
+            assert!(enqueue_notification(
+                &runtime,
+                delete_task(&root, "restart.txt", 31)
+            ));
+            wait_for(|| seen.lock().unwrap().len() == 1, "首次投递被消费");
+
+            // disconnect() 路径：停投递 + 停接收。
+            stop_notify_worker(&runtime);
+            assert!(
+                !enqueue_notification(&runtime, delete_task(&root, "restart.txt", 31)),
+                "停止后不得投递"
+            );
+
+            // connect() 路径：必须重建通道与消费者线程。
+            start_notify_worker(&runtime);
+            assert!(
+                enqueue_notification(&runtime, delete_task(&root, "restart.txt", 31)),
+                "stop→start 之后必须能重新投递（生命周期标记未复位曾导致永久哑掉）"
+            );
+            wait_for(|| seen.lock().unwrap().len() == 2, "重启后的投递被消费");
+        }
+
+        /// 回归：开关关掉再打开（set_notifications_enabled 入口）同样必须重建通道。
+        #[test]
+        fn notifications_switch_reenable_recreates_the_channel() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            upsert_file(&db, 32, "switch.txt");
+            let mut platform = WindowsPlatform::default();
+            platform.register(&root).unwrap();
+            platform.set_state_db(&db_path);
+            let runtime = Arc::clone(&platform.runtime);
+            let seen = captured(&runtime);
+
+            platform.set_notifications_enabled(true);
+            assert!(enqueue_notification(
+                &runtime,
+                delete_task(&root, "switch.txt", 32)
+            ));
+            wait_for(|| seen.lock().unwrap().len() == 1, "开关打开后投递被消费");
+
+            platform.set_notifications_enabled(false);
+            assert!(
+                !enqueue_notification(&runtime, delete_task(&root, "switch.txt", 32)),
+                "开关关闭后不得投递"
+            );
+
+            platform.set_notifications_enabled(true);
+            assert!(
+                enqueue_notification(&runtime, delete_task(&root, "switch.txt", 32)),
+                "重新打开开关必须重建通道"
+            );
+            wait_for(|| seen.lock().unwrap().len() == 2, "重新打开后的投递被消费");
         }
 
         /// 删除通知落库：pending_op=delete + local_change + 事件（来源 explorer）。
@@ -1560,6 +1663,28 @@ mod windows_impl {
             .unwrap_or(false)
     }
 
+    /// 通道缺失 / 已断开的告警限频：这类失效必须在日志里可见，否则
+    /// 「通知捕获静默哑掉」在日志里完全查不到，但也不能刷爆日志。
+    static LAST_CHANNEL_WARN_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    const CHANNEL_WARN_INTERVAL_MS: u64 = 60_000;
+
+    fn warn_notify_channel_unavailable() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = LAST_CHANNEL_WARN_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < CHANNEL_WARN_INTERVAL_MS {
+            return;
+        }
+        LAST_CHANNEL_WARN_MS.store(now, Ordering::Relaxed);
+        log::warn!(
+            "native-sync notify channel unavailable; local change event dropped \
+             (provider disconnected, or capture disabled?)"
+        );
+    }
+
     /// 非阻塞投递：队列满即丢弃并告警（绝不阻塞 Explorer 回调线程）。
     fn enqueue_notification(runtime: &Arc<Runtime>, task: NotifyTask) -> bool {
         if !runtime.notifications_enabled.load(Ordering::Relaxed) {
@@ -1567,6 +1692,7 @@ mod windows_impl {
         }
         let sender = runtime.notify_tx.read().ok().and_then(|v| v.clone());
         let Some(sender) = sender else {
+            warn_notify_channel_unavailable();
             return false;
         };
         match sender.try_send(task) {
@@ -1575,7 +1701,10 @@ mod windows_impl {
                 log::warn!("native-sync notify queue full; dropped one event");
                 false
             }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                warn_notify_channel_unavailable();
+                false
+            }
         }
     }
 
@@ -1870,10 +1999,22 @@ mod windows_impl {
         emit_change(runtime, change);
     }
 
-    /// 启动通知消费者（进程内唯一）。connect 成功后调用。
+    /// 启动通知消费者。`connect()` 成功与「重新打开开关」都会调用，因此必须可重复建立。
+    ///
+    /// 以**通道是否存在**作为权威判据：`notify_worker_started` 只用来挡住并发重复启动。
+    /// 这样即使某条路径漏了复位（历史缺陷），也不会让捕获永久哑掉。
     fn start_notify_worker(runtime: &Arc<Runtime>) {
         if runtime.notify_worker_started.swap(true, Ordering::SeqCst) {
-            return;
+            if runtime
+                .notify_tx
+                .read()
+                .map(|slot| slot.is_some())
+                .unwrap_or(false)
+            {
+                return;
+            }
+            // 标记为真但通道缺失 => 陈旧标记，继续重建而不是直接返回。
+            log::debug!("native-sync notify worker rebuilt after a stale lifecycle flag");
         }
         let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyTask>(NOTIFY_QUEUE_DEPTH);
         if let Ok(mut slot) = runtime.notify_tx.write() {
@@ -1895,9 +2036,16 @@ mod windows_impl {
         }
     }
 
+    /// 停止投递并复位生命周期标记。
+    ///
+    /// 置空与复位必须在**同一临界区顺序内**完成：否则下一次 `connect()` 或
+    /// 「重新打开开关」时 `start_notify_worker` 会因标记仍为 true 而提前返回，
+    /// 既不建通道也不起线程——本地变更捕获会在「停用 → 启用」之后永久哑掉
+    /// （直到重启应用），而调用方只会看到投递静默失败。
     fn stop_notify_worker(runtime: &Runtime) {
         if let Ok(mut slot) = runtime.notify_tx.write() {
             *slot = None;
+            runtime.notify_worker_started.store(false, Ordering::SeqCst);
         }
     }
 
@@ -2017,9 +2165,11 @@ mod windows_impl {
         let info = &*info_ptr;
         let params = &*params_ptr;
         let flags = params.Anonymous.Rename.Flags.0 as u32;
+        // 先 ACK：Explorer 正在阻塞等待响应，TargetPath 的字符串转换（堆分配）
+        // 必须放在 ACK 之后，把阻塞窗口压到最小。
+        ack_rename(info);
         // 新名字只由 TargetPath 给出（不是 FileIdentity）。
         let target = params.Anonymous.Rename.TargetPath.to_string().ok();
-        ack_rename(info);
         dispatch_notification(
             info,
             crate::notify::NotifyInput {
