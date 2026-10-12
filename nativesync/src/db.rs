@@ -478,12 +478,23 @@ impl IndexDb {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
-    pub fn snapshot_for(&self, fs_id: i64) -> Result<Option<(Option<i64>, u64)>, String> {
+    /// 读取占位符创建 / 上次水合时记录的本地快照。
+    ///
+    /// **`None`（无行）或 size 为 `None`（NULL）都表示「没有可用基线」**——例如 S1 之前
+    /// 水合的老库行，或尚未记录过快照的条目。调用方必须把它当作「无法判定」，
+    /// **绝不能**折叠成 `0`：否则任何一次读取都会被判成「本地被修改」
+    /// （实测事故：只读打开三个文件即被记成 `pending_op='upload'`）。
+    pub fn snapshot_for(&self, fs_id: i64) -> Result<Option<LocalSnapshot>, String> {
         self.conn
             .query_row(
                 "SELECT snapshot_mtime,snapshot_size FROM local_state WHERE fs_id=?1",
                 params![fs_id],
-                |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64)),
+                |r| {
+                    Ok(LocalSnapshot {
+                        mtime: r.get(0)?,
+                        size: r.get::<_, Option<i64>>(1)?.map(|v| v.max(0) as u64),
+                    })
+                },
             )
             .optional()
             .map_err(|e| e.to_string())
@@ -591,6 +602,16 @@ impl IndexDb {
         self.conn.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN l.placeholder=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN l.hydration_state='hydrated' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN l.hydration_state IN ('error','remote_missing','stale') OR l.pending_op IN ('delete','rename') THEN 1 ELSE 0 END),0),COALESCE((SELECT COUNT(*) FROM hydration_job WHERE status='running'),0) FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|e|e.to_string())
     }
 }
+/// 占位符创建 / 上次水合时记录的本地快照。
+///
+/// `size` 为 `None` 表示**没有可用基线**（老库行为 NULL、或从未记录过）——
+/// 调用方必须视为「无法判定」，绝不能当作 0，否则任何一次读取都会被判成本地修改。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalSnapshot {
+    pub mtime: Option<i64>,
+    pub size: Option<u64>,
+}
+
 /// 本地新建条目（`local_only=1`）没有云端映射的统一错误文本。
 pub const LOCAL_ONLY_NO_REMOTE: &str =
     "本地新建条目没有远端映射，不能用于云端召回或占位符 identity";
@@ -1020,6 +1041,42 @@ mod tests {
         assert_eq!(db.counts().unwrap().3, 1);
         db.set_pending_op(7, None, None).unwrap();
         assert_eq!(db.counts().unwrap().3, 0);
+    }
+
+    /// `snapshot_for` 必须区分「没有基线」（NULL）与「基线为 0 字节」。
+    /// 把 NULL 折叠成 0 会让任何读取被误判成本地修改（真实事故）。
+    #[test]
+    fn snapshot_for_distinguishes_missing_baseline_from_zero_size() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        db.upsert(&EntryRecord {
+            fs_id: 51,
+            local_only: false,
+            parent_fs_id: None,
+            remote_path: "/legacy.txt".into(),
+            relative_path: "legacy.txt".into(),
+            name: "legacy.txt".into(),
+            is_dir: false,
+            size: 12,
+            md5: None,
+            modified_at: None,
+            state: NativeSyncState::Hydrated,
+            pin_state: PinState::Unpinned,
+            error: None,
+            has_children: false,
+            pending_op: None,
+            pending_since: None,
+        })
+        .unwrap();
+        // 未记录过快照 => 两个字段都是 NULL（没有可用基线）。
+        let missing = db.snapshot_for(51).unwrap().unwrap();
+        assert_eq!((missing.mtime, missing.size), (None, None));
+        // 记录 0 字节基线 => 是真实基线，不等于"没有基线"。
+        db.set_snapshot(51, Some(1_700_000_000), 0).unwrap();
+        let zero = db.snapshot_for(51).unwrap().unwrap();
+        assert_eq!((zero.mtime, zero.size), (Some(1_700_000_000), Some(0)));
+        // 不存在的条目 => None。
+        assert_eq!(db.snapshot_for(999).unwrap(), None);
     }
 
     /// 本地改名：路径改为新值并标记待同步，云端事实保持不变。

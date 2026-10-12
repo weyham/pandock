@@ -1436,6 +1436,63 @@ mod windows_impl {
             assert_eq!(events[0].fs_id, Some(21));
         }
 
+        /// 事故回归：**没有可用基线**（老库行 `snapshot_* IS NULL`）时，
+        /// 关闭完成通知不得把"只读打开"判成"本地编辑"。
+        ///
+        /// 真实事故：S1 之前水合的条目没有快照列，`snapshot_for` 把 NULL 折叠成 0，
+        /// 于是仅用 `Get-FileHash` 读一遍三个文件，就给它们全写了 `pending_op='upload'`。
+        /// 正确行为：第一次见到无基线的条目时**只补记基线、不判定**；此后真正的修改仍要能捕获。
+        #[test]
+        fn close_completion_without_baseline_does_not_flag_read_as_edit() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            upsert_file(&db, 41, "legacy.txt");
+            // 故意不写快照：模拟 S1 之前水合的老库行（snapshot_mtime/size 为 NULL）。
+            assert_eq!(
+                db.snapshot_for(41).unwrap().and_then(|s| s.size),
+                None,
+                "未记录快照时应视为没有可用基线"
+            );
+            std::fs::write(root.join("legacy.txt"), b"read-only-open").unwrap();
+            let runtime = runtime_with(&root, &db_path);
+            let seen = captured(&runtime);
+            let close_event = |at: &str| crate::model::NativeSyncChangeEvent {
+                kind: "close".into(),
+                phase: "completion".into(),
+                fs_id: Some(41),
+                from_relative: Some("legacy.txt".into()),
+                to_relative: None,
+                is_dir: false,
+                reason: None,
+                source: "system".into(),
+                detected_at: at.into(),
+                pending_cloud: true,
+            };
+
+            // 只读打开后关闭：不得产生待同步。
+            detect_local_write(&runtime, &db, &close_event("1791773770"));
+            assert_eq!(
+                db.pending_op_of(41).unwrap(),
+                None,
+                "没有基线时不得把读取判成本地编辑"
+            );
+            assert!(seen.lock().unwrap().is_empty());
+            // 但必须把当前状态补记为基线，供后续判定使用。
+            let actual_len = std::fs::metadata(root.join("legacy.txt")).unwrap().len();
+            let size = db.snapshot_for(41).unwrap().and_then(|s| s.size);
+            assert_eq!(size, Some(actual_len), "无基线时应补记基线");
+
+            // 之后真正的本地编辑仍必须被捕获。
+            std::fs::write(root.join("legacy.txt"), b"read-only-open-and-then-edited").unwrap();
+            detect_local_write(&runtime, &db, &close_event("1791773800"));
+            assert_eq!(db.pending_op_of(41).unwrap().as_deref(), Some("upload"));
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
+
         /// 快照一致（未被改动）不得产生任何待同步标记。
         #[test]
         fn close_completion_without_snapshot_drift_is_ignored() {
@@ -1926,9 +1983,21 @@ mod windows_impl {
                 if local_only || db.pending_op_of(fs_id).ok().flatten().is_some() {
                     return;
                 }
-                let Ok(Some((prev_mtime, prev_size))) = db.snapshot_for(fs_id) else {
-                    return;
+                // 没有可用基线（老库行 / 尚未记录快照）时**不判定为修改**，
+                // 只把当前状态补记为基线。否则「读取」会被误记成「本地编辑」。
+                let baseline = db
+                    .snapshot_for(fs_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|snap| snap.size.map(|size| (snap.mtime, size)));
+                let (prev_mtime, prev_size) = match baseline {
+                    Some(baseline) => baseline,
+                    None => {
+                        let _ = db.set_snapshot(fs_id, mtime, size);
+                        return;
+                    }
                 };
+                // 纯读取不改变 mtime/size ⇒ 不产生待同步（放行）。
                 let changed =
                     prev_size != size || matches!(prev_mtime, Some(prev) if Some(prev) != mtime);
                 if !changed {
