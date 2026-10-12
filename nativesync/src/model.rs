@@ -40,6 +40,32 @@ pub struct NativeSyncEvent {
     pub fs_id: u64,
     pub success: bool,
 }
+/// 本地变更事件（S1：实时捕获并上报，**不传播到云端**）。
+///
+/// `pendingCloud` 在 S1 恒为 true：事实已在本地生效，但云端尚未收到任何变更。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSyncChangeEvent {
+    /// dehydrate|delete|rename|open|close|validate|placeholders_cancelled
+    pub kind: String,
+    /// intent|completion
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fs_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_relative: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_relative: Option<String>,
+    pub is_dir: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// app|explorer|system|unknown
+    pub source: String,
+    pub detected_at: String,
+    /// S1 恒为 true：本地已生效但尚未同步到云端。
+    pub pending_cloud: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSyncStatusView {

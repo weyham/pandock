@@ -28,6 +28,14 @@ pub trait PlatformSync: Send + Sync {
         _sink: Option<Arc<dyn Fn(crate::model::NativeSyncEvent) + Send + Sync>>,
     ) {
     }
+    /// 本地变更事件出口（S1 的 `pandock://nativesync/change` 由它驱动）。
+    fn set_change_sink(
+        &mut self,
+        _sink: Option<Arc<dyn Fn(crate::model::NativeSyncChangeEvent) + Send + Sync>>,
+    ) {
+    }
+    /// 紧急开关：关闭后不再注册/处理本地变更通知（保留只读召回与占位符创建）。
+    fn set_notifications_enabled(&mut self, _enabled: bool) {}
     fn create_placeholder(
         &mut self,
         path: &Path,
@@ -248,6 +256,7 @@ mod windows_impl {
         Ok(())
     }
     use super::*;
+    use crate::notify::{path_tail, relative_from_normalized};
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -265,6 +274,7 @@ mod windows_impl {
         runtime: Arc<Runtime>,
     }
     type EventSink = Arc<dyn Fn(crate::model::NativeSyncEvent) + Send + Sync>;
+    type ChangeSink = Arc<dyn Fn(crate::model::NativeSyncChangeEvent) + Send + Sync>;
 
     #[derive(Default)]
     struct Runtime {
@@ -274,6 +284,17 @@ mod windows_impl {
         by_id: RwLock<HashMap<u64, (RemotePath, String)>>,
         state_db: RwLock<Option<PathBuf>>,
         event_sink: RwLock<Option<EventSink>>,
+        change_sink: RwLock<Option<ChangeSink>>,
+        /// 本地变更通知：有界队列 + 单消费者线程。用独立的额度，不占 hydration 的
+        /// `try_begin_worker` 名额，避免通知把召回挤掉、或反之。
+        notify_tx: RwLock<Option<std::sync::mpsc::SyncSender<NotifyTask>>>,
+        notify_worker_started: AtomicBool,
+        /// 紧急开关（配置字段 + 环境变量覆盖），默认关闭捕获前不生效。
+        notifications_enabled: AtomicBool,
+        /// 应用自身发起的 CF 操作守卫：由此产生的 NOTIFY_* 是「自杀回调」，
+        /// 必须去重，否则会把应用的动作误记成用户的本地变更。
+        app_path_ops: Mutex<HashMap<String, std::time::Instant>>,
+        app_fs_ops: Mutex<HashMap<u64, std::time::Instant>>,
         cancelled: RwLock<HashMap<i64, Arc<AtomicBool>>>,
         lifecycle: Mutex<RuntimeLifecycle>,
         lifecycle_cv: Condvar,
@@ -422,26 +443,6 @@ mod windows_impl {
         Some(u64::from_le_bytes(bytes.try_into().ok()?))
     }
 
-    fn path_tail(path: &str) -> String {
-        let p = path.trim_start_matches("//?/").trim_start_matches('/');
-        let p = if p.len() > 2 && p.as_bytes()[1] == b':' {
-            &p[2..]
-        } else {
-            p
-        };
-        p.trim_start_matches('/').to_string()
-    }
-
-    fn relative_from_normalized(normalized: &str, root: &str) -> Option<String> {
-        let root_tail = path_tail(root);
-        if root_tail.is_empty() {
-            return None;
-        }
-        path_tail(normalized)
-            .strip_prefix(&root_tail)
-            .map(|rest| rest.trim_start_matches('/').to_string())
-            .filter(|rel| !rel.is_empty())
-    }
     /// 把单个路径标记为「与云端已同步」。
     ///
     /// 不标记时资源管理器的「状态」列会显示为**同步挂起**（蓝色循环箭头）——
@@ -556,6 +557,8 @@ mod windows_impl {
         const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
         // 诊断日志只记录 fs_id/区间/字节数，严禁记录文件名、dlink、token。
         log::info!("native-sync fetch start fs_id={file_id} offset={offset} length={length}");
+        // 应用自身发起的召回：登记 fs_id 守卫，开/闭完成通知不得被误判为用户变更。
+        note_app_fs_op(&runtime, file_id);
         let db = runtime
             .state_db
             .read()
@@ -694,6 +697,14 @@ mod windows_impl {
                             "native-sync mark in-sync failed after hydration: fs_id={file_id} error={error}"
                         );
                     }
+                }
+            }
+        }
+        // 水合写入会改 mtime：完成后刷新快照，避免把平台自己的写入误判成本地编辑。
+        if let (Some(db), Ok(_)) = (db.as_ref(), &result) {
+            if let Some(local) = root_path_for(&runtime, &relative_for_mark) {
+                if let Ok(meta) = std::fs::metadata(&local) {
+                    let _ = db.set_snapshot(file_id as i64, mtime_secs(&meta), meta.len());
                 }
             }
         }
@@ -1067,6 +1078,363 @@ mod windows_impl {
         }
     }
     #[cfg(test)]
+    mod notify_capture_tests {
+        use super::*;
+
+        fn runtime_with(root: &Path, db_path: &Path) -> Arc<Runtime> {
+            let runtime = Arc::new(Runtime::default());
+            *runtime.root.write().unwrap() = Some(root.to_path_buf());
+            *runtime.state_db.write().unwrap() = Some(db_path.to_path_buf());
+            runtime
+        }
+
+        fn captured(
+            runtime: &Arc<Runtime>,
+        ) -> Arc<Mutex<Vec<crate::model::NativeSyncChangeEvent>>> {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            *runtime.change_sink.write().unwrap() = Some(Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }));
+            seen
+        }
+
+        fn upsert_file(db: &crate::db::IndexDb, fs_id: i64, relative: &str) {
+            db.upsert(&crate::model::EntryRecord {
+                fs_id,
+                local_only: false,
+                parent_fs_id: None,
+                remote_path: format!("/{relative}"),
+                relative_path: relative.into(),
+                name: relative.rsplit('/').next().unwrap().into(),
+                is_dir: false,
+                size: 3,
+                md5: None,
+                modified_at: None,
+                state: crate::model::NativeSyncState::OnlineOnly,
+                pin_state: crate::model::PinState::Unpinned,
+                error: None,
+                has_children: false,
+                pending_op: None,
+                pending_since: None,
+            })
+            .unwrap();
+        }
+
+        /// 回调表必须自洽：13 个真实回调 + NONE 终止项，类型不得重复。
+        #[test]
+        fn callback_table_registers_every_s1_callback_and_terminates_with_none() {
+            assert_eq!(CALLBACKS.len(), 14);
+            assert_eq!(CALLBACKS[13].Type, CF_CALLBACK_TYPE_NONE);
+            assert!(CALLBACKS[13].Callback.is_none());
+            let mut types: Vec<i32> = CALLBACKS[..13].iter().map(|c| c.Type.0).collect();
+            types.sort_unstable();
+            let before = types.len();
+            types.dedup();
+            assert_eq!(types.len(), before, "回调类型不得重复");
+            for entry in &CALLBACKS[..13] {
+                assert!(entry.Callback.is_some(), "真实回调必须挂上处理函数");
+            }
+            // ADR-108 记录的三个只读召回必须保留。
+            for required in [
+                CF_CALLBACK_TYPE_FETCH_DATA,
+                CF_CALLBACK_TYPE_CANCEL_FETCH_DATA,
+                CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
+            ] {
+                assert!(CALLBACKS[..13].iter().any(|c| c.Type == required));
+            }
+            // S1 新增的本地变更捕获。
+            for required in [
+                CF_CALLBACK_TYPE_NOTIFY_DELETE,
+                CF_CALLBACK_TYPE_NOTIFY_DELETE_COMPLETION,
+                CF_CALLBACK_TYPE_NOTIFY_RENAME,
+                CF_CALLBACK_TYPE_NOTIFY_RENAME_COMPLETION,
+                CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE,
+                CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE_COMPLETION,
+                CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION,
+                CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
+                CF_CALLBACK_TYPE_VALIDATE_DATA,
+                CF_CALLBACK_TYPE_CANCEL_FETCH_PLACEHOLDERS,
+            ] {
+                assert!(CALLBACKS[..13].iter().any(|c| c.Type == required));
+            }
+        }
+
+        /// 投递绝不阻塞：开关关闭、队列满、队列无消费者都必须安全返回 false。
+        #[test]
+        fn enqueue_never_blocks_and_respects_the_switch_and_queue_bound() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            let runtime = runtime_with(dir.path(), &db_path);
+            let task = || NotifyTask {
+                input: crate::notify::NotifyInput {
+                    kind: Some(crate::notify::NotifyKind::Delete),
+                    ..Default::default()
+                },
+                fs_id: Some(1),
+            };
+
+            // 未启动消费者：投递失败但不阻塞、不 panic。
+            runtime.notifications_enabled.store(true, Ordering::Relaxed);
+            assert!(!enqueue_notification(&runtime, task()));
+
+            // 启动后正常入队。
+            start_notify_worker(&runtime);
+            assert!(enqueue_notification(&runtime, task()));
+
+            // 开关关闭后不再收。
+            runtime
+                .notifications_enabled
+                .store(false, Ordering::Relaxed);
+            assert!(!enqueue_notification(&runtime, task()));
+            runtime.notifications_enabled.store(true, Ordering::Relaxed);
+
+            // 队列满时丢弃（消费者已被停止，队列没有读者）。
+            stop_notify_worker(&runtime);
+        }
+
+        /// 自杀回调去重：应用自身的操作守卫必须「一次操作抵消一次通知」。
+        #[test]
+        fn app_operation_guard_consumes_exactly_one_self_callback() {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(root.join("d")).unwrap();
+            let runtime = runtime_with(&root, &db_path);
+
+            note_app_path_op(&runtime, &root.join("d").join("f.txt"));
+            assert!(consume_app_path_op(&runtime, "d/f.txt"));
+            assert!(
+                !consume_app_path_op(&runtime, "d/f.txt"),
+                "守卫只能被消费一次"
+            );
+            assert!(!consume_app_path_op(&runtime, "d/other.txt"));
+
+            note_app_fs_op(&runtime, 42);
+            assert!(consume_app_fs_op(&runtime, 42));
+            assert!(!consume_app_fs_op(&runtime, 42));
+        }
+
+        /// 删除通知落库：pending_op=delete + local_change + 事件（来源 explorer）。
+        #[test]
+        fn delete_notification_marks_pending_and_emits_event() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            upsert_file(&db, 11, "a.txt");
+            let runtime = runtime_with(&root, &db_path);
+            let seen = captured(&runtime);
+
+            handle_notification(
+                &runtime,
+                NotifyTask {
+                    input: crate::notify::NotifyInput {
+                        kind: Some(crate::notify::NotifyKind::Delete),
+                        normalized_path: Some(format!(
+                            "{}/a.txt",
+                            root.to_string_lossy().replace('\\', "/")
+                        )),
+                        ..Default::default()
+                    },
+                    fs_id: Some(11),
+                },
+            );
+
+            assert_eq!(db.pending_op_of(11).unwrap().as_deref(), Some("delete"));
+            let events = seen.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "delete");
+            assert_eq!(events[0].source, "explorer");
+            assert_eq!(events[0].from_relative.as_deref(), Some("a.txt"));
+            let changes = db.recent_local_changes(10).unwrap();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].kind, "delete");
+            assert!(!changes[0].applied_to_cloud, "S1 不上传");
+        }
+
+        /// 应用自身的回调（命中守卫）不得被记成用户的本地变更。
+        #[test]
+        fn self_callback_is_recorded_as_app_and_does_not_mark_pending() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            upsert_file(&db, 12, "b.txt");
+            let runtime = runtime_with(&root, &db_path);
+            let seen = captured(&runtime);
+            note_app_path_op(&runtime, &root.join("b.txt"));
+
+            handle_notification(
+                &runtime,
+                NotifyTask {
+                    input: crate::notify::NotifyInput {
+                        kind: Some(crate::notify::NotifyKind::Delete),
+                        normalized_path: Some(format!(
+                            "{}/b.txt",
+                            root.to_string_lossy().replace('\\', "/")
+                        )),
+                        ..Default::default()
+                    },
+                    fs_id: Some(12),
+                },
+            );
+
+            assert_eq!(
+                db.pending_op_of(12).unwrap(),
+                None,
+                "自杀回调不得产生待同步标记"
+            );
+            let events = seen.lock().unwrap();
+            assert_eq!(events[0].source, "app");
+        }
+
+        /// 本地编辑：关闭完成后快照不一致 -> pending_op=upload。
+        #[test]
+        fn close_completion_detects_local_edit_via_snapshot_diff() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            upsert_file(&db, 21, "edit.txt");
+            // 占位符创建时的快照：3 字节。
+            db.set_snapshot(21, Some(1_700_000_000), 3).unwrap();
+            std::fs::write(root.join("edit.txt"), b"0123456789").unwrap();
+            let runtime = runtime_with(&root, &db_path);
+            let seen = captured(&runtime);
+
+            detect_local_write(
+                &runtime,
+                &db,
+                &crate::model::NativeSyncChangeEvent {
+                    kind: "close".into(),
+                    phase: "completion".into(),
+                    fs_id: Some(21),
+                    from_relative: Some("edit.txt".into()),
+                    to_relative: None,
+                    is_dir: false,
+                    reason: None,
+                    source: "system".into(),
+                    detected_at: "1700000100".into(),
+                    pending_cloud: true,
+                },
+            );
+
+            assert_eq!(db.pending_op_of(21).unwrap().as_deref(), Some("upload"));
+            let events = seen.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "upload");
+            assert_eq!(events[0].fs_id, Some(21));
+        }
+
+        /// 快照一致（未被改动）不得产生任何待同步标记。
+        #[test]
+        fn close_completion_without_snapshot_drift_is_ignored() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            upsert_file(&db, 22, "same.txt");
+            std::fs::write(root.join("same.txt"), b"abc").unwrap();
+            let meta = std::fs::metadata(root.join("same.txt")).unwrap();
+            let mtime = mtime_secs(&meta).unwrap();
+            db.set_snapshot(22, Some(mtime), 3).unwrap();
+            let runtime = runtime_with(&root, &db_path);
+            let seen = captured(&runtime);
+
+            detect_local_write(
+                &runtime,
+                &db,
+                &crate::model::NativeSyncChangeEvent {
+                    kind: "close".into(),
+                    phase: "completion".into(),
+                    fs_id: Some(22),
+                    from_relative: Some("same.txt".into()),
+                    to_relative: None,
+                    is_dir: false,
+                    reason: None,
+                    source: "system".into(),
+                    detected_at: "1700000100".into(),
+                    pending_cloud: true,
+                },
+            );
+
+            assert_eq!(db.pending_op_of(22).unwrap(), None);
+            assert!(seen.lock().unwrap().is_empty());
+        }
+
+        /// 本地新建真实文件：登记为 local_only 条目，fs_id 不下发负数。
+        #[test]
+        fn close_completion_registers_locally_created_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            std::fs::write(root.join("new.txt"), b"hello").unwrap();
+            let runtime = runtime_with(&root, &db_path);
+            let seen = captured(&runtime);
+
+            detect_local_write(
+                &runtime,
+                &db,
+                &crate::model::NativeSyncChangeEvent {
+                    kind: "close".into(),
+                    phase: "completion".into(),
+                    fs_id: None,
+                    from_relative: Some("new.txt".into()),
+                    to_relative: None,
+                    is_dir: false,
+                    reason: None,
+                    source: "system".into(),
+                    detected_at: "1700000100".into(),
+                    pending_cloud: true,
+                },
+            );
+
+            let row = db
+                .entry_by_relative("new.txt")
+                .unwrap()
+                .expect("本地新建条目");
+            assert!(row.5, "必须标记为 local_only");
+            assert_eq!(db.pending_op_of(row.0).unwrap().as_deref(), Some("upload"));
+            {
+                let events = seen.lock().unwrap();
+                assert_eq!(events[0].kind, "create");
+                assert_eq!(events[0].fs_id, None, "本地新建不得暴露负数 fs_id");
+            }
+
+            // 再次触发不会重复记账。
+            detect_local_write(
+                &runtime,
+                &db,
+                &crate::model::NativeSyncChangeEvent {
+                    kind: "close".into(),
+                    phase: "completion".into(),
+                    fs_id: None,
+                    from_relative: Some("new.txt".into()),
+                    to_relative: None,
+                    is_dir: false,
+                    reason: None,
+                    source: "system".into(),
+                    detected_at: "1700000200".into(),
+                    pending_cloud: true,
+                },
+            );
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[cfg(test)]
     mod lifecycle_tests {
         use super::*;
         use std::sync::mpsc;
@@ -1103,7 +1471,719 @@ mod windows_impl {
             thread.join().unwrap();
         }
     }
-    static CALLBACKS: [CF_CALLBACK_REGISTRATION; 4] = [
+    // ======================= 本地变更通知（S1） =======================
+    //
+    // 设计约束（来自 CFAPI 纪律，违反会导致 Explorer 卡死或误删本地文件）：
+    //   A. 阻塞型回调（NOTIFY_DEHYDRATE / NOTIFY_DELETE / NOTIFY_RENAME）必须先
+    //      **同步内联 ACK**；ACK 之前不得做任何 I/O、加锁或日志落盘。
+    //      「ACK = 确认并执行」——平台收到成功 ACK 才真正落地删除/改名/脱水。
+    //   B. 非阻塞通知必须快速投递到 worker，不能在回调线程里查库/联网。
+    //   C. 应用自身发起的 CF 操作会产生「自杀回调」，必须按来源去重。
+    //   D. 紧急开关（配置字段 + 环境变量）可整体关掉捕获。
+    const APP_OP_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    const NOTIFY_QUEUE_DEPTH: usize = 256;
+
+    struct NotifyTask {
+        input: crate::notify::NotifyInput,
+        fs_id: Option<u64>,
+    }
+
+    fn now_iso() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{secs}")
+    }
+
+    /// 回调线程内只用它做「字符串 → 相对路径」的便宜计算（无 I/O、无 DB）。
+    unsafe fn normalized_text(info: &CF_CALLBACK_INFO) -> Option<String> {
+        info.NormalizedPath.to_string().ok()
+    }
+
+    /// 记录一次「应用自身发起」的操作，用于去重随之而来的自杀回调。
+    fn note_app_path_op(runtime: &Runtime, path: &Path) {
+        let Some(root) = runtime
+            .root
+            .read()
+            .ok()
+            .and_then(|v| v.clone())
+            .map(|p| p.to_string_lossy().to_string())
+        else {
+            return;
+        };
+        let key = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        if let Some(rel) = crate::notify::relative_from_normalized(&key, &root) {
+            if let Ok(mut ops) = runtime.app_path_ops.lock() {
+                let now = std::time::Instant::now();
+                ops.retain(|_, at| now.duration_since(*at) < APP_OP_TTL);
+                ops.insert(rel.replace('\\', "/").to_ascii_lowercase(), now);
+            }
+        }
+    }
+
+    fn note_app_fs_op(runtime: &Runtime, fs_id: u64) {
+        if let Ok(mut ops) = runtime.app_fs_ops.lock() {
+            let now = std::time::Instant::now();
+            ops.retain(|_, at| now.duration_since(*at) < APP_OP_TTL);
+            ops.insert(fs_id, now);
+        }
+    }
+
+    /// 消费一次守卫（命中即移除：一次应用操作只抵消一次自杀回调）。
+    fn consume_app_path_op(runtime: &Runtime, relative: &str) -> bool {
+        let key = relative.replace('\\', "/").to_ascii_lowercase();
+        runtime
+            .app_path_ops
+            .lock()
+            .ok()
+            .and_then(|mut ops| {
+                let hit = ops.remove(&key)?;
+                Some(std::time::Instant::now().duration_since(hit) < APP_OP_TTL)
+            })
+            .unwrap_or(false)
+    }
+
+    fn consume_app_fs_op(runtime: &Runtime, fs_id: u64) -> bool {
+        runtime
+            .app_fs_ops
+            .lock()
+            .ok()
+            .and_then(|mut ops| {
+                let hit = ops.remove(&fs_id)?;
+                Some(std::time::Instant::now().duration_since(hit) < APP_OP_TTL)
+            })
+            .unwrap_or(false)
+    }
+
+    /// 非阻塞投递：队列满即丢弃并告警（绝不阻塞 Explorer 回调线程）。
+    fn enqueue_notification(runtime: &Arc<Runtime>, task: NotifyTask) -> bool {
+        if !runtime.notifications_enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let sender = runtime.notify_tx.read().ok().and_then(|v| v.clone());
+        let Some(sender) = sender else {
+            return false;
+        };
+        match sender.try_send(task) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                log::warn!("native-sync notify queue full; dropped one event");
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    /// 非阻塞通知的统一入口：**不得**在这里做 I/O / 查库 / 落盘。
+    fn dispatch_notification(info: &CF_CALLBACK_INFO, input: crate::notify::NotifyInput) {
+        let Some(runtime) = (unsafe { runtime_from_callback(info) }) else {
+            return;
+        };
+        let task = NotifyTask {
+            input,
+            fs_id: file_id_from_identity(info),
+        };
+        enqueue_notification(&runtime, task);
+    }
+
+    /// 单消费者：所有落库/发事件都在这条线程上，回调线程只投递。
+    fn notify_worker_loop(runtime: Arc<Runtime>, rx: std::sync::mpsc::Receiver<NotifyTask>) {
+        while let Ok(task) = rx.recv() {
+            handle_notification(&runtime, task);
+        }
+    }
+
+    fn handle_notification(runtime: &Arc<Runtime>, task: NotifyTask) {
+        let root_text = runtime
+            .root
+            .read()
+            .ok()
+            .and_then(|v| v.clone())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // 来源判定：命中应用守卫 => App（自杀回调，不得记为用户的本地变更）。
+        let kind = task.input.kind;
+        let relative_key = task
+            .input
+            .normalized_path
+            .as_deref()
+            .and_then(|p| crate::notify::relative_from_normalized(p, &root_text));
+        let is_app_op = relative_key
+            .as_deref()
+            .map(|rel| consume_app_path_op(runtime, rel))
+            .unwrap_or(false)
+            || task
+                .fs_id
+                .map(|id| consume_app_fs_op(runtime, id))
+                .unwrap_or(false);
+        let source = match (kind, is_app_op) {
+            (Some(_), true) => crate::notify::NotifySource::App,
+            (Some(k), false) if k.is_blocking() => crate::notify::NotifySource::Explorer,
+            // 完成型通知由平台侧发出，无法区分具体发起者；S1 只观测。
+            (Some(_), false) => crate::notify::NotifySource::System,
+            (None, _) => crate::notify::NotifySource::Unknown,
+        };
+        let scope = crate::notify::NotifyScope {
+            root: &root_text,
+            fs_id: task.fs_id,
+            source,
+            detected_at: &now_iso(),
+        };
+        let event = match crate::notify::classify(&task.input, &scope) {
+            crate::notify::NotifyDecision::Event(event) => *event,
+            crate::notify::NotifyDecision::Ignore(reason) => {
+                log::debug!("native-sync notify ignored: {reason}");
+                return;
+            }
+            crate::notify::NotifyDecision::OutOfScope => {
+                log::debug!("native-sync notify out of scope");
+                return;
+            }
+        };
+        // 诊断日志只记录 fs_id / kind / 来源，绝不记录文件名。
+        log::info!(
+            "native-sync notify kind={} phase={} source={} fs_id={:?} dir={} reason={:?}",
+            event.kind,
+            event.phase,
+            event.source,
+            event.fs_id,
+            event.is_dir,
+            event.reason
+        );
+
+        let db = runtime
+            .state_db
+            .read()
+            .ok()
+            .and_then(|v| v.clone())
+            .and_then(|path| {
+                path.parent()
+                    .and_then(|p| p.parent())
+                    .map(crate::db::IndexDb::open)
+            })
+            .and_then(|r| r.ok());
+        if let Some(db) = db.as_ref() {
+            // 应用自身操作只留痕，不产生「待同步」标记。
+            let is_app = event.source == "app";
+            let fs_id = event.fs_id.map(|v| v as i64);
+            if !is_app {
+                match event.kind.as_str() {
+                    "delete" => {
+                        if let Some(id) = fs_id {
+                            let _ = db.set_pending_op(id, Some("delete"), Some(&event.detected_at));
+                        } else if let Some(rel) = event.from_relative.as_deref() {
+                            if let Some((id, _, _, _, _, _)) =
+                                db.entry_by_relative(rel).ok().flatten()
+                            {
+                                let _ =
+                                    db.set_pending_op(id, Some("delete"), Some(&event.detected_at));
+                            }
+                        }
+                    }
+                    "rename" => {
+                        if let Some(id) = fs_id {
+                            if let Some(to) = event.to_relative.as_deref() {
+                                let _ = db.apply_local_rename(id, to);
+                            } else {
+                                // 移出同步根：从同步根视角等同「本地已删除」。
+                                let _ =
+                                    db.set_pending_op(id, Some("delete"), Some(&event.detected_at));
+                            }
+                        }
+                    }
+                    "dehydrate" if event.phase == "intent" => {
+                        if let Some(id) = fs_id {
+                            // 内容已不在本地：hydration 轴回到 online_only。
+                            let _ = db.set_state_by_fs_id(id as u64, "online_only", None);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = db.record_local_change(&crate::db::LocalChangeRecord {
+                id: None,
+                fs_id,
+                kind: event.kind.clone(),
+                phase: event.phase.clone(),
+                from_relative: event.from_relative.clone(),
+                to_relative: event.to_relative.clone(),
+                is_dir: event.is_dir,
+                reason: event.reason.clone(),
+                source: event.source.clone(),
+                detected_at: event.detected_at.clone(),
+                applied_to_cloud: false,
+                error: None,
+            });
+        }
+        if let Ok(sink) = runtime.change_sink.read() {
+            if let Some(sink) = sink.as_ref() {
+                sink(event.clone());
+            }
+        }
+        // 关闭完成：本地可能已被写入（编辑）或新建，做快照比对。
+        if event.kind == "close" && event.phase == "completion" {
+            if let Some(db) = db.as_ref() {
+                detect_local_write(runtime, db, &event);
+            }
+        }
+    }
+
+    fn mtime_secs(meta: &std::fs::Metadata) -> Option<i64> {
+        use std::time::UNIX_EPOCH;
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+    }
+
+    /// 是否为云占位符（在线/脱水/已召回）。用来把「本地新建的真实文件」与
+    /// 「本来就存在的占位符」区分开——只有前者才算本地新建。
+    fn is_cloud_placeholder(meta: &std::fs::Metadata) -> bool {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+        meta.file_attributes()
+            & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+            != 0
+    }
+
+    fn root_path_for(runtime: &Arc<Runtime>, relative: &str) -> Option<std::path::PathBuf> {
+        runtime
+            .root
+            .read()
+            .ok()
+            .and_then(|v| v.clone())
+            .map(|root| root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR)))
+    }
+
+    fn emit_change(runtime: &Arc<Runtime>, event: crate::model::NativeSyncChangeEvent) {
+        if let Ok(sink) = runtime.change_sink.read() {
+            if let Some(sink) = sink.as_ref() {
+                sink(event);
+            }
+        }
+    }
+
+    /// 关闭完成通知是「本地可能已被写入」的唯一可靠信号：把磁盘上的 mtime/size
+    /// 与占位符创建 / 上次水合时记录的快照比对，识别本地编辑与本地新建。
+    fn detect_local_write(
+        runtime: &Arc<Runtime>,
+        db: &crate::db::IndexDb,
+        event: &crate::model::NativeSyncChangeEvent,
+    ) {
+        let Some(relative) = event
+            .from_relative
+            .as_deref()
+            .or(event.to_relative.as_deref())
+        else {
+            return;
+        };
+        let Some(local) = root_path_for(runtime, relative) else {
+            return;
+        };
+        let Ok(meta) = std::fs::metadata(&local) else {
+            return;
+        };
+        let size = meta.len();
+        let mtime = mtime_secs(&meta);
+        let (fs_id, kind) = match db.entry_by_relative(relative) {
+            Ok(Some((fs_id, _, _, _, _, local_only))) => {
+                // 已有待同步标记（本地新建/已识别的编辑）不重复记账。
+                if local_only || db.pending_op_of(fs_id).ok().flatten().is_some() {
+                    return;
+                }
+                let Ok(Some((prev_mtime, prev_size))) = db.snapshot_for(fs_id) else {
+                    return;
+                };
+                let changed =
+                    prev_size != size || matches!(prev_mtime, Some(prev) if Some(prev) != mtime);
+                if !changed {
+                    return;
+                }
+                // 本地编辑：云端仍是旧内容，标记待上传（S1 只记录，不上传）。
+                if db
+                    .set_pending_op(fs_id, Some("upload"), Some(&event.detected_at))
+                    .is_err()
+                {
+                    return;
+                }
+                (Some(fs_id), "upload")
+            }
+            Ok(None) => {
+                if is_cloud_placeholder(&meta) {
+                    return;
+                }
+                let Ok(next_id) = db.next_local_fs_id() else {
+                    return;
+                };
+                let name = local
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| relative.to_string());
+                if db
+                    .insert_local_only_entry(next_id, relative, &name, meta.is_dir(), size)
+                    .is_err()
+                {
+                    return;
+                }
+                (None, "create")
+            }
+            Err(_) => return,
+        };
+        let change = crate::model::NativeSyncChangeEvent {
+            kind: kind.to_string(),
+            phase: "intent".to_string(),
+            // 本地新建条目没有云端 fs_id，绝不下发负数内部 id。
+            fs_id: fs_id.map(|v| v as u64),
+            from_relative: Some(relative.to_string()),
+            to_relative: None,
+            is_dir: meta.is_dir(),
+            reason: None,
+            source: event.source.clone(),
+            detected_at: event.detected_at.clone(),
+            pending_cloud: true,
+        };
+        log::info!(
+            "native-sync local change captured kind={kind} fs_id={:?} dir={} bytes={size}",
+            change.fs_id,
+            meta.is_dir()
+        );
+        let _ = db.record_local_change(&crate::db::LocalChangeRecord {
+            id: None,
+            fs_id,
+            kind: change.kind.clone(),
+            phase: change.phase.clone(),
+            from_relative: change.from_relative.clone(),
+            to_relative: None,
+            is_dir: change.is_dir,
+            reason: None,
+            source: change.source.clone(),
+            detected_at: change.detected_at.clone(),
+            applied_to_cloud: false,
+            error: None,
+        });
+        emit_change(runtime, change);
+    }
+
+    /// 启动通知消费者（进程内唯一）。connect 成功后调用。
+    fn start_notify_worker(runtime: &Arc<Runtime>) {
+        if runtime.notify_worker_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<NotifyTask>(NOTIFY_QUEUE_DEPTH);
+        if let Ok(mut slot) = runtime.notify_tx.write() {
+            *slot = Some(tx);
+        } else {
+            runtime.notify_worker_started.store(false, Ordering::SeqCst);
+            return;
+        }
+        let worker_runtime = Arc::clone(runtime);
+        let spawned = thread::Builder::new()
+            .name("pandock-native-sync-notify".into())
+            .spawn(move || notify_worker_loop(worker_runtime, rx));
+        if spawned.is_err() {
+            if let Ok(mut slot) = runtime.notify_tx.write() {
+                *slot = None;
+            }
+            runtime.notify_worker_started.store(false, Ordering::SeqCst);
+            log::warn!("native-sync notify worker spawn failed");
+        }
+    }
+
+    fn stop_notify_worker(runtime: &Runtime) {
+        if let Ok(mut slot) = runtime.notify_tx.write() {
+            *slot = None;
+        }
+    }
+
+    // ===================== 阻塞型回调：先内联 ACK =====================
+    unsafe fn ack_operation(
+        info: &CF_CALLBACK_INFO,
+        op_type: CF_OPERATION_TYPE,
+        params: &mut CF_OPERATION_PARAMETERS,
+    ) {
+        let op = CF_OPERATION_INFO {
+            StructSize: std::mem::size_of::<CF_OPERATION_INFO>() as u32,
+            Type: op_type,
+            ConnectionKey: info.ConnectionKey,
+            TransferKey: info.TransferKey,
+            RequestKey: info.RequestKey,
+            ..Default::default()
+        };
+        let _ = CfExecute(&op, params);
+    }
+
+    /// ACK 前不得有任何 I/O、加锁或日志落盘：Explorer 正阻塞等待这个响应。
+    unsafe fn ack_delete(info: &CF_CALLBACK_INFO) {
+        let mut params = CF_OPERATION_PARAMETERS {
+            ParamSize: operation_param_size::<CF_OPERATION_PARAMETERS_0_2>(),
+            ..Default::default()
+        };
+        params.Anonymous.AckDelete = CF_OPERATION_PARAMETERS_0_2 {
+            Flags: CF_OPERATION_ACK_DELETE_FLAG_NONE,
+            CompletionStatus: NTSTATUS(0),
+        };
+        ack_operation(info, CF_OPERATION_TYPE_ACK_DELETE, &mut params);
+    }
+
+    unsafe fn ack_rename(info: &CF_CALLBACK_INFO) {
+        let mut params = CF_OPERATION_PARAMETERS {
+            ParamSize: operation_param_size::<CF_OPERATION_PARAMETERS_0_3>(),
+            ..Default::default()
+        };
+        params.Anonymous.AckRename = CF_OPERATION_PARAMETERS_0_3 {
+            Flags: CF_OPERATION_ACK_RENAME_FLAG_NONE,
+            CompletionStatus: NTSTATUS(0),
+        };
+        ack_operation(info, CF_OPERATION_TYPE_ACK_RENAME, &mut params);
+    }
+
+    unsafe fn ack_dehydrate(info: &CF_CALLBACK_INFO) {
+        let mut params = CF_OPERATION_PARAMETERS {
+            ParamSize: operation_param_size::<CF_OPERATION_PARAMETERS_0_1>(),
+            ..Default::default()
+        };
+        params.Anonymous.AckDehydrate = CF_OPERATION_PARAMETERS_0_1 {
+            Flags: CF_OPERATION_ACK_DEHYDRATE_FLAG_NONE,
+            CompletionStatus: NTSTATUS(0),
+            // 回传回调给定的 identity，供平台把 ACK 关联回该占位符。
+            FileIdentity: info.FileIdentity,
+            FileIdentityLength: info.FileIdentityLength,
+        };
+        ack_operation(info, CF_OPERATION_TYPE_ACK_DEHYDRATE, &mut params);
+    }
+
+    /// VALIDATE_DATA：S1 只观测。成功 ACK 表示「数据可用」，不触发重新下载链路；
+    /// 任何异常都在日志里留痕，S2 再决定是否改为要求重新水合。
+    unsafe fn ack_validate_data(info: &CF_CALLBACK_INFO, offset: i64, length: i64) {
+        let mut params = CF_OPERATION_PARAMETERS {
+            ParamSize: operation_param_size::<CF_OPERATION_PARAMETERS_0_0>(),
+            ..Default::default()
+        };
+        params.Anonymous.AckData = CF_OPERATION_PARAMETERS_0_0 {
+            Flags: CF_OPERATION_ACK_DATA_FLAG_NONE,
+            CompletionStatus: NTSTATUS(0),
+            Offset: offset,
+            Length: length,
+        };
+        ack_operation(info, CF_OPERATION_TYPE_ACK_DATA, &mut params);
+    }
+
+    unsafe extern "system" fn on_notify_delete(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let flags = (&*params_ptr).Anonymous.Delete.Flags.0 as u32;
+        // 阻塞型：先 ACK，再做别的。
+        ack_delete(info);
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::Delete),
+                flags,
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_notify_delete_completion(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let flags = (&*params_ptr).Anonymous.DeleteCompletion.Flags.0 as u32;
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::DeleteCompleted),
+                flags,
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_notify_rename(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let params = &*params_ptr;
+        let flags = params.Anonymous.Rename.Flags.0 as u32;
+        // 新名字只由 TargetPath 给出（不是 FileIdentity）。
+        let target = params.Anonymous.Rename.TargetPath.to_string().ok();
+        ack_rename(info);
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::Rename),
+                flags,
+                target_path: target,
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_notify_rename_completion(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let params = &*params_ptr;
+        let flags = params.Anonymous.RenameCompletion.Flags.0 as u32;
+        let source = params
+            .Anonymous
+            .RenameCompletion
+            .SourcePath
+            .to_string()
+            .ok();
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::RenameCompleted),
+                flags,
+                source_path: source,
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_notify_dehydrate(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let params = &*params_ptr;
+        let flags = params.Anonymous.Dehydrate.Flags.0 as u32;
+        let reason = params.Anonymous.Dehydrate.Reason.0 as u32;
+        ack_dehydrate(info);
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::Dehydrate),
+                flags,
+                reason: Some(reason),
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_notify_dehydrate_completion(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let params = &*params_ptr;
+        let flags = params.Anonymous.DehydrateCompletion.Flags.0 as u32;
+        let reason = params.Anonymous.DehydrateCompletion.Reason.0 as u32;
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::DehydrateCompleted),
+                flags,
+                reason: Some(reason),
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_notify_open_completion(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let flags = (&*params_ptr).Anonymous.OpenCompletion.Flags.0 as u32;
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::OpenCompleted),
+                flags,
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_notify_close_completion(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let flags = (&*params_ptr).Anonymous.CloseCompletion.Flags.0 as u32;
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::CloseCompleted),
+                flags,
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_validate_data(
+        info_ptr: *const CF_CALLBACK_INFO,
+        params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        let info = &*info_ptr;
+        let validate = (&*params_ptr).Anonymous.ValidateData;
+        // S1：只观测 + 安全 ACK，不改动用户数据、不触发重新下载。
+        log::warn!(
+            "native-sync validate data observed offset={} length={} request_key={}",
+            validate.RequiredFileOffset,
+            validate.RequiredLength,
+            info.RequestKey
+        );
+        ack_validate_data(info, validate.RequiredFileOffset, validate.RequiredLength);
+        // 只观测：投递一条事件供诊断，worker 对 validate 不写任何待同步状态。
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::ValidateData),
+                flags: validate.Flags.0 as u32,
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    unsafe extern "system" fn on_cancel_fetch_placeholders(
+        info_ptr: *const CF_CALLBACK_INFO,
+        _params_ptr: *const CF_CALLBACK_PARAMETERS,
+    ) {
+        // S1 不启用按需填充（FETCH_PLACEHOLDERS 恒返回空），这里只观察。
+        let info = &*info_ptr;
+        log::debug!(
+            "native-sync cancel fetch placeholders observed request_key={}",
+            info.RequestKey
+        );
+        dispatch_notification(
+            info,
+            crate::notify::NotifyInput {
+                kind: Some(crate::notify::NotifyKind::PlaceholdersCancelled),
+                normalized_path: normalized_text(info),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// S1 注册 13 个回调（3 个只读召回 + 10 个本地变更捕获）+ 终止项 NONE。
+    ///
+    /// 与 ADR-108 的关系：ADR-108 记录的「只注册 FETCH_DATA / CANCEL_FETCH_DATA /
+    /// FETCH_PLACEHOLDERS」是 1.2.x 的事实；本切片补上删除/改名/脱水/开闭完成，
+    /// 使本地变更被实时捕获（仍然**不传播到云端**）。
+    static CALLBACKS: [CF_CALLBACK_REGISTRATION; 14] = [
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_FETCH_DATA,
             Callback: Some(on_fetch_data),
@@ -1115,6 +2195,46 @@ mod windows_impl {
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_FETCH_PLACEHOLDERS,
             Callback: Some(on_fetch_placeholders),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_CANCEL_FETCH_PLACEHOLDERS,
+            Callback: Some(on_cancel_fetch_placeholders),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_VALIDATE_DATA,
+            Callback: Some(on_validate_data),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_FILE_OPEN_COMPLETION,
+            Callback: Some(on_notify_open_completion),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_FILE_CLOSE_COMPLETION,
+            Callback: Some(on_notify_close_completion),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE,
+            Callback: Some(on_notify_dehydrate),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_DEHYDRATE_COMPLETION,
+            Callback: Some(on_notify_dehydrate_completion),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_DELETE,
+            Callback: Some(on_notify_delete),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_DELETE_COMPLETION,
+            Callback: Some(on_notify_delete_completion),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_RENAME,
+            Callback: Some(on_notify_rename),
+        },
+        CF_CALLBACK_REGISTRATION {
+            Type: CF_CALLBACK_TYPE_NOTIFY_RENAME_COMPLETION,
+            Callback: Some(on_notify_rename_completion),
         },
         CF_CALLBACK_REGISTRATION {
             Type: CF_CALLBACK_TYPE_NONE,
@@ -1143,6 +2263,24 @@ mod windows_impl {
         ) {
             if let Ok(mut slot) = self.runtime.event_sink.write() {
                 *slot = sink;
+            }
+        }
+        fn set_change_sink(
+            &mut self,
+            sink: Option<Arc<dyn Fn(crate::model::NativeSyncChangeEvent) + Send + Sync>>,
+        ) {
+            if let Ok(mut slot) = self.runtime.change_sink.write() {
+                *slot = sink;
+            }
+        }
+        fn set_notifications_enabled(&mut self, enabled: bool) {
+            self.runtime
+                .notifications_enabled
+                .store(enabled, Ordering::Relaxed);
+            if enabled {
+                start_notify_worker(&self.runtime);
+            } else {
+                stop_notify_worker(&self.runtime);
             }
         }
         fn set_remote_mapping(&mut self, relative: &str, remote: RemotePath, fs_id: u64) {
@@ -1202,6 +2340,9 @@ mod windows_impl {
                 }
             };
             self.connection = Some(k);
+            if self.runtime.notifications_enabled.load(Ordering::Relaxed) {
+                start_notify_worker(&self.runtime);
+            }
             self.runtime.start_accepting();
             Ok(())
         }
@@ -1209,6 +2350,8 @@ mod windows_impl {
             // Stop new workers and drain existing ones before disconnecting CFAPI.
             // self.runtime remains owned by WindowsPlatform until drop, so the
             // raw CallbackContext pointer stays valid throughout teardown.
+            // 先停投递与接收，再等 worker 排空，最后才断开 CFAPI。
+            stop_notify_worker(&self.runtime);
             self.runtime.stop_accepting_and_wait();
             if let Some(k) = self.connection {
                 unsafe {
@@ -1291,6 +2434,8 @@ mod windows_impl {
             r.map_err(|e| PlatformError::Api(e.to_string()))
         }
         fn dehydrate(&mut self, path: &Path) -> Result<(), PlatformError> {
+            // 应用自身发起的脱水会产生 NOTIFY_DEHYDRATE「自杀回调」，先立守卫。
+            note_app_path_op(&self.runtime, path);
             let h = file_handle(path, true)?;
             let r = unsafe { CfDehydratePlaceholder(h, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) };
             unsafe {
@@ -1328,6 +2473,8 @@ mod windows_impl {
             r.map_err(|e| PlatformError::Api(e.to_string()))
         }
         fn remove_placeholder(&mut self, path: &Path, is_dir: bool) -> Result<(), PlatformError> {
+            // 远端删除对账时应用会删本地占位符，随之而来的 NOTIFY_DELETE 不是用户操作。
+            note_app_path_op(&self.runtime, path);
             let result = if is_dir {
                 std::fs::remove_dir(path)
             } else {

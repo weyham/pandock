@@ -7,11 +7,13 @@ mod db;
 mod hydration;
 mod manager;
 mod model;
+mod notify;
 mod path;
 mod platform;
 
 pub use backend::{CloudBackend, SnapshotBackend};
-pub use model::NativeSyncEvent;
+pub use model::{NativeSyncChangeEvent, NativeSyncEvent};
+pub use notify::{resolve_notifications_enabled, NotifySource, NOTIFICATIONS_ENV};
 
 pub use manager::{NativeSyncError, NativeSyncManager};
 pub use model::{

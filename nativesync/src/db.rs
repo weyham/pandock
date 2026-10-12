@@ -415,6 +415,7 @@ impl IndexDb {
             .map_err(|e| e.to_string())?;
         Ok(self.conn.last_insert_rowid())
     }
+    #[cfg(test)]
     pub fn recent_local_changes(&self, limit: usize) -> Result<Vec<LocalChangeRecord>, String> {
         let mut st = self
             .conn
@@ -465,15 +466,6 @@ impl IndexDb {
                 |r| r.get::<_, i64>(0),
             )
             .map(|v| v as u64)
-            .map_err(|e| e.to_string())
-    }
-    pub fn set_relative_path(&self, fs_id: i64, relative: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE local_state SET relative_path=?2 WHERE fs_id=?1",
-                params![fs_id, relative],
-            )
-            .map(|_| ())
             .map_err(|e| e.to_string())
     }
     /// 记录占位符创建/水合时的本地快照，用于识别后续的本地写入。
@@ -529,7 +521,7 @@ impl IndexDb {
             .map_err(|e| e.to_string())?;
         self.conn
             .execute(
-                "INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?1,?2,0,'error','unpinned',NULL,0)",
+                "INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?1,?2,0,'online_only','unpinned',NULL,0)",
                 params![fs_id, relative],
             )
             .map_err(|e| e.to_string())?;

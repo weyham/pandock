@@ -30,23 +30,61 @@ pub struct NativeSyncManager {
     db: IndexDb,
     backend: Option<Arc<dyn CloudBackend>>,
     platform: Box<dyn PlatformSync>,
+    /// 配置文件里的 `nativeSyncNotifications`（默认 true）。
+    notifications_config: bool,
+    /// 生效值 = 环境变量 `PANDOCK_NATIVESYNC_NOTIFICATIONS` 覆盖配置字段。
+    notifications_enabled: bool,
 }
 impl NativeSyncManager {
     pub fn new(
         data_dir: &Path,
         backend: Option<Arc<dyn CloudBackend>>,
     ) -> Result<Self, NativeSyncError> {
+        let notifications_config = true;
+        let notifications_enabled =
+            crate::notify::resolve_notifications_enabled(notifications_config);
+        let mut platform = new_platform();
+        platform.set_notifications_enabled(notifications_enabled);
+        // 启动时记录生效值：卡死时用户需要知道往哪看。
+        log::info!(
+            "native-sync notifications effective={} config={} env={} (env 优先，置 0 可整体关闭捕获)",
+            notifications_enabled,
+            notifications_config,
+            std::env::var(crate::notify::NOTIFICATIONS_ENV).unwrap_or_else(|_| "<unset>".into())
+        );
         Ok(Self {
             db: IndexDb::open(data_dir).map_err(NativeSyncError::Message)?,
             backend,
-            platform: new_platform(),
+            platform,
+            notifications_config,
+            notifications_enabled,
         })
+    }
+    /// 应用配置文件里的 `nativeSyncNotifications`；环境变量优先级更高。
+    pub fn set_notifications_config(&mut self, value: bool) {
+        self.notifications_config = value;
+        self.apply_notifications_switch();
+    }
+    fn apply_notifications_switch(&mut self) {
+        let effective = crate::notify::resolve_notifications_enabled(self.notifications_config);
+        if effective != self.notifications_enabled {
+            log::info!("native-sync notifications effective={effective}");
+        }
+        self.notifications_enabled = effective;
+        self.platform.set_notifications_enabled(effective);
     }
     pub fn set_backend(&mut self, backend: Arc<dyn CloudBackend>) {
         self.backend = Some(backend);
     }
     pub fn set_event_sink(&mut self, sink: Option<Arc<dyn Fn(NativeSyncEvent) + Send + Sync>>) {
         self.platform.set_event_sink(sink);
+    }
+    /// 本地变更事件出口（`pandock://nativesync/change`）。
+    pub fn set_change_sink(
+        &mut self,
+        sink: Option<Arc<dyn Fn(crate::model::NativeSyncChangeEvent) + Send + Sync>>,
+    ) {
+        self.platform.set_change_sink(sink);
     }
     /// 状态查询显式传播内部错误：db 损坏/不可读时返回 Err，
     /// 调用方（Tauri 命令/事件推送）应把真实错误呈现给 UI，而不是伪装成"未启用"。
@@ -71,7 +109,7 @@ impl NativeSyncManager {
             hydrated_entries: hydrated,
             attention_entries: attention,
             pending_entries: self.db.pending_count().map_err(NativeSyncError::Message)?,
-            notifications_enabled: false, // S1 中间态：platform.rs 接线后改为运行时真值
+            notifications_enabled: self.notifications_enabled,
             active_jobs: jobs,
             last_sync_at: None,
             last_error: None,
@@ -261,6 +299,15 @@ impl NativeSyncManager {
                     snapshot.size,
                     &fs_id.to_le_bytes(),
                 )?;
+                // 记录本地快照作为基线：关闭完成通知靠它与磁盘现状比对来识别本地编辑。
+                if let Ok(meta) = std::fs::metadata(&local) {
+                    let mtime = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64);
+                    let _ = self.db.set_snapshot(fs_id as i64, mtime, meta.len());
+                }
                 // 回读文件系统上的真实 pin 状态：只跟自己的操作走会与磁盘不一致
                 // （实测：磁盘 PINNED、数据库 unpinned，界面与 Explorer 互相矛盾）。
                 if !snapshot.is_dir() {
@@ -785,6 +832,8 @@ mod manager_tests {
             platform: Box::new(FakePlatform {
                 calls: calls.clone(),
             }),
+            notifications_config: true,
+            notifications_enabled: true,
         };
         (dir, root, calls, manager)
     }
@@ -840,6 +889,8 @@ mod manager_tests {
             platform: Box::new(FakePlatform {
                 calls: calls.clone(),
             }),
+            notifications_config: true,
+            notifications_enabled: true,
         };
         let status = restarted.reconnect_from_db().unwrap();
         assert!(status.enabled);
@@ -864,6 +915,8 @@ mod manager_tests {
             platform: Box::new(FakePlatform {
                 calls: calls.clone(),
             }),
+            notifications_config: true,
+            notifications_enabled: true,
         };
         let status = restarted.reconnect_from_db().unwrap();
         assert!(!status.enabled);
@@ -1321,6 +1374,8 @@ mod manager_tests {
             },
             backend: None,
             platform: Box::new(FakePlatform::default()),
+            notifications_config: true,
+            notifications_enabled: true,
         };
         // 存在候选：canonicalize 现值。
         let inside_existing = manager.open_path("d/exists.txt").unwrap();
