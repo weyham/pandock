@@ -60,3 +60,5 @@
 - winget / scoop 分发。
 - 多语言界面（中文优先，英文跟进）。
 - macOS NativeSync（File Provider，需 Apple 开发者账号，远期）。
+
+- 工具任务（后续，**不阻塞本次部署**）：⑤ Cloud Files 元数据/写操作的**权限验证 harness**（独立 ProviderId + `%TEMP%` 临时根 + 本进程内，按 A–E 阶段逐步断言"对已脱水文件做元数据调用后 `OnDisk` 仍为 0"）。可复用脚手架：`nativesync/examples/register_sync_root.rs`（`:74` 的 `StorageProviderSyncRootManager::Register`）+ `diag_probe.rs` 的读取代码；**不用** `CfRegisterSyncRoot`（ADR-108：混用会 `0x8007018B`）。当前判断：其独有增量价值已被官方文档（句柄权限）+ 验收路径（脱水后 `mark_in_sync` 的真实副作用可被外部探针立刻观测）覆盖，故降级为后续工具。
