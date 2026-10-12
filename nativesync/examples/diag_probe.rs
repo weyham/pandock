@@ -107,7 +107,7 @@ fn cf_probe(
     .is_ok();
     // 注意：CF_PLACEHOLDER_STANDARD_INFO 里**没有** FileSize（文件大小来自文件系统元数据），
     // 所以这里用本地元数据长度，与 OnDiskDataSize 对照即可判断水合程度。
-    let file_size = std::fs::metadata(raw.as_str()).ok().map(|m| m.len() as i64);
+    let file_size = std::fs::metadata(raw).ok().map(|m| m.len() as i64);
     let on_disk = if std_ok {
         let info = unsafe { &*(std_buf.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO) };
         Some(info.OnDiskDataSize)
