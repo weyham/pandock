@@ -14,10 +14,50 @@ fn map_error(error: NativeSyncError) -> String {
 
 /// P2: NativeSync 状态事件（payload 与 native_sync_status 返回同构）。
 pub const NATIVE_SYNC_STATE_EVENT: &str = "pandock://nativesync/state";
+/// S1: 本地变更事件，payload 为 NativeSyncChangeEvent。
+pub const NATIVE_SYNC_CHANGE_EVENT: &str = "pandock://nativesync/change";
+
+/// 状态重推的最小间隔：一次批量操作（例如删除一个目录）会连续产生多个变更，
+/// 用 300ms last-wins 节流，避免把设置页刷爆。
+const STATE_EMIT_THROTTLE_MS: u64 = 300;
+static LAST_STATE_EMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn emit_state(app: &AppHandle, status: &NativeSyncStatusView) {
     use tauri::Emitter;
     let _ = app.emit(NATIVE_SYNC_STATE_EVENT, status);
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 节流后的状态重推：状态变化点用；锁被占或未到间隔时静默跳过。
+fn emit_state_throttled(app: &AppHandle) {
+    use std::sync::atomic::Ordering;
+    let now = now_ms();
+    let last = LAST_STATE_EMIT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < STATE_EMIT_THROTTLE_MS {
+        return;
+    }
+    LAST_STATE_EMIT_MS.store(now, Ordering::Relaxed);
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app_handle.state::<AppState>();
+        let Ok(guard) = state.native_sync.try_lock() else {
+            return;
+        };
+        let Some(manager) = guard.as_ref() else {
+            return;
+        };
+        let Ok(status) = manager.status() else {
+            return;
+        };
+        use tauri::Emitter;
+        let _ = app_handle.emit(NATIVE_SYNC_STATE_EVENT, &status);
+    });
 }
 
 async fn ensure_manager(app: &AppHandle) -> Result<(), String> {
@@ -40,6 +80,10 @@ async fn ensure_manager_guard(
             .map_err(|_| "无法读取应用数据目录".to_string())?
             .clone();
         let mut manager = NativeSyncManager::new(&data_dir, None).map_err(map_error)?;
+        // 配置文件里的紧急开关；环境变量优先级更高（在 manager 内部解析）。
+        if let Ok(config) = app.state::<AppState>().config.lock() {
+            manager.set_notifications_config(config.native_sync_notifications);
+        }
         attach_event_sink(app, &mut manager);
         **guard = Some(manager);
     }
@@ -50,6 +94,13 @@ async fn ensure_manager_guard(
 /// 推送是非高频的（job 终态才触发）；状态锁被占时静默跳过，避免刷频与阻塞。
 fn attach_event_sink(app: &AppHandle, manager: &mut NativeSyncManager) {
     let app_handle = app.clone();
+    let change_handle = app.clone();
+    manager.set_change_sink(Some(std::sync::Arc::new(move |event| {
+        use tauri::Emitter;
+        // 变更事件立即推送（UI 按 source 过滤）；状态统计做节流重推。
+        let _ = change_handle.emit(NATIVE_SYNC_CHANGE_EVENT, &event);
+        emit_state_throttled(&change_handle);
+    })));
     manager.set_event_sink(Some(std::sync::Arc::new(move |_event| {
         let app = app_handle.clone();
         tauri::async_runtime::spawn(async move {

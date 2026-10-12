@@ -256,7 +256,7 @@ mod windows_impl {
         Ok(())
     }
     use super::*;
-    use crate::notify::{path_tail, relative_from_normalized};
+    use crate::notify::relative_from_normalized;
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, Ordering};

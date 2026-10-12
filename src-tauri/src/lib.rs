@@ -570,11 +570,25 @@ fn save_config(app: AppHandle, mut config: Config) -> Result<(), String> {
     config.webdav_password.clear();
     save_config_file(&app, &config)?;
     let was_running = app.state::<AppState>().server.lock().unwrap().is_some();
+    let notifications_before = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .native_sync_notifications;
     app.state::<AppState>()
         .config
         .lock()
         .unwrap()
         .clone_from(&config);
+    if notifications_before != config.native_sync_notifications {
+        // 通知捕获开关是即时生效的：不必重启应用，也不影响已登记的同步根。
+        if let Ok(mut guard) = app.state::<AppState>().native_sync.try_lock() {
+            if let Some(manager) = guard.as_mut() {
+                manager.set_notifications_config(config.native_sync_notifications);
+            }
+        }
+    }
     if was_running {
         let app2 = app.clone();
         tauri::async_runtime::spawn(async move {

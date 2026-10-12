@@ -20,6 +20,9 @@ pub struct Config {
     pub cache_size_mb: u64,
     pub launch_at_login: bool,
     pub start_webdav_automatically: bool,
+    /// NativeSync 本地变更通知捕获的紧急开关（默认开启）。
+    /// 环境变量 `PANDOCK_NATIVESYNC_NOTIFICATIONS` 优先级更高，用于卡死时免编辑恢复。
+    pub native_sync_notifications: bool,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             cache_size_mb: 256,
             launch_at_login: false,
             start_webdav_automatically: true,
+            native_sync_notifications: true,
         }
     }
 }
