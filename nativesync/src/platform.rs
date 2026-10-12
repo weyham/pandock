@@ -194,6 +194,12 @@ pub trait PlatformSync: Send + Sync {
     fn set_notifications_enabled(&mut self, _enabled: bool) {}
     /// 取出并清空"已存在路径判定"的一次性统计 `(checked, placeholders, converted)`。
     fn set_run_id(&mut self, _run_id: u64) {}
+    /// 只读查询"本地实际占用字节数"（CfGetPlaceholderInfo(STANDARD).OnDiskDataSize）。
+    /// 用于在**读取文件内容之前**判断它是否已经脱水——对已脱水文件做读访问会立刻把它水合回来。
+    fn on_disk_data_size(&self, _path: &Path) -> Option<i64> {
+        None
+    }
+
     fn take_probe_summary(&mut self) -> (usize, usize, usize, usize) {
         (0, 0, 0, 0)
     }
@@ -2976,6 +2982,32 @@ mod windows_impl {
             self.root.take();
             Ok(())
         }
+        fn on_disk_data_size(&self, path: &Path) -> Option<i64> {
+            let handle = file_handle(path, false).ok()?;
+            let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 64];
+            let mut returned = 0u32;
+            let ok = unsafe {
+                CfGetPlaceholderInfo(
+                    handle,
+                    CF_PLACEHOLDER_INFO_STANDARD,
+                    buf.as_mut_ptr() as *mut c_void,
+                    buf.len() as u32,
+                    Some(&mut returned),
+                )
+            }
+            .is_ok();
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            if ok {
+                Some(unsafe {
+                    (*(buf.as_ptr() as *const CF_PLACEHOLDER_STANDARD_INFO)).OnDiskDataSize
+                })
+            } else {
+                None
+            }
+        }
+
         fn set_run_id(&mut self, run_id: u64) {
             self.run_id
                 .store(run_id, std::sync::atomic::Ordering::Relaxed);

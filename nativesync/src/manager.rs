@@ -499,7 +499,15 @@ impl NativeSyncManager {
                     // 百度 md5 不保证 32 位十六进制（历史数据为其它编码），非十六进制跳过比对。
                     let hex =
                         expected.len() == 32 && expected.bytes().all(|b| b.is_ascii_hexdigit());
-                    if hex {
+                    // ③：**先看磁盘真值**——若该条目已经脱水（OnDiskDataSize == 0），
+                    // 绝不做 std::fs::read：对已脱水占位符的读访问会立刻把内容水合回来，
+                    // 等于白释放一次（事故 D1 的同类）。索引里的 state 可能滞后于磁盘，故以磁盘为准。
+                    let already_dehydrated = self.platform.on_disk_data_size(&local) == Some(0);
+                    if hex && already_dehydrated {
+                        log::debug!(
+                            "native-sync dehydrate: skip md5 verification (already dehydrated on disk)"
+                        );
+                    } else if hex {
                         let bytes = std::fs::read(&local).map_err(|e| {
                             NativeSyncError::Message(format!("读取本地文件失败: {e}"))
                         })?;
