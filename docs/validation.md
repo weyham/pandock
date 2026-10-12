@@ -79,5 +79,31 @@
    （"云文件提供程序意外退出"）——若要机制码本身（`ERROR_CLOUD_FILE_PROVIDER_TERMINATED`，Win32 404 / `0x80070194`），
    需改用 Win32 原语取值，**不要**把包装码当成机制码写进材料。
 
+### 终审补录：验收结论与合并对象是同一份代码（2026-10-12）
+
+实机验收（⑧/②/⑥/⑦/C）之后，我方**再无任何影响产物的改动**，因此本轮验收结论直接适用于要合并的提交：
+
+```
+$ git log --oneline df67a22..HEAD
+0be5da8 docs: 记录 D2 机理更正、观测纪律第 5 条、部分在本地进路线图
+2e58732 docs: 外部发起的释放收手定稿（三形态实测表 + 更正甲的说法）
+76b4161 docs: 客观验收方法论与三次实测数字入档（validation.md 新节）
+e86c495 chore(deploy): deploy-dev.ps1 硬化（pre-flight / 轮询解锁 / 失败先恢复服务）
+36a2ddd docs: 追加两条长期纪律（精确路径停进程/改文件、PS 脚本 BOM+CRLF）
+
+$ git diff --name-only df67a22..HEAD
+docs/development.md
+docs/roadmap.md
+docs/validation.md
+docs/问题与解决.md
+scripts/deploy-dev.ps1
+```
+
+⇒ **`df67a22`（甲方案：不注册脱水回调 + NOT_IN_SYNC 守卫）之后只改了文档与部署脚本**，
+应用产物代码与验收时跑的那份**逐字节相同**。
+
+**覆盖率的证据来源**：`nativesync` 总行 90.11% 由**模块提供**（`cargo llvm-cov`／WSL Ubuntu-24.04），
+**非门禁项、未经总监独立复跑**，记录时按"模块提供"标注。
+
 **边界**：本节证明的是"提供程序不在时被拒绝且不挂起"与"提供程序在时会按需下载、内容逐字节一致"；
 "用户双击后能否被 shell 关联/编辑器打开"属于**体验层**，需用户在场时补充确认。
