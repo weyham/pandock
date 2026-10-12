@@ -3160,7 +3160,10 @@ mod windows_impl {
             Ok(())
         }
         fn pin(&mut self, path: &Path, pinned: bool) -> Result<(), PlatformError> {
-            let h = file_handle(path, false)?;
+            // **写操作**（CfSetPinState）必须用可写属性的句柄：此前传 false（只读属性）
+            // 是"管理台点击固定没有反应"的高度可疑根因；文档只保证"句柄可为仅属性/无访问 +
+            // 调用者具备 READ_DATA 或 WRITE_DAC"，两种读法必须实测判定（见材料里的权限验证表）。
+            let h = file_handle(path, true)?;
             let state = if pinned {
                 CF_PIN_STATE_PINNED
             } else {
