@@ -344,6 +344,13 @@ impl NativeSyncManager {
                 }
             }
         }
+        // 每轮对账一行 info 汇总：一眼看出"有没有重复转换"，便于与 fsutil 对照。
+        let (checked, placeholders, converted) = self.platform.take_probe_summary();
+        if checked > 0 {
+            log::info!(
+                "native-sync existing-path probe checked={checked} placeholders={placeholders} converted={converted}"
+            );
+        }
         let missing = self
             .db
             .missing_entries(&seen)

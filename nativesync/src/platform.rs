@@ -143,6 +143,10 @@ pub trait PlatformSync: Send + Sync {
     }
     /// 紧急开关：关闭后不再注册/处理本地变更通知（保留只读召回与占位符创建）。
     fn set_notifications_enabled(&mut self, _enabled: bool) {}
+    /// 取出并清空"已存在路径判定"的一次性统计 `(checked, placeholders, converted)`。
+    fn take_probe_summary(&mut self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
     /// 若占位符被平台标成"未同步"且**内容确实与云端一致**，把它恢复为 in-sync。
     /// 前置条件（`has_pending_change` / `snapshot_matches`）由调用方从索引库给出。
     fn repair_in_sync_if_needed(
@@ -390,6 +394,8 @@ mod windows_impl {
         root: Option<PathBuf>,
         connection: Option<CF_CONNECTION_KEY>,
         runtime: Arc<Runtime>,
+        /// 每次 `sync_now` 期间"已存在路径判定"的统计：(检查数, 判为占位符数, 实际转换数)。
+        probe_stats: Mutex<(usize, usize, usize)>,
     }
     type EventSink = Arc<dyn Fn(crate::model::NativeSyncEvent) + Send + Sync>;
     type ChangeSink = Arc<dyn Fn(crate::model::NativeSyncChangeEvent) + Send + Sync>;
@@ -2885,6 +2891,16 @@ mod windows_impl {
             self.root.take();
             Ok(())
         }
+        fn take_probe_summary(&mut self) -> (usize, usize, usize) {
+            self.probe_stats
+                .lock()
+                .map(|mut s| {
+                    let out = *s;
+                    *s = (0, 0, 0);
+                    out
+                })
+                .unwrap_or((0, 0, 0))
+        }
         fn repair_in_sync_if_needed(
             &mut self,
             path: &Path,
@@ -2963,6 +2979,12 @@ mod windows_impl {
                     "native-sync existing-path probe attrs=0x{attrs:08X} attrs_hint={} cf_placeholder={cf_placeholder}",
                     is_placeholder_attrs(attrs)
                 );
+                if let Ok(mut stats) = self.probe_stats.lock() {
+                    stats.0 += 1;
+                    if cf_placeholder {
+                        stats.1 += 1;
+                    }
+                }
                 match placeholder_repair_action(if cf_placeholder { 1 } else { 0 }) {
                     // 本来就是占位符：确保被标记为「与云端已同步」，
                     // 否则 Explorer 状态列会一直显示「同步挂起」。
@@ -3001,8 +3023,12 @@ mod windows_impl {
                             );
                             return Err(PlatformError::Api(error.to_string()));
                         }
+                        if let Ok(mut stats) = self.probe_stats.lock() {
+                            stats.2 += 1;
+                        }
+                        // 转换是稀有事件：留下该条目的原始属性与判定，便于与 fsutil 对照。
                         log::info!(
-                            "native-sync self-healed existing path back to a placeholder (dir={is_dir})"
+                            "native-sync self-healed existing path back to a placeholder (dir={is_dir}) attrs=0x{attrs:08X} cf_placeholder={cf_placeholder}"
                         );
                         probe_in_sync(path, if is_dir { "dir" } else { "file" });
                     }
