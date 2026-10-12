@@ -81,7 +81,7 @@ NativeSync 会注册删除 / 改名 / 脱水 / 开闭完成的 Cloud Files 回�
 
 关闭顺序（从最轻到最终手段）：
 
-1. 在 `config.json` 里设 `"nativeSyncNotifications": false`，重启应用；
+1. 在 `config.json` 里设 `"native_sync_notifications": false`，重启应用；
 2. 若配置无法编辑，改用环境变量（**优先级最高**，用于免编辑恢复）：
 
    ```powershell
@@ -94,7 +94,10 @@ NativeSync 会注册删除 / 改名 / 脱水 / 开闭完成的 Cloud Files 回�
    native-sync notifications effective=false config=false env=0
    ```
 
-恢复：删除该环境变量、或把 `nativeSyncNotifications` 改回 `true`，重启应用。
+恢复：删除该环境变量、或把 `native_sync_notifications` 改回 `true`，重启应用。
+
+> 注意：`config.json` 的键一律是 **snake_case**（与既有 `app_key`、`launch_at_login` 一致），
+> 不是 camelCase。camelCase（如 `pendingEntries`）只用于 Tauri 事件/命令的 payload。
 
 关闭捕获后，`native_sync_status` 的 `notificationsEnabled` 为 `false`，
 `pandock://nativesync/change` 不再有事件；此前已记录的待同步标记仍保留在

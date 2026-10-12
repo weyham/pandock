@@ -30,7 +30,7 @@ pub struct NativeSyncManager {
     db: IndexDb,
     backend: Option<Arc<dyn CloudBackend>>,
     platform: Box<dyn PlatformSync>,
-    /// 配置文件里的 `nativeSyncNotifications`（默认 true）。
+    /// 配置文件里的 `native_sync_notifications`（默认 true；config.json 用 snake_case）。
     notifications_config: bool,
     /// 生效值 = 环境变量 `PANDOCK_NATIVESYNC_NOTIFICATIONS` 覆盖配置字段。
     notifications_enabled: bool,
@@ -60,7 +60,7 @@ impl NativeSyncManager {
             notifications_enabled,
         })
     }
-    /// 应用配置文件里的 `nativeSyncNotifications`；环境变量优先级更高。
+    /// 应用配置文件里的 `native_sync_notifications`；环境变量优先级更高。
     pub fn set_notifications_config(&mut self, value: bool) {
         self.notifications_config = value;
         self.apply_notifications_switch();

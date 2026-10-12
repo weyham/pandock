@@ -119,6 +119,28 @@ mod tests {
 mod migration_tests {
     use super::*;
 
+    /// config.json 的键是 snake_case（`Config` 未加 `rename_all`）。
+    /// 这条断言是为了防止文档/契约再次写成 camelCase——紧急恢复步骤写错键名，
+    /// 用户按文档改配置会改不动。
+    #[test]
+    fn native_sync_notifications_uses_snake_case_key_and_defaults_on() {
+        let cfg = Config::default();
+        assert!(cfg.native_sync_notifications, "通知捕获默认开启");
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["native_sync_notifications"], true);
+        assert!(
+            json.get("nativeSyncNotifications").is_none(),
+            "config.json 不使用 camelCase 键"
+        );
+        // 老配置缺该字段时按默认值 true 反序列化（零迁移）。
+        let legacy: Config =
+            serde_json::from_str(r#"{"app_key":"k","listen":"127.0.0.1:19090"}"#).unwrap();
+        assert!(legacy.native_sync_notifications);
+        // 显式关闭必须被读到。
+        let off: Config = serde_json::from_str(r#"{"native_sync_notifications":false}"#).unwrap();
+        assert!(!off.native_sync_notifications);
+    }
+
     #[test]
     fn migrates_non_secret_config_and_removes_legacy_secrets() {
         let root = std::env::temp_dir().join(format!("pandock-migration-{}", uuid::Uuid::new_v4()));

@@ -69,7 +69,9 @@ ADR-108 确立了外壳注册，并明确记录了一条代价：
 
 ### 5. 紧急开关：配置字段 + 环境变量覆盖
 
-- 配置：`config.json` 的 `nativeSyncNotifications`（默认 `true`）；
+- 配置：`config.json` 的 `native_sync_notifications`（默认 `true`）；
+  `config.json` 全量使用 **snake_case** 键（`Config` 未加 `rename_all`，与 `app_key`/`launch_at_login` 一致）；
+  camelCase 仅用于 Tauri 命令与事件的 payload。
 - 环境变量 `PANDOCK_NATIVESYNC_NOTIFICATIONS`（`0/false/no/off` 关闭）**优先级最高**，
   用于回调卡死时免编辑恢复；
 - 启动时把生效值写入日志（`native-sync notifications effective=… config=… env=…`）；
