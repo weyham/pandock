@@ -456,27 +456,7 @@ impl IndexDb {
                 params![fs_id, op, since],
             )
             .map(|_| ())
-            .map_err(|e| e.to_string())?;
-        // 写穿到「脱水安全闸门」的内存镜像（见 `crate::pending`）：脱水回调线程只读内存，
-        // 绝不查库。这里是唯一写入点（设置与清除都覆盖），镜像因此不会漏标。
-        if op.is_some() {
-            crate::pending::mark(fs_id as u64);
-        } else {
-            crate::pending::clear(fs_id as u64);
-        }
-        Ok(())
-    }
-    /// 有未同步本地改动的 `fs_id` 集合（**权威来源**）：启动/重连时用它预热内存镜像。
-    pub fn pending_fs_ids(&self) -> Result<Vec<u64>, String> {
-        let mut st = self
-            .conn
-            .prepare("SELECT fs_id FROM local_state WHERE pending_op IS NOT NULL")
-            .map_err(|e| e.to_string())?;
-        let rows = st
-            .query_map([], |r| r.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?;
-        rows.map(|r| r.map(|v| v as u64).map_err(|e| e.to_string()))
-            .collect()
+            .map_err(|e| e.to_string())
     }
     pub fn pending_count(&self) -> Result<u64, String> {
         self.conn

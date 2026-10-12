@@ -9,7 +9,6 @@ mod manager;
 mod model;
 mod notify;
 mod path;
-mod pending;
 mod platform;
 
 pub use backend::{CloudBackend, SnapshotBackend};

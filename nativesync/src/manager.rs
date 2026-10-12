@@ -174,11 +174,6 @@ impl NativeSyncManager {
     }
     fn restore_platform_mappings(&mut self) {
         self.platform.set_state_db(self.db.path());
-        // 脱水安全闸门的内存镜像：启动/重连时从库里预热一次，此后回调线程只读内存。
-        match self.db.pending_fs_ids() {
-            Ok(ids) => crate::pending::preload(ids),
-            Err(err) => log::warn!("native-sync pending mirror preload failed: {err}"),
-        }
         if let Ok(mappings) = self.db.all_mappings() {
             for (fs_id, remote_path, relative) in mappings {
                 if let Ok(remote) = RemotePath::parse(&remote_path) {
@@ -350,6 +345,18 @@ impl NativeSyncManager {
                     // 平台侧可能已经把文件水合回来或释放掉了：每轮用磁盘真值对账，
                     // 免得管理台显示的状态与 Explorer 看到的实际情况互相矛盾。
                     self.reconcile_hydration_with_disk(fs_id, &relative, &local, snapshot.size)?;
+                    // 甲方案守卫（收敛路径）：库里仍有未同步本地改动的条目，重新标回
+                    // NOT_IN_SYNC，让平台（及外部工具）**拒绝对它脱水**。捕获那一刻已标过一次，
+                    // 这里覆盖「老库行 / 重启后遗留」的情形。S1 无上传方向 ⇒ 该标记可能长期保持，
+                    // 这是诚实状态（S2 上传成功后再清回 IN_SYNC）。
+                    if self
+                        .db
+                        .pending_op_of(fs_id as i64)
+                        .map_err(NativeSyncError::Message)?
+                        .is_some()
+                    {
+                        self.platform.mark_not_in_sync(&local);
+                    }
                 }
                 if snapshot.is_dir() {
                     queue.push(snapshot.path.clone());
@@ -810,6 +817,12 @@ mod manager_tests {
             self.calls.lock().unwrap().push("mark_in_sync".into());
             Ok(())
         }
+        fn mark_not_in_sync(&mut self, path: &Path) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("mark_not_in_sync:{}", path.display()));
+        }
         fn remove_placeholder(&mut self, path: &Path, is_dir: bool) -> Result<(), PlatformError> {
             self.calls
                 .lock()
@@ -995,6 +1008,45 @@ mod manager_tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_now_marks_only_pending_entries_not_in_sync() {
+        let (_dir, root, calls, mut manager, on_disk) = setup_with_disk();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        manager.backend = Some(backend_with(vec![(
+            "/",
+            vec![
+                file_snap("/a.txt", 11, Some("aaa")),
+                file_snap("/b.txt", 12, Some("bbb")),
+            ],
+        )]));
+        // b.txt 模拟「老库行 / 重启后遗留」的未同步本地改动：必须被重新标未同步。
+        manager
+            .db
+            .upsert(&record(12, "b.txt", Some("bbb")))
+            .unwrap();
+        manager
+            .db
+            .set_pending_op(12, Some("upload"), Some("2026-10-12T00:00:00Z"))
+            .unwrap();
+        set_on_disk(&on_disk, &root.join("b.txt"), 5);
+        manager.sync_now().await.unwrap();
+        let marked = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("mark_not_in_sync:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marked.len(),
+            1,
+            "只有带 pending 的条目才标未同步: {marked:?}"
+        );
+        assert!(marked[0].contains("b.txt"), "{marked:?}");
+        // 磁盘对账照旧工作，不受该守卫影响。
+        assert_eq!(hydration_state_of(&manager, 12), "hydrated");
     }
 
     #[tokio::test]

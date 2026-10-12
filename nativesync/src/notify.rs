@@ -94,7 +94,12 @@ impl IdentityLogLimiter {
 /// 回调种类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NotifyKind {
+    // 脱水通知已按方案甲**不再注册**（见 platform.rs 的回调表说明）：这两个种类在当前
+    // 生产路径上不会被构造，但它们在分类层（纯逻辑 + 单测）里仍然成立，且一旦重新注册
+    // 脱水回调即可直接复用。留着比删掉再写回来便宜，故显式放行 dead_code。
+    #[allow(dead_code)]
     Dehydrate,
+    #[allow(dead_code)]
     DehydrateCompleted,
     Delete,
     DeleteCompleted,
