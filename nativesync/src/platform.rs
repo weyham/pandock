@@ -406,7 +406,7 @@ mod windows_impl {
         {
             return Some(hit);
         }
-        db.and_then(|db| db.mapping_by_fs_id(file_id).ok().flatten())
+        db.and_then(|db| db.mapping_by_fs_id(file_id as i64).ok().flatten())
             .and_then(|(remote_path, relative)| {
                 RemotePath::parse(&remote_path)
                     .ok()
@@ -956,8 +956,9 @@ mod windows_impl {
         fn resolve_mapping_prefers_memory_and_falls_back_to_db() {
             let dir = tempfile::tempdir().unwrap();
             let db = crate::db::IndexDb::open(dir.path()).unwrap();
-            let record = |fs_id: u64, remote: &str, rel: &str| crate::model::EntryRecord {
+            let record = |fs_id: i64, remote: &str, rel: &str| crate::model::EntryRecord {
                 fs_id,
+                local_only: false,
                 parent_fs_id: None,
                 remote_path: remote.into(),
                 relative_path: rel.into(),
@@ -970,6 +971,9 @@ mod windows_impl {
                 pin_state: crate::model::PinState::Unpinned,
                 error: None,
                 has_children: false,
+
+                pending_op: None,
+                pending_since: None,
             };
             db.upsert(&record(77, "/a.txt", "a.txt")).unwrap();
             let runtime = Runtime::default();

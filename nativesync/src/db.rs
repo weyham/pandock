@@ -8,7 +8,7 @@ pub struct IndexDb {
     pub(crate) conn: Connection,
 }
 /// Row shape returned by IndexDb::entry_by_relative.
-pub type EntryByRelativeRow = (u64, String, Option<String>, String, bool);
+pub type EntryByRelativeRow = (i64, String, Option<String>, String, bool, bool);
 
 impl IndexDb {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
@@ -28,7 +28,7 @@ impl IndexDb {
         Ok(db)
     }
     fn migrate(&self) -> Result<(), String> {
-        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY); CREATE TABLE IF NOT EXISTS sync_root(id INTEGER PRIMARY KEY CHECK(id=1),root_path TEXT NOT NULL,state TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 0,registered_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS remote_entry(fs_id INTEGER PRIMARY KEY,parent_fs_id INTEGER,remote_path TEXT NOT NULL UNIQUE,name TEXT NOT NULL,is_dir INTEGER NOT NULL,size INTEGER NOT NULL,md5 TEXT,modified_at INTEGER,etag TEXT,seen_cycle INTEGER NOT NULL DEFAULT 0,tombstone INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS local_state(fs_id INTEGER PRIMARY KEY REFERENCES remote_entry(fs_id),relative_path TEXT NOT NULL,placeholder INTEGER NOT NULL DEFAULT 1,hydration_state TEXT NOT NULL DEFAULT 'online_only',pin_state TEXT NOT NULL DEFAULT 'unpinned',hydrated_md5 TEXT,last_error TEXT,remote_missing_ack_at TEXT,error_count INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS hydration_job(id INTEGER PRIMARY KEY AUTOINCREMENT,fs_id INTEGER NOT NULL,status TEXT NOT NULL,bytes_done INTEGER NOT NULL DEFAULT 0,total_bytes INTEGER NOT NULL DEFAULT 0,started_at TEXT NOT NULL,finished_at TEXT,error TEXT); CREATE TABLE IF NOT EXISTS sync_cycle(id INTEGER PRIMARY KEY AUTOINCREMENT,started_at TEXT NOT NULL,finished_at TEXT,result TEXT); INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);").map_err(|e|e.to_string())?;
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY); CREATE TABLE IF NOT EXISTS sync_root(id INTEGER PRIMARY KEY CHECK(id=1),root_path TEXT NOT NULL,state TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 0,registered_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS remote_entry(fs_id INTEGER PRIMARY KEY,parent_fs_id INTEGER,remote_path TEXT NOT NULL UNIQUE,name TEXT NOT NULL,is_dir INTEGER NOT NULL,size INTEGER NOT NULL,md5 TEXT,modified_at INTEGER,etag TEXT,seen_cycle INTEGER NOT NULL DEFAULT 0,tombstone INTEGER NOT NULL DEFAULT 0,local_only INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS local_state(fs_id INTEGER PRIMARY KEY REFERENCES remote_entry(fs_id),relative_path TEXT NOT NULL,placeholder INTEGER NOT NULL DEFAULT 1,hydration_state TEXT NOT NULL DEFAULT 'online_only',pin_state TEXT NOT NULL DEFAULT 'unpinned',hydrated_md5 TEXT,last_error TEXT,remote_missing_ack_at TEXT,error_count INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS hydration_job(id INTEGER PRIMARY KEY AUTOINCREMENT,fs_id INTEGER NOT NULL,status TEXT NOT NULL,bytes_done INTEGER NOT NULL DEFAULT 0,total_bytes INTEGER NOT NULL DEFAULT 0,started_at TEXT NOT NULL,finished_at TEXT,error TEXT); CREATE TABLE IF NOT EXISTS sync_cycle(id INTEGER PRIMARY KEY AUTOINCREMENT,started_at TEXT NOT NULL,finished_at TEXT,result TEXT); INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);").map_err(|e|e.to_string())?;
         let has_ack: Option<String> = self.conn.query_row("SELECT name FROM pragma_table_info('local_state') WHERE name='remote_missing_ack_at'", [], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
         if has_ack.is_none() {
             self.conn
@@ -41,6 +41,59 @@ impl IndexDb {
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO schema_migrations(version) VALUES(2)",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        // ---- v3（ADR-109 / S1）：本地变更捕获 + 待同步轴（与 hydration 轴正交）----
+        // 纯增量：建表/建索引 + 受探测保护的 ADD COLUMN；打开前已生成 .bak。
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS local_change(id INTEGER PRIMARY KEY AUTOINCREMENT,fs_id INTEGER,kind TEXT NOT NULL,phase TEXT NOT NULL,from_relative TEXT,to_relative TEXT,is_dir INTEGER NOT NULL DEFAULT 0,reason TEXT,source TEXT NOT NULL,detected_at TEXT NOT NULL,applied_to_cloud INTEGER NOT NULL DEFAULT 0,error TEXT);
+                 CREATE INDEX IF NOT EXISTS local_change_pending ON local_change(applied_to_cloud, id);",
+            )
+            .map_err(|e| e.to_string())?;
+        for (column, decl) in [
+            ("pending_op", "TEXT"),
+            ("pending_since", "TEXT"),
+            ("snapshot_mtime", "INTEGER"),
+            ("snapshot_size", "INTEGER"),
+        ] {
+            let probe =
+                format!("SELECT name FROM pragma_table_info('local_state') WHERE name='{column}'");
+            let exists: Option<String> = self
+                .conn
+                .query_row(&probe, [], |row| row.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if exists.is_none() {
+                self.conn
+                    .execute(
+                        &format!("ALTER TABLE local_state ADD COLUMN {column} {decl}"),
+                        [],
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        let local_only_probe: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('remote_entry') WHERE name='local_only'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if local_only_probe.is_none() {
+            self.conn
+                .execute(
+                    "ALTER TABLE remote_entry ADD COLUMN local_only INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version) VALUES(3)",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -87,7 +140,7 @@ impl IndexDb {
         } else {
             format!("{}/", parent.trim_end_matches('/'))
         };
-        let mut st=self.conn.prepare("SELECT r.fs_id,r.parent_fs_id,r.remote_path,r.name,r.is_dir,r.size,r.md5,r.modified_at,l.relative_path,l.hydration_state,l.pin_state,l.last_error,EXISTS(SELECT 1 FROM remote_entry c WHERE c.parent_fs_id=r.fs_id AND c.tombstone=0) FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id WHERE l.relative_path LIKE ?1 AND instr(substr(l.relative_path,length(?1)+1),'/')=0 AND r.tombstone=0 ORDER BY r.is_dir DESC,r.name LIMIT ?2 OFFSET ?3").map_err(|e|e.to_string())?;
+        let mut st=self.conn.prepare("SELECT r.fs_id,r.parent_fs_id,r.remote_path,r.name,r.is_dir,r.size,r.md5,r.modified_at,l.relative_path,l.hydration_state,l.pin_state,l.last_error,l.pending_op,l.pending_since,EXISTS(SELECT 1 FROM remote_entry c WHERE c.parent_fs_id=r.fs_id AND c.tombstone=0),r.local_only FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id WHERE l.relative_path LIKE ?1 AND instr(substr(l.relative_path,length(?1)+1),'/')=0 AND r.tombstone=0 ORDER BY r.is_dir DESC,r.name LIMIT ?2 OFFSET ?3").map_err(|e|e.to_string())?;
         let rows = st
             .query_map(
                 params![
@@ -99,7 +152,7 @@ impl IndexDb {
                     let state: String = r.get(9).unwrap_or_else(|_| "online_only".into());
                     let pin: String = r.get(10).unwrap_or_else(|_| "unpinned".into());
                     Ok(EntryRecord {
-                        fs_id: r.get(0)?,
+                        fs_id: r.get::<_, i64>(0)?,
                         parent_fs_id: r.get(1)?,
                         remote_path: r.get(2)?,
                         name: r.get(3)?,
@@ -111,7 +164,10 @@ impl IndexDb {
                         state: parse_state(&state),
                         pin_state: parse_pin(&pin),
                         error: r.get(11)?,
-                        has_children: r.get::<_, i64>(12)? != 0,
+                        pending_op: r.get(12)?,
+                        pending_since: r.get(13)?,
+                        has_children: r.get::<_, i64>(14)? != 0,
+                        local_only: r.get::<_, i64>(15)? != 0,
                     })
                 },
             )
@@ -147,7 +203,7 @@ impl IndexDb {
                 .map_err(|e| e.to_string())?;
         }
         self.conn.execute("INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone) VALUES(?,?,?,?,?,?,?,?,?,0,0) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0",params![e.fs_id,e.parent_fs_id,e.remote_path,e.name,e.is_dir as i64,e.size,e.md5,e.modified_at,Option::<String>::None]).map_err(|err|format!("remote_entry 写入失败 fs_id={} path={} err={err}",e.fs_id,e.remote_path))?;
-        self.conn.execute("INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?,?,1,?,?,?,0) ON CONFLICT(fs_id) DO UPDATE SET relative_path=excluded.relative_path",params![e.fs_id,e.relative_path,e.state.to_string(),e.pin_state.to_string(),e.error]).map_err(|e|e.to_string())?;
+        self.conn.execute("INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?,?,1,?,?,?,0) ON CONFLICT(fs_id) DO UPDATE SET relative_path=CASE WHEN local_state.pending_op IS NULL THEN excluded.relative_path ELSE local_state.relative_path END",params![e.fs_id,e.relative_path,e.state.to_string(),e.pin_state.to_string(),e.error]).map_err(|e|e.to_string())?;
         Ok(())
     }
     /// 按远端路径查 fs_id（容忍前导斜杠差异）；parent_fs_id 回填用。
@@ -170,7 +226,7 @@ impl IndexDb {
         self.conn.query_row("SELECT l.relative_path FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.remote_path=?1 AND r.tombstone=0", params![remote], |r| r.get(0)).optional().map_err(|e| e.to_string())
     }
     pub fn entry_by_relative(&self, relative: &str) -> Result<Option<EntryByRelativeRow>, String> {
-        self.conn.query_row("SELECT r.fs_id,l.hydration_state,r.md5,r.remote_path,r.is_dir FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE l.relative_path=?1 AND r.tombstone=0",params![relative],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_,i64>(4)?!=0))).optional().map_err(|e|e.to_string())
+        self.conn.query_row("SELECT r.fs_id,l.hydration_state,r.md5,r.remote_path,r.is_dir,r.local_only FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE l.relative_path=?1 AND r.tombstone=0",params![relative],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_,i64>(4)?!=0,r.get::<_,i64>(5)?!=0))).optional().map_err(|e|e.to_string())
     }
     pub fn set_pin_state(&self, fs_id: u64, pinned: bool) -> Result<(), String> {
         self.conn
@@ -203,7 +259,7 @@ impl IndexDb {
         &self,
         seen: &[u64],
     ) -> Result<Vec<(u64, String, String, bool)>, String> {
-        let mut st=self.conn.prepare("SELECT r.fs_id,l.relative_path,l.hydration_state,r.is_dir FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0").map_err(|e|e.to_string())?;
+        let mut st=self.conn.prepare("SELECT r.fs_id,l.relative_path,l.hydration_state,r.is_dir FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0 AND r.local_only=0").map_err(|e|e.to_string())?;
         let rows = st
             .query_map([], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
@@ -239,21 +295,33 @@ impl IndexDb {
             .map_err(|e| e.to_string())?;
         Ok(id)
     }
-    pub fn mapping_by_fs_id(&self, fs_id: u64) -> Result<Option<(String, String)>, String> {
-        self.conn
+    /// 召回映射的唯一权威出口。**本地新建条目（local_only）必须拒绝**：
+    /// 它们的 remote_path 是 `local:` 前缀的内部占位，若被当作远端路径解析会构造出
+    /// 非法云端请求。这里返回显式错误而不是伪造映射。
+    pub fn mapping_by_fs_id(&self, fs_id: i64) -> Result<Option<(String, String)>, String> {
+        if fs_id < 0 {
+            return Err(LOCAL_ONLY_NO_REMOTE.into());
+        }
+        let row: Option<(String, String, i64)> = self
+            .conn
             .query_row(
-                "SELECT r.remote_path,l.relative_path FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.fs_id=?1 AND r.tombstone=0",
+                "SELECT r.remote_path,l.relative_path,r.local_only FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.fs_id=?1 AND r.tombstone=0",
                 params![fs_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        match row {
+            None => Ok(None),
+            Some((_, _, local_only)) if local_only != 0 => Err(LOCAL_ONLY_NO_REMOTE.into()),
+            Some((remote, relative, _)) => Ok(Some((remote, relative))),
+        }
     }
     pub fn all_mappings(&self) -> Result<Vec<(u64, String, String)>, String> {
         let mut st = self
             .conn
             .prepare(
-                "SELECT r.fs_id,r.remote_path,l.relative_path FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0",
+                "SELECT r.fs_id,r.remote_path,l.relative_path FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0 AND r.local_only=0",
             )
             .map_err(|e| e.to_string())?;
         let rows = st
@@ -325,10 +393,233 @@ impl IndexDb {
     pub fn acknowledge_remote_missing(&self, fs_id: u64) -> Result<(), String> {
         self.conn.execute("UPDATE local_state SET remote_missing_ack_at=?2 WHERE fs_id=?1 AND hydration_state='remote_missing'", params![fs_id, now()]).map(|_| ()).map_err(|e| e.to_string())
     }
+    /// 记录一条本地变更（S1 追加式日志；S2/S3 将其作为上传/传播队列消费）。
+    pub fn record_local_change(&self, change: &LocalChangeRecord) -> Result<i64, String> {
+        self.conn
+            .execute(
+                "INSERT INTO local_change(fs_id,kind,phase,from_relative,to_relative,is_dir,reason,source,detected_at,applied_to_cloud,error) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    change.fs_id,
+                    change.kind,
+                    change.phase,
+                    change.from_relative,
+                    change.to_relative,
+                    change.is_dir as i64,
+                    change.reason,
+                    change.source,
+                    change.detected_at,
+                    change.applied_to_cloud as i64,
+                    change.error
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(self.conn.last_insert_rowid())
+    }
+    pub fn recent_local_changes(&self, limit: usize) -> Result<Vec<LocalChangeRecord>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT id,fs_id,kind,phase,from_relative,to_relative,is_dir,reason,source,detected_at,applied_to_cloud,error FROM local_change ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![limit as i64], |r| {
+                Ok(LocalChangeRecord {
+                    id: Some(r.get(0)?),
+                    fs_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    phase: r.get(3)?,
+                    from_relative: r.get(4)?,
+                    to_relative: r.get(5)?,
+                    is_dir: r.get::<_, i64>(6)? != 0,
+                    reason: r.get(7)?,
+                    source: r.get(8)?,
+                    detected_at: r.get(9)?,
+                    applied_to_cloud: r.get::<_, i64>(10)? != 0,
+                    error: r.get(11)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.map(|r| r.map_err(|e| e.to_string())).collect()
+    }
+    /// 设置/清除「待同步到云端」标记（hydration 轴之外的第二条状态轴）。
+    pub fn set_pending_op(
+        &self,
+        fs_id: i64,
+        op: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE local_state SET pending_op=?2,pending_since=?3 WHERE fs_id=?1",
+                params![fs_id, op, since],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    pub fn pending_count(&self) -> Result<u64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_state WHERE pending_op IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(|e| e.to_string())
+    }
+    pub fn set_relative_path(&self, fs_id: i64, relative: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE local_state SET relative_path=?2 WHERE fs_id=?1",
+                params![fs_id, relative],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    /// 记录占位符创建/水合时的本地快照，用于识别后续的本地写入。
+    pub fn set_snapshot(&self, fs_id: i64, mtime: Option<i64>, size: u64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE local_state SET snapshot_mtime=?2,snapshot_size=?3 WHERE fs_id=?1",
+                params![fs_id, mtime, size as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    pub fn snapshot_for(&self, fs_id: i64) -> Result<Option<(Option<i64>, u64)>, String> {
+        self.conn
+            .query_row(
+                "SELECT snapshot_mtime,snapshot_size FROM local_state WHERE fs_id=?1",
+                params![fs_id],
+                |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+    /// 本地新建（云端不存在）条目：预留负数 fs_id，remote_path 用 local: 前缀。
+    pub fn next_local_fs_id(&self) -> Result<i64, String> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(MIN(fs_id),0) FROM remote_entry WHERE local_only=1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|min| if min < 0 { min - 1 } else { -1 })
+            .map_err(|e| e.to_string())
+    }
+    pub fn insert_local_only_entry(
+        &self,
+        fs_id: i64,
+        relative: &str,
+        name: &str,
+        is_dir: bool,
+        size: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone,local_only) VALUES(?1,NULL,?2,?3,?4,?5,NULL,NULL,NULL,0,0,1)",
+                params![
+                    fs_id,
+                    format!("local:{relative}"),
+                    name,
+                    is_dir as i64,
+                    size as i64
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?1,?2,0,'error','unpinned',NULL,0)",
+                params![fs_id, relative],
+            )
+            .map_err(|e| e.to_string())?;
+        self.set_pending_op(fs_id, Some("upload"), Some(&now()))
+    }
+    /// 某条云端路径上是否已有「本地已删除/改名、尚未同步到云端」的待同步标记。
+    ///
+    /// H1：注册 NOTIFY_DELETE / NOTIFY_RENAME 之后，`sync_now` 会同时看到
+    /// 「本地已删除/改名」与「云端仍在」。若照旧重建占位符，用户删掉的文件会在下次
+    /// 同步无声复活、改名会多出旧路径副本。调用方据此跳过占位符重建。
+    pub fn pending_op_for_remote(&self, remote: &str) -> Result<Option<(i64, String)>, String> {
+        let key = if remote.starts_with('/') {
+            remote.to_string()
+        } else {
+            format!("/{remote}")
+        };
+        self.conn
+            .query_row(
+                "SELECT r.fs_id,l.pending_op FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.remote_path=?1 AND r.tombstone=0 AND l.pending_op IS NOT NULL",
+                params![key],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+    pub fn pending_op_of(&self, fs_id: i64) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT pending_op FROM local_state WHERE fs_id=?1",
+                params![fs_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|v| v.flatten())
+            .map_err(|e| e.to_string())
+    }
+    /// 占位符 identity 的 fs_id 出口守卫：identity 必须来自云端 fs_id。
+    pub fn cloud_fs_id(&self, fs_id: i64) -> Result<u64, String> {
+        if fs_id < 0 {
+            return Err(LOCAL_ONLY_NO_REMOTE.into());
+        }
+        let local_only: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT local_only FROM remote_entry WHERE fs_id=?1",
+                params![fs_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if local_only == Some(1) {
+            return Err(LOCAL_ONLY_NO_REMOTE.into());
+        }
+        Ok(fs_id as u64)
+    }
+    /// 记录一次本地改名：路径改为新值，并标记待同步（不改动远端事实）。
+    pub fn apply_local_rename(&self, fs_id: i64, to_relative: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE local_state SET relative_path=?2,pending_op='rename',pending_since=?3 WHERE fs_id=?1",
+                params![fs_id, to_relative, now()],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
     pub fn counts(&self) -> Result<(u64, u64, u64, u64, u64), String> {
-        self.conn.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN l.placeholder=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN l.hydration_state='hydrated' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN l.hydration_state IN ('error','remote_missing','stale') THEN 1 ELSE 0 END),0),COALESCE((SELECT COUNT(*) FROM hydration_job WHERE status='running'),0) FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|e|e.to_string())
+        self.conn.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN l.placeholder=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN l.hydration_state='hydrated' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN l.hydration_state IN ('error','remote_missing','stale') OR l.pending_op IN ('delete','rename') THEN 1 ELSE 0 END),0),COALESCE((SELECT COUNT(*) FROM hydration_job WHERE status='running'),0) FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|e|e.to_string())
     }
 }
+/// 本地新建条目（`local_only=1`）没有云端映射的统一错误文本。
+pub const LOCAL_ONLY_NO_REMOTE: &str =
+    "本地新建条目没有远端映射，不能用于云端召回或占位符 identity";
+
+/// 一条本地变更记录（S1 只写不消费；S2/S3 消费）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalChangeRecord {
+    pub id: Option<i64>,
+    pub fs_id: Option<i64>,
+    pub kind: String,
+    pub phase: String,
+    pub from_relative: Option<String>,
+    pub to_relative: Option<String>,
+    pub is_dir: bool,
+    pub reason: Option<String>,
+    pub source: String,
+    pub detected_at: String,
+    pub applied_to_cloud: bool,
+    pub error: Option<String>,
+}
+
 fn now() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -366,8 +657,9 @@ mod tests {
     fn upsert_replaces_stale_row_when_remote_path_changes_fs_id() {
         let dir = tempdir().unwrap();
         let db = IndexDb::open(dir.path()).unwrap();
-        let record = |fs_id: u64, state: NativeSyncState| EntryRecord {
+        let record = |fs_id: i64, state: NativeSyncState| EntryRecord {
             fs_id,
+            local_only: false,
             parent_fs_id: None,
             remote_path: "/a.txt".into(),
             relative_path: "a.txt".into(),
@@ -380,6 +672,9 @@ mod tests {
             pin_state: PinState::Unpinned,
             error: None,
             has_children: false,
+
+            pending_op: None,
+            pending_since: None,
         };
 
         db.upsert(&record(1, NativeSyncState::Hydrated)).unwrap();
@@ -420,7 +715,51 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3, "schema_migrations 应记录 1/2/3 三个版本");
+        // v3：本地变更捕获表、索引与待同步/快照列必须存在
+        let table: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='local_change'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "local_change 表应存在");
+        let index: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='local_change_pending'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1, "local_change_pending 索引应存在");
+        for column in [
+            "pending_op",
+            "pending_since",
+            "snapshot_mtime",
+            "snapshot_size",
+        ] {
+            let n: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('local_state') WHERE name=?1",
+                    [column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "local_state.{column} 应存在");
+        }
+        let local_only: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('remote_entry') WHERE name='local_only'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_only, 1, "remote_entry.local_only 应存在");
     }
     #[test]
     fn mapping_queries_support_recall_resolution() {
@@ -428,6 +767,7 @@ mod tests {
         let db = IndexDb::open(dir.path()).unwrap();
         db.upsert(&EntryRecord {
             fs_id: 77,
+            local_only: false,
             parent_fs_id: None,
             remote_path: "/a.txt".into(),
             relative_path: "a.txt".into(),
@@ -440,10 +780,14 @@ mod tests {
             pin_state: PinState::Unpinned,
             error: None,
             has_children: false,
+
+            pending_op: None,
+            pending_since: None,
         })
         .unwrap();
         db.upsert(&EntryRecord {
             fs_id: 78,
+            local_only: false,
             parent_fs_id: None,
             remote_path: "/d/b.txt".into(),
             relative_path: "d/b.txt".into(),
@@ -456,6 +800,9 @@ mod tests {
             pin_state: PinState::Unpinned,
             error: None,
             has_children: false,
+
+            pending_op: None,
+            pending_since: None,
         })
         .unwrap();
         assert_eq!(
@@ -474,6 +821,7 @@ mod tests {
         let db = IndexDb::open(dir.path()).unwrap();
         let record = |parent: Option<u64>| EntryRecord {
             fs_id: 20,
+            local_only: false,
             parent_fs_id: parent,
             remote_path: "/d/f.txt".into(),
             relative_path: "d/f.txt".into(),
@@ -486,6 +834,9 @@ mod tests {
             pin_state: PinState::Unpinned,
             error: None,
             has_children: false,
+
+            pending_op: None,
+            pending_since: None,
         };
         db.upsert(&record(None)).unwrap();
         db.upsert(&record(Some(5))).unwrap();
@@ -540,8 +891,27 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(versions, 2);
+        assert_eq!(versions, 3, "v1 库升级后应记录到 3");
         db.migrate().unwrap();
+        // 幂等：二次迁移不得报错，且 v3 对象已在 v1 库上升级出来
+        let table: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='local_change'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "v1 库升级后应具备 local_change 表");
+        let pending: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('local_state') WHERE name='pending_op'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "v1 库升级后 local_state 应具备 pending_op");
     }
     #[test]
     fn entry_listing_uses_local_relative_path_and_cursor() {
@@ -550,6 +920,7 @@ mod tests {
         for id in 1..=3 {
             db.upsert(&EntryRecord {
                 fs_id: id,
+                local_only: false,
                 parent_fs_id: None,
                 remote_path: format!("/f{id}"),
                 relative_path: format!("f{id}"),
@@ -562,10 +933,134 @@ mod tests {
                 pin_state: PinState::Unpinned,
                 error: None,
                 has_children: false,
+
+                pending_op: None,
+                pending_since: None,
             })
             .unwrap();
         }
         assert_eq!(db.entries("/", 2, 0).unwrap().len(), 2);
         assert_eq!(db.entries("/", 2, 2).unwrap().len(), 1);
+    }
+
+    /// 本地新建条目的三条云出口必须显式拒绝：fs_id→RemotePath、fs_id→占位符 identity、
+    /// all_mappings（fs_id→by_id 预热源）不得把内部占位当成合法云端事实。
+    #[test]
+    fn local_only_rows_are_rejected_by_every_cloud_identity_exit() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        let fs_id = db.next_local_fs_id().unwrap();
+        assert!(fs_id < 0, "本地新建条目必须占用负数保留区间");
+        db.insert_local_only_entry(fs_id, "新建.txt", "新建.txt", false, 3)
+            .unwrap();
+
+        // ① fs_id -> RemotePath
+        let err = db.mapping_by_fs_id(fs_id).unwrap_err();
+        assert_eq!(err, LOCAL_ONLY_NO_REMOTE);
+        // ② fs_id -> 占位符 identity
+        let err = db.cloud_fs_id(fs_id).unwrap_err();
+        assert_eq!(err, LOCAL_ONLY_NO_REMOTE);
+        // ③ all_mappings（内存 by_id 预热的唯一来源）
+        assert!(
+            db.all_mappings().unwrap().is_empty(),
+            "本地新建条目不得进入云端映射预热"
+        );
+
+        // 对照：云端条目仍然正常，守卫不是「一律拒绝」
+        db.upsert(&EntryRecord {
+            fs_id: 42,
+            local_only: false,
+            parent_fs_id: None,
+            remote_path: "/a.txt".into(),
+            relative_path: "a.txt".into(),
+            name: "a.txt".into(),
+            is_dir: false,
+            size: 3,
+            md5: None,
+            modified_at: None,
+            state: NativeSyncState::OnlineOnly,
+            pin_state: PinState::Unpinned,
+            error: None,
+            has_children: false,
+            pending_op: None,
+            pending_since: None,
+        })
+        .unwrap();
+        assert_eq!(
+            db.mapping_by_fs_id(42).unwrap().unwrap().0,
+            "/a.txt".to_string()
+        );
+        assert_eq!(db.cloud_fs_id(42).unwrap(), 42);
+        assert_eq!(db.all_mappings().unwrap().len(), 1);
+    }
+
+    /// H1 的数据层前提：pending_op_for_remote 必须能按云端路径查到本地待同步标记。
+    #[test]
+    fn pending_op_lookup_is_keyed_by_remote_path() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        db.upsert(&EntryRecord {
+            fs_id: 7,
+            local_only: false,
+            parent_fs_id: None,
+            remote_path: "/d/f.txt".into(),
+            relative_path: "d/f.txt".into(),
+            name: "f.txt".into(),
+            is_dir: false,
+            size: 3,
+            md5: None,
+            modified_at: None,
+            state: NativeSyncState::OnlineOnly,
+            pin_state: PinState::Unpinned,
+            error: None,
+            has_children: false,
+            pending_op: None,
+            pending_since: None,
+        })
+        .unwrap();
+        assert!(db.pending_op_for_remote("/d/f.txt").unwrap().is_none());
+        db.set_pending_op(7, Some("delete"), Some("2026-10-12T00:00:00Z"))
+            .unwrap();
+        let (fs_id, op) = db.pending_op_for_remote("d/f.txt").unwrap().unwrap();
+        assert_eq!((fs_id, op.as_str()), (7, "delete"));
+        assert_eq!(db.pending_op_of(7).unwrap().as_deref(), Some("delete"));
+        // 待同步的删除/改名必须计入 attention（否则 UI 无从提示）
+        assert_eq!(db.counts().unwrap().3, 1);
+        db.set_pending_op(7, None, None).unwrap();
+        assert_eq!(db.counts().unwrap().3, 0);
+    }
+
+    /// 本地改名：路径改为新值并标记待同步，云端事实保持不变。
+    #[test]
+    fn apply_local_rename_rewrites_relative_path_and_marks_pending() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        db.upsert(&EntryRecord {
+            fs_id: 9,
+            local_only: false,
+            parent_fs_id: None,
+            remote_path: "/old.txt".into(),
+            relative_path: "old.txt".into(),
+            name: "old.txt".into(),
+            is_dir: false,
+            size: 3,
+            md5: None,
+            modified_at: None,
+            state: NativeSyncState::OnlineOnly,
+            pin_state: PinState::Unpinned,
+            error: None,
+            has_children: false,
+            pending_op: None,
+            pending_since: None,
+        })
+        .unwrap();
+        db.apply_local_rename(9, "new.txt").unwrap();
+        let (_, state, _, remote_path, _, local_only) =
+            db.entry_by_relative("new.txt").unwrap().unwrap();
+        assert!(!local_only);
+        assert_eq!(remote_path, "/old.txt", "本地改名不得改写云端路径");
+        assert_eq!(state, "online_only");
+        assert_eq!(db.pending_op_of(9).unwrap().as_deref(), Some("rename"));
+        assert!(db.entry_by_relative("old.txt").unwrap().is_none());
     }
 }

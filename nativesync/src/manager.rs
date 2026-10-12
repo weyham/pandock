@@ -70,6 +70,8 @@ impl NativeSyncManager {
             placeholder_entries: placeholders,
             hydrated_entries: hydrated,
             attention_entries: attention,
+            pending_entries: self.db.pending_count().map_err(NativeSyncError::Message)?,
+            notifications_enabled: false, // S1 中间态：platform.rs 接线后改为运行时真值
             active_jobs: jobs,
             last_sync_at: None,
             last_error: None,
@@ -180,7 +182,22 @@ impl NativeSyncManager {
                 let fs_id = snapshot
                     .fs_id
                     .ok_or_else(|| NativeSyncError::Message("远端条目缺少 fs_id".into()))?;
+                // 云端仍存在：先登记，否则下面的 missing 对账会把它误判成远端删除。
                 seen.push(fs_id);
+                // H1：本地已删除/改名、尚未同步到云端的条目不得被重建，
+                // 否则用户删掉的文件会在下次同步无声复活、改名会多出旧路径副本。
+                if let Some((pending_fs_id, op)) = self
+                    .db
+                    .pending_op_for_remote(snapshot.path.as_str())
+                    .map_err(NativeSyncError::Message)?
+                {
+                    if op == "delete" || op == "rename" {
+                        log::info!(
+                            "native-sync sync_now keeps local pending entry fs_id={pending_fs_id} op={op}"
+                        );
+                        continue;
+                    }
+                }
                 let name = sanitize_component(
                     snapshot
                         .server_filename
@@ -214,7 +231,8 @@ impl NativeSyncManager {
                 };
                 let local = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
                 let record = crate::model::EntryRecord {
-                    fs_id,
+                    fs_id: fs_id as i64,
+                    local_only: false,
                     parent_fs_id,
                     remote_path: snapshot.path.as_str().to_string(),
                     relative_path: relative.clone(),
@@ -230,6 +248,8 @@ impl NativeSyncManager {
                     state: NativeSyncState::OnlineOnly,
                     pin_state: PinState::Unpinned,
                     error: None,
+                    pending_op: None,
+                    pending_since: None,
                     has_children: snapshot.is_dir(),
                 };
                 self.db.upsert(&record).map_err(NativeSyncError::Message)?;
@@ -273,8 +293,12 @@ impl NativeSyncManager {
                         Some("远端条目已删除，保留本地内容"),
                     )
                     .map_err(NativeSyncError::Message)?;
-            } else {
+            } else if local.exists() {
                 self.platform.remove_placeholder(&local, is_dir)?;
+                self.db.tombstone(fs_id).map_err(NativeSyncError::Message)?;
+            } else {
+                // 本地已不存在（用户在 Explorer 删除、或父目录本轮被跳过枚举）：
+                // 直接记账，不再调用平台删除接口（对不存在的路径会 ENOENT 而中断整轮）。
                 self.db.tombstone(fs_id).map_err(NativeSyncError::Message)?;
             }
         }
@@ -299,8 +323,9 @@ impl NativeSyncManager {
         let views = entries
             .into_iter()
             .map(|e| {
+                let cloud_fs_id = if e.local_only { None } else { Some(e.fs_id) };
                 Ok(NativeSyncEntryView {
-                    fs_id: e.fs_id,
+                    fs_id: cloud_fs_id.map(|v| v as u64),
                     parent_fs_id: e.parent_fs_id,
                     name: e.name,
                     relative_path: e.relative_path,
@@ -309,11 +334,17 @@ impl NativeSyncManager {
                     modified_at: e.modified_at,
                     state: e.state,
                     pin_state: e.pin_state,
-                    progress: self
-                        .db
-                        .hydration_progress_for(e.fs_id)
-                        .map_err(NativeSyncError::Message)?,
+                    progress: match cloud_fs_id {
+                        Some(id) if id >= 0 => self
+                            .db
+                            .hydration_progress_for(id as u64)
+                            .map_err(NativeSyncError::Message)?,
+                        // 本地新建条目没有 hydration job。
+                        _ => None,
+                    },
                     error: e.error,
+                    pending_operation: e.pending_op,
+                    pending_since: e.pending_since,
                     has_children: e.has_children,
                 })
             })
@@ -351,39 +382,32 @@ impl NativeSyncManager {
         );
         match action.action {
             EntryAction::Pin => {
-                let Some((fs_id, _, _, _, _)) = self
-                    .db
-                    .entry_by_relative(&action.relative_path)
-                    .map_err(NativeSyncError::Message)?
-                else {
-                    return Err(NativeSyncError::Message("找不到同步条目".into()));
-                };
+                let fs_id = self.cloud_fs_id_for(&action.relative_path)?;
                 self.platform.pin(&local, true)?;
                 self.db
                     .set_pin_state(fs_id, true)
                     .map_err(NativeSyncError::Message)?;
             }
             EntryAction::Unpin => {
-                let Some((fs_id, _, _, _, _)) = self
-                    .db
-                    .entry_by_relative(&action.relative_path)
-                    .map_err(NativeSyncError::Message)?
-                else {
-                    return Err(NativeSyncError::Message("找不到同步条目".into()));
-                };
+                let fs_id = self.cloud_fs_id_for(&action.relative_path)?;
                 self.platform.pin(&local, false)?;
                 self.db
                     .set_pin_state(fs_id, false)
                     .map_err(NativeSyncError::Message)?;
             }
             EntryAction::Dehydrate => {
-                let Some((fs_id, state, remote_md5, _, _)) = self
+                let Some((fs_id, state, remote_md5, _, _, local_only)) = self
                     .db
                     .entry_by_relative(&action.relative_path)
                     .map_err(NativeSyncError::Message)?
                 else {
                     return Err(NativeSyncError::Message("找不到同步条目".into()));
                 };
+                if local_only {
+                    return Err(NativeSyncError::Message(
+                        crate::db::LOCAL_ONLY_NO_REMOTE.into(),
+                    ));
+                }
                 if state != "hydrated" {
                     return Err(NativeSyncError::Message(
                         "只有已完整下载且已同步的文件才能释放空间".into(),
@@ -411,37 +435,64 @@ impl NativeSyncManager {
                 self.platform.dehydrate(&local)?;
                 self.platform.mark_in_sync(&local)?;
                 self.db
-                    .set_state_by_fs_id(fs_id, "online_only", None)
+                    .set_state_by_fs_id(fs_id as u64, "online_only", None)
                     .map_err(NativeSyncError::Message)?;
             }
             EntryAction::Retry => {
-                if let Some((fs_id, _, _, _, _)) = self
+                if let Some((fs_id, _, _, _, _, local_only)) = self
                     .db
                     .entry_by_relative(&action.relative_path)
                     .map_err(NativeSyncError::Message)?
                 {
+                    if local_only {
+                        return Err(NativeSyncError::Message(
+                            crate::db::LOCAL_ONLY_NO_REMOTE.into(),
+                        ));
+                    }
                     self.db
-                        .set_state_by_fs_id(fs_id, "online_only", None)
+                        .set_state_by_fs_id(fs_id as u64, "online_only", None)
                         .map_err(NativeSyncError::Message)?;
                 }
             }
             EntryAction::AckRemoteMissing => {
-                let Some((fs_id, state, _, _, _)) = self
+                let Some((fs_id, state, _, _, _, local_only)) = self
                     .db
                     .entry_by_relative(&action.relative_path)
                     .map_err(NativeSyncError::Message)?
                 else {
                     return Err(NativeSyncError::Message("找不到同步条目".into()));
                 };
+                if local_only {
+                    return Err(NativeSyncError::Message(
+                        crate::db::LOCAL_ONLY_NO_REMOTE.into(),
+                    ));
+                }
                 if state != "remote_missing" {
                     return Err(NativeSyncError::Message("条目不是远端删除状态".into()));
                 }
                 self.db
-                    .acknowledge_remote_missing(fs_id)
+                    .acknowledge_remote_missing(fs_id as u64)
                     .map_err(NativeSyncError::Message)?;
             }
         }
         self.status()
+    }
+    /// 云端操作（pin / dehydrate / retry / ack）前的 fs_id 出口守卫：
+    /// 本地新建条目没有云端对应物，必须显式拒绝，不构造非法云端请求。
+    fn cloud_fs_id_for(&self, relative: &str) -> Result<u64, NativeSyncError> {
+        let Some((fs_id, _, _, _, _, local_only)) = self
+            .db
+            .entry_by_relative(relative)
+            .map_err(NativeSyncError::Message)?
+        else {
+            return Err(NativeSyncError::Message("找不到同步条目".into()));
+        };
+        if local_only {
+            return Err(NativeSyncError::Message(
+                crate::db::LOCAL_ONLY_NO_REMOTE.into(),
+            ));
+        }
+        self.db.cloud_fs_id(fs_id).map_err(NativeSyncError::Message)
     }
     pub fn open_path(&self, relative: &str) -> Result<PathBuf, NativeSyncError> {
         let Some((root, _, _)) = self.db.root().map_err(NativeSyncError::Message)? else {
@@ -565,6 +616,15 @@ mod manager_tests {
                 .lock()
                 .unwrap()
                 .push(format!("placeholder:{}:dir={is_dir}", path.display()));
+            // 与生产一致：占位符在磁盘上真实存在（否则本地存在的判断会失真）。
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if is_dir {
+                let _ = std::fs::create_dir_all(path);
+            } else if !path.exists() {
+                std::fs::write(path, b"").expect("fake placeholder file");
+            }
             Ok(())
         }
         fn pin(&mut self, _path: &Path, pinned: bool) -> Result<(), PlatformError> {
@@ -590,6 +650,11 @@ mod manager_tests {
                 .lock()
                 .unwrap()
                 .push(format!("remove:{}:dir={is_dir}", path.display()));
+            let _ = if is_dir {
+                std::fs::remove_dir(path)
+            } else {
+                std::fs::remove_file(path)
+            };
             Ok(())
         }
     }
@@ -689,9 +754,10 @@ mod manager_tests {
         backend.replace(entries);
         backend
     }
-    fn record(fs_id: u64, relative: &str, md5: Option<&str>) -> EntryRecord {
+    fn record(fs_id: i64, relative: &str, md5: Option<&str>) -> EntryRecord {
         EntryRecord {
             fs_id,
+            local_only: false,
             parent_fs_id: None,
             remote_path: format!("/{relative}"),
             relative_path: relative.into(),
@@ -704,6 +770,8 @@ mod manager_tests {
             pin_state: PinState::Unpinned,
             error: None,
             has_children: false,
+            pending_op: None,
+            pending_since: None,
         }
     }
     fn setup() -> (TempDir, PathBuf, Arc<Mutex<Vec<String>>>, NativeSyncManager) {
@@ -1059,12 +1127,12 @@ mod manager_tests {
         let page2 = manager.list(None, page1.next_cursor, 2).unwrap();
         assert_eq!(page2.entries.len(), 1);
         assert_eq!(page2.next_cursor, None);
-        let first = page1.entries.iter().find(|e| e.fs_id == 1).unwrap();
+        let first = page1.entries.iter().find(|e| e.fs_id == Some(1)).unwrap();
         assert_eq!(first.modified_at, Some(123));
         let job = manager.db.hydration_started(1, 100).unwrap();
         manager.db.hydration_progress(job, 40).unwrap();
         let page = manager.list(None, None, 10).unwrap();
-        let first = page.entries.iter().find(|e| e.fs_id == 1).unwrap();
+        let first = page.entries.iter().find(|e| e.fs_id == Some(1)).unwrap();
         assert_eq!(
             first.progress.as_ref().map(|p| (p.completed, p.total)),
             Some((40, 100))
@@ -1077,7 +1145,7 @@ mod manager_tests {
         assert!(page
             .entries
             .iter()
-            .find(|e| e.fs_id == 1)
+            .find(|e| e.fs_id == Some(1))
             .unwrap()
             .progress
             .is_none());
@@ -1300,5 +1368,138 @@ mod manager_tests {
         assert!(manager.open_path("d/../../x").is_err());
         let absolute = std::fs::canonicalize(&root).unwrap().join("x");
         assert!(manager.open_path(absolute.to_str().unwrap()).is_err());
+    }
+
+    /// H1：本地已删除（pending_op=delete）的条目在下次 sync_now 不得被重建。
+    /// 没有这条守卫，注册 NOTIFY_DELETE 之后用户删掉的文件会无声复活。
+    #[tokio::test]
+    async fn sync_now_does_not_revive_locally_deleted_entry() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, None)])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        assert!(root.join("a.txt").exists(), "首次同步应落地占位符");
+
+        // 用户在 Explorer 删除：文件消失 + CF 回调记下待同步删除。
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        manager
+            .db
+            .set_pending_op(11, Some("delete"), Some("2026-10-12T00:00:00Z"))
+            .unwrap();
+        calls.lock().unwrap().clear();
+
+        // 云端仍列出 a.txt（S1 不上传，云端事实未变）。
+        let status = manager.sync_now().await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("placeholder:") && c.contains("a.txt")),
+            "已删除的条目不得被重建：{calls:?}"
+        );
+        assert_eq!(status.pending_entries, 1);
+        assert_eq!(status.attention_entries, 1, "待同步删除必须计入 attention");
+        assert_eq!(
+            manager.db.pending_op_of(11).unwrap().as_deref(),
+            Some("delete"),
+            "跳过重建时必须保留 pending 标记"
+        );
+        assert!(manager.db.entry_by_relative("a.txt").unwrap().is_some());
+    }
+
+    /// H1：本地改名后不得在下次 sync_now 里把旧路径重新建出来。
+    #[tokio::test]
+    async fn sync_now_does_not_recreate_old_path_after_local_rename() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/old.txt", 21, None)])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+
+        // 本地改名：磁盘 a→b，回调记下新相对路径与待同步改名。
+        std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
+        manager.db.apply_local_rename(21, "new.txt").unwrap();
+        calls.lock().unwrap().clear();
+
+        manager.sync_now().await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("placeholder:") && c.contains("old.txt")),
+            "旧路径不得被重建：{calls:?}"
+        );
+        assert!(manager.db.entry_by_relative("old.txt").unwrap().is_none());
+        assert!(manager.db.entry_by_relative("new.txt").unwrap().is_some());
+        assert_eq!(
+            manager.db.pending_op_of(21).unwrap().as_deref(),
+            Some("rename")
+        );
+    }
+
+    /// 本地已不存在的条目在远端删除对账时直接记账，不再打平台删除接口
+    /// （对不存在的路径调用会 ENOENT 并中断整轮同步）。
+    #[tokio::test]
+    async fn sync_now_tombstones_locally_absent_entry_without_platform_call() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 31, None)])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+
+        backend.replace(vec![("/", vec![])]);
+        calls.lock().unwrap().clear();
+        let status = manager.sync_now().await.unwrap();
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("remove:")),
+            "本地已不存在时不得再调 remove_placeholder"
+        );
+        assert_eq!(status.total_entries, 0);
+    }
+
+    /// 本地新建条目（云端尚无）不得进入任何云端操作路径：必须显式拒绝，
+    /// 而不是拿负数 fs_id 去构造非法云端请求。
+    #[test]
+    fn local_only_entry_is_rejected_by_every_cloud_action() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let fs_id = manager.db.next_local_fs_id().unwrap();
+        manager
+            .db
+            .insert_local_only_entry(fs_id, "新建.txt", "新建.txt", false, 10)
+            .unwrap();
+        for action in [
+            EntryAction::Pin,
+            EntryAction::Unpin,
+            EntryAction::Dehydrate,
+            EntryAction::Retry,
+            EntryAction::AckRemoteMissing,
+        ] {
+            let err = manager
+                .action(NativeSyncAction {
+                    relative_path: "新建.txt".into(),
+                    action: action.clone(),
+                })
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("本地新建条目"),
+                "{action:?} 必须被显式拒绝，实际: {err}"
+            );
+        }
+        // UI 侧：本地新建条目的 fsId 为 None，不暴露负数内部 id。
+        let view = manager.list(None, None, 10).unwrap();
+        let entry = view
+            .entries
+            .iter()
+            .find(|e| e.relative_path == "新建.txt")
+            .unwrap();
+        assert_eq!(entry.fs_id, None);
+        assert_eq!(entry.pending_operation.as_deref(), Some("upload"));
     }
 }
