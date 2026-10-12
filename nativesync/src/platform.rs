@@ -94,8 +94,8 @@ pub(crate) fn sync_root_removal_action(cause: SyncRootRemovalCause) -> SyncRootR
     }
 }
 
-pub(crate) fn placeholder_repair_action(attrs: u32) -> PlaceholderRepair {
-    if is_placeholder_attrs(attrs) {
+pub(crate) fn placeholder_repair_action(is_placeholder: bool) -> PlaceholderRepair {
+    if is_placeholder {
         PlaceholderRepair::KeepInSync
     } else {
         PlaceholderRepair::ConvertToPlaceholder
@@ -3055,7 +3055,7 @@ mod windows_impl {
                     );
                     return Ok(());
                 }
-                match placeholder_repair_action(if cf_placeholder { 1 } else { 0 }) {
+                match placeholder_repair_action(cf_placeholder) {
                     // 本来就是占位符：确保被标记为「与云端已同步」，
                     // 否则 Explorer 状态列会一直显示「同步挂起」。
                     PlaceholderRepair::KeepInSync => {
@@ -3070,38 +3070,14 @@ mod windows_impl {
                     // 已存在但**不是占位符**（例如曾被注销转成普通文件）：就地转回占位符。
                     // 这是唯一非破坏性的自愈手段——保留内容与 PINNED 位。
                     PlaceholderRepair::ConvertToPlaceholder => {
-                        let h = file_handle(path, true)?;
-                        let mut usn = 0;
-                        let r = unsafe {
-                            CfConvertToPlaceholder(
-                                h,
-                                Some(identity.as_ptr() as *const c_void),
-                                identity.len() as u32,
-                                CF_CONVERT_FLAG_MARK_IN_SYNC,
-                                Some(&mut usn),
-                                None,
-                            )
-                        };
-                        unsafe {
-                            let _ = CloseHandle(h);
-                        }
-                        if let Err(error) = r {
-                            // **尽力而为**：一次修复尝试失败不得让整条命令失败（曾把
-                            // ERROR_CLOUD_FILE_INVALID_REQUEST 冒泡上去，导致整个同步/状态读取一起挂掉）。
-                            log::warn!(
-                                "native-sync self-heal convert-to-placeholder failed op=CfConvertToPlaceholder hr=0x{:08X}",
-                                error.code().0 as u32
-                            );
-                            return Ok(());
-                        }
-                        if let Ok(mut stats) = self.probe_stats.lock() {
-                            stats.2 += 1;
-                        }
-                        // 转换是稀有事件：留下该条目的原始属性与判定，便于与 fsutil 对照。
-                        log::info!(
-                            "native-sync self-healed existing path back to a placeholder (dir={is_dir}) attrs=0x{attrs:08X} cf_placeholder={cf_placeholder}"
+                        // **止血（2026-10-12）**：自动转换当前被**闸门**关闭。
+                        // 缘由：探测结论尚未与 CF 层真值逐条对齐——曾因判定传递错误，
+                        // 对**健康的占位符**反复发起 CfConvertToPlaceholder 并全部失败（0x8007017C）。
+                        // 恢复条件：用诊断模式证明"探测结论 == CF 真值"后，才允许重新启用
+                        // （届时单独提交 + 失败测试）。
+                        log::warn!(
+                            "native-sync would convert existing path back to a placeholder, but auto-conversion is gated pending probe validation (dir={is_dir}) attrs=0x{attrs:08X}"
                         );
-                        probe_in_sync(path, if is_dir { "dir" } else { "file" });
                     }
                 }
                 return Ok(());
@@ -3230,15 +3206,12 @@ mod placeholder_repair_tests {
     /// 已是占位符 → 维持 in-sync（**不**走 convert 分支）。
     #[test]
     fn existing_placeholders_keep_in_sync_and_are_not_converted() {
-        // 真实占位符属性：目录 0x420、在线文件 0x100420、固定文件 0x80420、纯重解析点 0x400
-        for attrs in [0x420u32, 0x0010_0420, 0x0008_0420, 0x0000_0400] {
-            assert_eq!(
-                placeholder_repair_action(attrs),
-                PlaceholderRepair::KeepInSync,
-                "attrs=0x{attrs:X} 应被判为占位符"
-            );
-            assert!(is_placeholder_attrs(attrs));
-        }
+        // 判定输入现在是 **CF 原生结论**（三态里的 Placeholder），不再是通用属性位。
+        assert_eq!(
+            placeholder_repair_action(true),
+            PlaceholderRepair::KeepInSync,
+            "CF 判定为占位符时不得再转换"
+        );
     }
 
     /// **唯一**允许注销同步根的起因是"刻意移除"；连接失败必须保留注册。
@@ -3366,15 +3339,11 @@ mod placeholder_repair_tests {
     /// 非占位符（事故现场实测的脱云属性）→ 走 convert 就地修复分支。
     #[test]
     fn existing_normal_files_are_converted_back_to_placeholders() {
-        // 实测值：db.sql 0x100020、manifest.json 0x80020、skills.zip 0x20、目录 0x10
-        for attrs in [0x0010_0020u32, 0x0008_0020, 0x0000_0020, 0x0000_0010, 0x0] {
-            assert_eq!(
-                placeholder_repair_action(attrs),
-                PlaceholderRepair::ConvertToPlaceholder,
-                "attrs=0x{attrs:X} 不是占位符，必须走 convert 修复"
-            );
-            assert!(!is_placeholder_attrs(attrs));
-        }
+        assert_eq!(
+            placeholder_repair_action(false),
+            PlaceholderRepair::ConvertToPlaceholder,
+            "CF 判定不是占位符时才允许走 convert 修复"
+        );
     }
 }
 
