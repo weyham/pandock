@@ -1318,6 +1318,50 @@ mod windows_impl {
             wait_for(|| seen.lock().unwrap().len() == 2, "重新打开后的投递被消费");
         }
 
+        /// 只读相关的通知（open/close/validate）**不得**在 local_change 里留下记录：
+        /// 它们只是观测，不是本地变更。否则"读一次文件"就会被记成变更（真实事故）。
+        /// 同时保证真正的变更（delete intent）仍然照常入账。
+        #[test]
+        fn read_only_notifications_leave_no_local_change_rows() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let db_path = dir.path().join("native-sync").join("sync.db");
+            std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+            let db = crate::db::IndexDb::open(dir.path()).unwrap();
+            upsert_file(&db, 61, "read.txt");
+            std::fs::write(root.join("read.txt"), b"content").unwrap();
+            let runtime = runtime_with(&root, &db_path);
+            let _seen = captured(&runtime);
+            let normalized = format!("{}/read.txt", root.to_string_lossy().replace('\\', "/"));
+            let task = |kind| NotifyTask {
+                input: crate::notify::NotifyInput {
+                    kind: Some(kind),
+                    normalized_path: Some(normalized.clone()),
+                    ..Default::default()
+                },
+                fs_id: Some(61),
+            };
+
+            // 打开 → 关闭（只读一遍）：不得留下任何 local_change，也不得产生待同步。
+            handle_notification(&runtime, task(crate::notify::NotifyKind::OpenCompleted));
+            handle_notification(&runtime, task(crate::notify::NotifyKind::CloseCompleted));
+            handle_notification(&runtime, task(crate::notify::NotifyKind::ValidateData));
+            assert_eq!(
+                db.recent_local_changes(10).unwrap().len(),
+                0,
+                "观测类通知不得写入 local_change"
+            );
+            assert_eq!(db.pending_op_of(61).unwrap(), None);
+
+            // 真正的变更（删除意图）仍然入账。
+            handle_notification(&runtime, task(crate::notify::NotifyKind::Delete));
+            let changes = db.recent_local_changes(10).unwrap();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].kind, "delete");
+            assert_eq!(db.pending_op_of(61).unwrap().as_deref(), Some("delete"));
+        }
+
         /// 删除通知落库：pending_op=delete + local_change + 事件（来源 explorer）。
         #[test]
         fn delete_notification_marks_pending_and_emits_event() {
@@ -1891,20 +1935,30 @@ mod windows_impl {
                     _ => {}
                 }
             }
-            let _ = db.record_local_change(&crate::db::LocalChangeRecord {
-                id: None,
-                fs_id,
-                kind: event.kind.clone(),
-                phase: event.phase.clone(),
-                from_relative: event.from_relative.clone(),
-                to_relative: event.to_relative.clone(),
-                is_dir: event.is_dir,
-                reason: event.reason.clone(),
-                source: event.source.clone(),
-                detected_at: event.detected_at.clone(),
-                applied_to_cloud: false,
-                error: None,
-            });
+            // 只有"本地确实发生了变化、且是意图事件"才入账。
+            // open/close/validate 属**观测**（日志里已有），不是变更；
+            // delete/rename/dehydrate 的 completion 只是平台回执，变更在 intent 时已记账。
+            // 否则「读一次文件」就会在 local_change 里留下记录（真实事故）。
+            let is_change = matches!(
+                event.kind.as_str(),
+                "delete" | "rename" | "dehydrate" | "upload" | "create"
+            );
+            if is_change && event.phase == "intent" {
+                let _ = db.record_local_change(&crate::db::LocalChangeRecord {
+                    id: None,
+                    fs_id,
+                    kind: event.kind.clone(),
+                    phase: event.phase.clone(),
+                    from_relative: event.from_relative.clone(),
+                    to_relative: event.to_relative.clone(),
+                    is_dir: event.is_dir,
+                    reason: event.reason.clone(),
+                    source: event.source.clone(),
+                    detected_at: event.detected_at.clone(),
+                    applied_to_cloud: false,
+                    error: None,
+                });
+            }
         }
         if let Ok(sink) = runtime.change_sink.read() {
             if let Some(sink) = sink.as_ref() {
