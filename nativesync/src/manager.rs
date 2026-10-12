@@ -342,6 +342,9 @@ impl NativeSyncManager {
                     if let Some(pinned) = self.platform.pin_state(&local) {
                         let _ = self.db.set_pin_state(fs_id, pinned);
                     }
+                    // 平台侧可能已经把文件水合回来或释放掉了：每轮用磁盘真值对账，
+                    // 免得管理台显示的状态与 Explorer 看到的实际情况互相矛盾。
+                    self.reconcile_hydration_with_disk(fs_id, &relative, &local, snapshot.size)?;
                 }
                 if snapshot.is_dir() {
                     queue.push(snapshot.path.clone());
@@ -385,6 +388,62 @@ impl NativeSyncManager {
             }
         }
         self.status()
+    }
+    /// 用**磁盘真值**校正 `hydration_state`（面板必须与磁盘一致）。
+    ///
+    /// 水合/脱水都会被外部驱动（Explorer、平台后台、第三方程序），只在自家动作里写库就
+    /// 会留下错值——真实事故：库里 `online_only`，磁盘上却是完整数据。`on_disk_data_size`
+    /// 只读占位符信息、**不触发水合**，正好适合做每轮对账。
+    ///
+    /// 口径：
+    ///   * `OnDisk == 0`       → `online_only`
+    ///   * `OnDisk >= size`    → `hydrated`
+    ///   * `0 < OnDisk < size` → **部分区间**：不改状态（S1 硬规则：部分区间不得标记
+    ///     hydrated），只落一条 warn，等水合完成后的下一轮自然纠正。
+    ///   * `remote_missing` / `error` / `stale` 有独立语义，一律不动。
+    ///
+    /// **绝不**改 `pin_state`：释放空间与固定/取消固定是两件事，pin 只跟着用户走。
+    fn reconcile_hydration_with_disk(
+        &self,
+        fs_id: u64,
+        relative: &str,
+        local: &Path,
+        size: u64,
+    ) -> Result<(), NativeSyncError> {
+        let Some(on_disk) = self.platform.on_disk_data_size(local) else {
+            return Ok(());
+        };
+        let Some(current) = self
+            .db
+            .entry_by_relative(relative)
+            .map_err(NativeSyncError::Message)?
+            .map(|row| row.1)
+        else {
+            return Ok(());
+        };
+        if current != "online_only" && current != "hydrated" {
+            return Ok(());
+        }
+        let truth = if on_disk <= 0 {
+            "online_only"
+        } else if on_disk as u64 >= size {
+            "hydrated"
+        } else {
+            log::warn!(
+                "native-sync hydration reconcile sees partial data fs_id={fs_id} on_disk_bytes={on_disk} size={size}; keeping state={current}"
+            );
+            return Ok(());
+        };
+        if current == truth {
+            return Ok(());
+        }
+        self.db
+            .set_state_by_fs_id(fs_id, truth, None)
+            .map_err(NativeSyncError::Message)?;
+        log::info!(
+            "native-sync hydration reconciled from disk fs_id={fs_id} from={current} to={truth} on_disk_bytes={on_disk} size={size}"
+        );
+        Ok(())
     }
     pub fn list(
         &self,
@@ -660,6 +719,9 @@ mod manager_tests {
     #[derive(Default)]
     struct FakePlatform {
         calls: Arc<Mutex<Vec<String>>>,
+        /// 磁盘真值表：路径 → 本地实际占用字节（生产来自 CFAPI 的 OnDiskDataSize）。
+        /// 缺省为空 ⇒ `on_disk_data_size` 返回 None，既有用例行为不变。
+        on_disk: Arc<Mutex<HashMap<String, i64>>>,
     }
     impl PlatformSync for FakePlatform {
         fn supported(&self) -> Result<(), String> {
@@ -731,6 +793,13 @@ mod manager_tests {
         }
         fn pin_state(&self, _path: &Path) -> Option<bool> {
             None
+        }
+        fn on_disk_data_size(&self, path: &Path) -> Option<i64> {
+            self.on_disk
+                .lock()
+                .unwrap()
+                .get(&path.to_string_lossy().to_string())
+                .copied()
         }
         fn mark_in_sync(&mut self, _path: &Path) -> Result<(), PlatformError> {
             self.calls.lock().unwrap().push("mark_in_sync".into());
@@ -875,12 +944,108 @@ mod manager_tests {
             backend: None,
             platform: Box::new(FakePlatform {
                 calls: calls.clone(),
+                ..Default::default()
             }),
             notifications_config: true,
             notifications_enabled: true,
         };
         (dir, root, calls, manager)
     }
+    /// 与 `setup()` 同构，但把「磁盘真值表」交回给用例，用来模拟外部水合/脱水。
+    /// 平台记录到的调用序列（用例断言用）。
+    type Calls = Arc<Mutex<Vec<String>>>;
+    /// 磁盘真值表句柄：路径 → 本地实际占用字节。
+    type DiskTruth = Arc<Mutex<HashMap<String, i64>>>;
+    fn setup_with_disk() -> (TempDir, PathBuf, Calls, NativeSyncManager, DiskTruth) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let on_disk = Arc::new(Mutex::new(HashMap::new()));
+        let manager = NativeSyncManager {
+            db: IndexDb::open(dir.path()).unwrap(),
+            backend: None,
+            platform: Box::new(FakePlatform {
+                calls: calls.clone(),
+                on_disk: on_disk.clone(),
+            }),
+            notifications_config: true,
+            notifications_enabled: true,
+        };
+        (dir, root, calls, manager, on_disk)
+    }
+    fn set_on_disk(on_disk: &DiskTruth, path: &Path, bytes: i64) {
+        on_disk
+            .lock()
+            .unwrap()
+            .insert(path.to_string_lossy().to_string(), bytes);
+    }
+    fn hydration_state_of(manager: &NativeSyncManager, fs_id: u64) -> String {
+        manager
+            .db
+            .conn
+            .query_row(
+                "SELECT hydration_state FROM local_state WHERE fs_id=?1",
+                rusqlite::params![fs_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_now_reconciles_hydration_state_from_disk_truth() {
+        let (_dir, root, calls, mut manager, on_disk) = setup_with_disk();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        manager.backend = Some(backend_with(vec![(
+            "/",
+            vec![file_snap("/a.txt", 11, Some("aaa"))],
+        )]));
+        let local = root.join("a.txt");
+        // 外部已经把内容读了回来（磁盘是完整数据）：库里的 online_only 必须被纠正。
+        set_on_disk(&on_disk, &local, 5);
+        manager.sync_now().await.unwrap();
+        assert_eq!(hydration_state_of(&manager, 11), "hydrated");
+        // 反向：平台把数据释放掉了（OnDisk=0）⇒ 回到 online_only。
+        set_on_disk(&on_disk, &local, 0);
+        manager.sync_now().await.unwrap();
+        assert_eq!(hydration_state_of(&manager, 11), "online_only");
+        // 部分区间（2/5）不得被标记成 hydrated：状态保持原值，只落 warn。
+        manager.db.set_state_by_fs_id(11, "hydrated", None).unwrap();
+        set_on_disk(&on_disk, &local, 2);
+        manager.sync_now().await.unwrap();
+        assert_eq!(hydration_state_of(&manager, 11), "hydrated");
+        // 对账绝不碰用户 pin：既有实现也不得凭空产生 pin 调用。
+        assert!(!calls.lock().unwrap().iter().any(|c| c.starts_with("pin:")));
+    }
+
+    #[tokio::test]
+    async fn sync_now_reconcile_keeps_remote_missing_and_error_states() {
+        let (_dir, root, _calls, mut manager, on_disk) = setup_with_disk();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        manager.backend = Some(backend_with(vec![(
+            "/",
+            vec![file_snap("/a.txt", 11, Some("aaa"))],
+        )]));
+        let local = root.join("a.txt");
+        set_on_disk(&on_disk, &local, 5);
+        manager.sync_now().await.unwrap();
+        assert_eq!(hydration_state_of(&manager, 11), "hydrated");
+        // remote_missing 有独立语义：磁盘真值不得把它冲掉（用户确认前必须保留标记）。
+        manager
+            .db
+            .set_state_by_fs_id(11, "remote_missing", Some("远端条目已删除，保留本地内容"))
+            .unwrap();
+        manager.sync_now().await.unwrap();
+        assert_eq!(hydration_state_of(&manager, 11), "remote_missing");
+        // error 同理：等 retry 清理，不由对账顺手抹掉。
+        manager
+            .db
+            .set_state_by_fs_id(11, "error", Some("boom"))
+            .unwrap();
+        manager.sync_now().await.unwrap();
+        assert_eq!(hydration_state_of(&manager, 11), "error");
+    }
+
     fn pin_state_of(manager: &NativeSyncManager, fs_id: u64) -> String {
         manager
             .db
@@ -932,6 +1097,7 @@ mod manager_tests {
             backend: None,
             platform: Box::new(FakePlatform {
                 calls: calls.clone(),
+                ..Default::default()
             }),
             notifications_config: true,
             notifications_enabled: true,
@@ -958,6 +1124,7 @@ mod manager_tests {
             backend: None,
             platform: Box::new(FakePlatform {
                 calls: calls.clone(),
+                ..Default::default()
             }),
             notifications_config: true,
             notifications_enabled: true,
