@@ -4,6 +4,36 @@ use pandock_core::cloud::RemotePath;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// CF 视角下"是否占位符"的**三态**判定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaceholderProbe {
+    Placeholder,
+    /// **确定**不是占位符（可以安全地就地转换）。
+    NotPlaceholder,
+    /// **无法确定**（包含一切非"确定不是"的错误）：必须按"当作占位符、不转换"处理。
+    Unknown,
+}
+
+/// 把 CfGetPlaceholderInfo 的结果映射成三态（纯函数，便于跨平台单测）。
+///
+/// **只有"确定不是占位符"才返回 NotPlaceholder**；其余一切错误都是 Unknown，
+/// 而 Unknown 的处置等价于"当成占位符、**不要转换**"（与"打不开句柄"同一保守策略）。
+///
+/// 事故（2026-10-12）：此前把**任何**错误都当成"不是占位符"，于是对一个**本来就是占位符的目录**
+/// 调用了 CfConvertToPlaceholder → 返回 ERROR_CLOUD_FILE_INVALID_REQUEST (0x8007017C)，
+/// 并把该错误冒泡成整条命令失败（UI 出现红框）。
+pub(crate) fn classify_placeholder_probe(result: Result<(), u32>) -> PlaceholderProbe {
+    match result {
+        Ok(()) => PlaceholderProbe::Placeholder,
+        Err(hr) => match hr {
+            // ERROR_NOT_A_REPARSE_POINT (4390) / ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT (390)
+            0x8007_1126 | 0x8007_0186 => PlaceholderProbe::NotPlaceholder,
+            // 其余（INVALID_REQUEST / ACCESS_DENIED / NOT_A_CLOUD_FILE …）一律"不确定"。
+            _ => PlaceholderProbe::Unknown,
+        },
+    }
+}
+
 /// 已存在路径的占位符修复动作（纯决策，便于跨平台单测）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlaceholderRepair {
@@ -581,9 +611,9 @@ mod windows_impl {
     ///
     /// 不用通用属性位（`GetFileAttributes*`）——Windows 对云占位符会隐藏 `0x400`，
     /// 用它判定会让健康占位符被反复转换（真实缺陷，见 `is_placeholder_attrs` 的说明）。
-    fn cf_is_placeholder(path: &Path) -> bool {
+    fn placeholder_probe(path: &Path) -> PlaceholderProbe {
         let Ok(handle) = file_handle(path, false) else {
-            return true; // 打不开句柄时按"是占位符"处理，宁可不转换
+            return PlaceholderProbe::Unknown; // 打不开句柄 ⇒ 不确定 ⇒ 宁可不转换
         };
         let mut buf = vec![0u8; std::mem::size_of::<CF_PLACEHOLDER_BASIC_INFO>() + 64];
         let mut returned = 0u32;
@@ -599,7 +629,16 @@ mod windows_impl {
         unsafe {
             let _ = CloseHandle(handle);
         }
-        r.is_ok()
+        let outcome = r.map_err(|e| e.code().0 as u32);
+        let probe = classify_placeholder_probe(outcome);
+        if probe == PlaceholderProbe::Unknown {
+            if let Err(hr) = outcome {
+                log::warn!(
+                    "native-sync placeholder probe inconclusive op=CfGetPlaceholderInfo hr=0x{hr:08X}"
+                );
+            }
+        }
+        probe
     }
 
     fn probe_in_sync_state(path: &Path) -> Option<bool> {
@@ -2928,7 +2967,7 @@ mod windows_impl {
                 })
                 .unwrap_or(0);
             let input = InSyncRepairInput {
-                is_placeholder: cf_is_placeholder(path),
+                is_placeholder: placeholder_probe(path) == PlaceholderProbe::Placeholder,
                 has_pending_change,
                 snapshot_matches,
                 in_sync: probe_in_sync_state(path),
@@ -2997,7 +3036,8 @@ mod windows_impl {
                         m.file_attributes()
                     })
                     .unwrap_or(0);
-                let cf_placeholder = cf_is_placeholder(path);
+                let probe = placeholder_probe(path);
+                let cf_placeholder = probe == PlaceholderProbe::Placeholder;
                 log::debug!(
                     "native-sync existing-path probe attrs=0x{attrs:08X} attrs_hint={} cf_placeholder={cf_placeholder}",
                     is_placeholder_attrs(attrs)
@@ -3007,6 +3047,13 @@ mod windows_impl {
                     if cf_placeholder {
                         stats.1 += 1;
                     }
+                }
+                if probe == PlaceholderProbe::Unknown {
+                    // 「不确定」必须保守：不转换、也不标记，避免把健康占位符改坏。
+                    log::debug!(
+                        "native-sync existing path probe inconclusive; leaving path untouched"
+                    );
+                    return Ok(());
                 }
                 match placeholder_repair_action(if cf_placeholder { 1 } else { 0 }) {
                     // 本来就是占位符：确保被标记为「与云端已同步」，
@@ -3039,12 +3086,13 @@ mod windows_impl {
                             let _ = CloseHandle(h);
                         }
                         if let Err(error) = r {
+                            // **尽力而为**：一次修复尝试失败不得让整条命令失败（曾把
+                            // ERROR_CLOUD_FILE_INVALID_REQUEST 冒泡上去，导致整个同步/状态读取一起挂掉）。
                             log::warn!(
-                                "native-sync self-heal convert-to-placeholder failed: {} hr=0x{:08X}",
-                                path.display(),
+                                "native-sync self-heal convert-to-placeholder failed op=CfConvertToPlaceholder hr=0x{:08X}",
                                 error.code().0 as u32
                             );
-                            return Err(PlatformError::Api(error.to_string()));
+                            return Ok(());
                         }
                         if let Ok(mut stats) = self.probe_stats.lock() {
                             stats.2 += 1;
@@ -3266,6 +3314,37 @@ mod placeholder_repair_tests {
                 in_sync_repair_action(bad),
                 InSyncRepair::Skip,
                 "内容可能被本地改过时绝不能置为已同步: {bad:?}"
+            );
+        }
+    }
+
+    /// 三态映射：只有"确定不是"才允许转换；其余错误一律"不确定"（保守不转换）。
+    #[test]
+    fn placeholder_probe_classification_is_conservative() {
+        assert_eq!(
+            classify_placeholder_probe(Ok(())),
+            PlaceholderProbe::Placeholder
+        );
+        // 确定不是占位符的两类
+        for hr in [0x8007_1126u32, 0x8007_0186] {
+            assert_eq!(
+                classify_placeholder_probe(Err(hr)),
+                PlaceholderProbe::NotPlaceholder,
+                "hr=0x{hr:08X} 应判为确定不是占位符"
+            );
+        }
+        // 其余错误（含事故里的 INVALID_REQUEST）一律"不确定" ⇒ 不转换
+        for hr in [
+            0x8007_017C,
+            0x8007_0005,
+            0x8007_018B,
+            0x8007_0164,
+            0x8000_4005,
+        ] {
+            assert_eq!(
+                classify_placeholder_probe(Err(hr)),
+                PlaceholderProbe::Unknown,
+                "hr=0x{hr:08X} 必须保守处理，不得当作\"不是占位符\""
             );
         }
     }
