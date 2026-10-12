@@ -123,3 +123,25 @@ powershell -ExecutionPolicy Bypass -File .\scripts\set-version.ps1 -Version 0.1.
    这条比"多写测试"更根本：**没有落盘的改动，任何测试都拦不住**。
 4. **提交信息用单引号或 `-F <文件>`**（Windows PowerShell 会把 ASCII 双引号当引号解析，
    消息会被拆成 pathspec 导致提交失败或信息被截断）。
+## Cloud Files 元数据写操作：句柄与权限（权限验证表的依据）
+
+**官方原文（MS Learn）**——两句合起来说明：**句柄本身可以只带属性访问**，
+而 `READ_DATA / WRITE_DATA` 是对**调用者**的 ACL 要求（我们以文件属主身份运行 ⇒ 满足）：
+
+- `CfSetInSyncState`：
+  > "A handle to the placeholder. ... **An attribute or no-access handle is sufficient.**
+  > The caller must have **WRITE_DATA or WRITE_DAC** access to the placeholder."
+- `CfSetPinState`：
+  > "... **An attribute or no-access handle is sufficient.**
+  > The caller must have **READ_DATA or WRITE_DAC** access to the placeholder.
+  > Otherwise, the operation fails with **STATUS_CLOUD_FILE_ACCESS_DENIED**."
+
+**由此确立的规则（不要回退）**：
+1. CF **元数据**调用（`CfGetPlaceholderInfo` / `CfSetInSyncState` / `CfSetPinState` / `CfDehydratePlaceholder` /
+   `CfConvertToPlaceholder`）**只用属性访问句柄**：只读用 `FILE_READ_ATTRIBUTES`，要改属性用 `FILE_WRITE_ATTRIBUTES`；
+   **禁止**改回 `FILE_GENERIC_READ`/`FILE_GENERIC_WRITE`——对**已脱水**的占位符做数据访问会让平台立刻把内容物化回来，
+   等于把我们自己的"释放空间"当场撤销（真实事故 D1）。**写入类操作用可写属性句柄**（`pin` 曾误用只读句柄）。
+2. **预期**：权限验证表 A–E 阶段里 `CfSetInSyncState` 与 `CfSetPinState` 都应成功（无 `ACCESS_DENIED`），
+   且对**已脱水**文件每一步调用之后 `OnDiskDataSize` 仍为 0。
+3. **若实测出现 `STATUS_CLOUD_FILE_ACCESS_DENIED`** ⇒ 与上述文档矛盾，**停下来回报**，
+   **不要**就地改成 `GENERIC_*`（那会立刻把 D1 带回来），而是按"只调那一个调用点并说明理由"处理。
