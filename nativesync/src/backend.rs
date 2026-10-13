@@ -19,12 +19,15 @@ pub trait CloudBackend: Send + Sync {
         start: u64,
         count: usize,
     ) -> futures_util::future::BoxFuture<'a, Result<Vec<u8>, CloudError>>;
-    /// 上传（ADR-112）：rtype 固定 0（冲突失败），-8 经 CloudErrorKind::AlreadyExists 表达。
+    /// 上传（ADR-112 §3.3 修订：rtype 分流由调用方决定——
+    /// local_only 新建 = 0（撞名即失败）；有基线编辑 stat 比对一致后 = 3（安全覆盖））。
+    /// -8 经 CloudErrorKind::AlreadyExists 表达。
     fn upload<'a>(
         &'a self,
         path: &'a RemotePath,
         local: &'a std::path::Path,
         size: u64,
+        rtype: u32,
     ) -> futures_util::future::BoxFuture<'a, Result<UploadOutcome, CloudError>>;
     /// 改名/移动（opera=move，保 fs_id）。
     fn rename<'a>(
@@ -60,10 +63,9 @@ impl CloudBackend for SnapshotBackend {
         path: &'a RemotePath,
         local: &'a std::path::Path,
         size: u64,
+        rtype: u32,
     ) -> futures_util::future::BoxFuture<'a, Result<UploadOutcome, CloudError>> {
-        // ADR-112 定稿：NativeSync 上传固定 rtype=0（冲突失败以便检测）；
-        // WebDAV PUT 的 rtype=3 是另一条独立路径，不受影响。
-        self.inner.upload_detailed(path, local, size, 0)
+        self.inner.upload_detailed(path, local, size, rtype)
     }
     fn rename<'a>(
         &'a self,
@@ -185,7 +187,7 @@ mod tests {
         assert!(backend.rename(&root, &root).await.is_ok());
         assert!(backend.remove(&root).await.is_ok());
         let error = backend
-            .upload(&root, std::path::Path::new("x"), 0)
+            .upload(&root, std::path::Path::new("x"), 0, 0)
             .await
             .unwrap_err();
         assert_eq!(error.kind, pandock_core::cloud::CloudErrorKind::Unsupported);

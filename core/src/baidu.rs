@@ -1,4 +1,4 @@
-use crate::cloud::{UploadFailure, UploadOutcome};
+use crate::cloud::UploadOutcome;
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -65,7 +65,6 @@ struct UploadPrepared {
     path: String,
     upload_id: String,
     block_list: String,
-    rapid: bool,
 }
 
 /// `method=list` 的固定分页大小。NativeSync 自动对账按它把一次目录列举折算成实际 HTTP
@@ -556,7 +555,6 @@ impl BaiduClient {
         self.upload_file_detailed(dav_path, local, size, 3)
             .await
             .map(|_| ())
-            .map_err(|failure| failure.message)
     }
 
     /// 详细上传（ADR-112）：`rtype` 由调用方给定（NativeSync 用 0 = 冲突失败以便检测）；
@@ -568,17 +566,12 @@ impl BaiduClient {
         local: &Path,
         size: u64,
         rtype: u32,
-    ) -> Result<UploadOutcome, UploadFailure> {
+    ) -> Result<UploadOutcome, String> {
         let prepared = self
             .upload_precreate_and_parts(dav_path, local, size, rtype)
-            .await
-            .map_err(|message| UploadFailure {
-                rapid: false,
-                message,
-            })?;
+            .await?;
         // errno -8（rtype=0 冲突）在这里以 Err 返回，错误文本含 JSON 原文，
-        // 由 CloudError::from_message 分类为 AlreadyExists（ADR-112 §3.3 冲突入口）；
-        // rapid 随失败返回（秒传假冲突守卫需要）。
+        // 由 CloudError::from_message 分类为 AlreadyExists（ADR-112 §3.3 冲突入口）。
         let created = self
             .upload_create(
                 &prepared.path,
@@ -587,11 +580,7 @@ impl BaiduClient {
                 &prepared.upload_id,
                 &prepared.block_list,
             )
-            .await
-            .map_err(|message| UploadFailure {
-                rapid: prepared.rapid,
-                message,
-            })?;
+            .await?;
         Ok(UploadOutcome {
             fs_id: created.get("fs_id").and_then(|v| v.as_u64()),
             md5: created
@@ -600,11 +589,10 @@ impl BaiduClient {
                 .map(str::to_string),
             size,
             mtime: created.get("mtime").and_then(|v| v.as_i64()),
-            rapid: prepared.rapid,
         })
     }
 
-    /// 三段式的前两段：precreate + 分片上传（秒传时跳过）→ 待 create 的全部材料。
+    /// 三段式的前两段：precreate + 分片上传 → 待 create 的全部材料。
     async fn upload_precreate_and_parts(
         &self,
         dav_path: &str,
@@ -656,21 +644,21 @@ impl BaiduClient {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "预上传未返回 uploadid".to_string())?
             .to_string();
-        let needed = pre
+        let mut needed = pre
             .get("block_list")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        // 秒传：服务端待传分片列表为空 ⇒ 一个分片都不用传（ADR-112 §3.3）。
-        let rapid = needed.is_empty();
-        let host = if rapid {
-            None
-        } else {
-            Some(self.locate_upload(&path, &upload_id).await?)
-        };
+        if needed.is_empty() {
+            // 【2026-10-13 实测 + 文档】预上传《响应示例》原文：「block_list 为空时等价于 [0]」——
+            // 空列表**不是**秒传信号，而是照常传 0 号分片。实测（EXP1/2/3：全新内容/同内容/
+            // 显式双 md5）precreate 恒返回 [0]，不传直接 create 实测 errno=31500（非文档 31363）。
+            // 不要再次把它"优化"成跳过上传——那次修正（"真秒传"）已被实证回滚。
+            needed.push(serde_json::json!(0));
+        }
+        let host = self.locate_upload(&path, &upload_id).await?;
         let mut uploaded_hashes = hashes.clone();
         for part in needed {
-            let host = host.as_ref().expect("非秒传必有上传域名");
             let seq = part
                 .as_u64()
                 .ok_or_else(|| "百度返回非法分片序号".to_string())? as usize;
@@ -725,7 +713,6 @@ impl BaiduClient {
             path,
             upload_id,
             block_list: uploaded_block_list,
-            rapid,
         })
     }
 
@@ -1150,11 +1137,13 @@ mod api_tests {
         );
         assert_eq!(outcome.mtime, Some(1700000123));
         assert_eq!(outcome.size, 5);
-        assert!(!outcome.rapid, "有分片待传就不是秒传");
     }
 
     #[tokio::test]
-    async fn upload_detailed_rapid_skips_part_upload_and_locate() {
+    async fn upload_detailed_empty_block_list_uploads_part_zero_anyway() {
+        // 【2026-10-13 实证回滚】文档「block_list 为空时等价于 [0]」：空列表必须照常传 0 号
+        // 分片（否则 create 实测 errno=31500）。superfile2/locateupload 缺 mock 即 404 报错——
+        // 成功即证明空列表没有被"优化"成跳过上传。
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("f.bin");
@@ -1167,7 +1156,23 @@ mod api_tests {
             })))
             .mount(&server)
             .await;
-        // 秒传：superfile2 与 locateupload 都不得被调用（未挂 mock ⇒ 调用即 404 ⇒ 报错）。
+        Mock::given(method("GET"))
+            .and(path("/rest/2.0/pcs/file"))
+            .and(query_param("method", "locateupload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error_code": 0, "servers": [{"server": server.uri()}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/pcs/superfile2"))
+            .and(query_param("method", "upload"))
+            .and(query_param("partseq", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "md5": "5d41402abc4b2a76b9719d911017c592"
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/rest/2.0/xpan/file"))
             .and(query_param("method", "create"))
@@ -1183,7 +1188,6 @@ mod api_tests {
             .upload_file_detailed("/f.bin", &local, 5, 0)
             .await
             .unwrap();
-        assert!(outcome.rapid);
         assert_eq!(outcome.fs_id, Some(777));
     }
 
@@ -1199,6 +1203,23 @@ mod api_tests {
             .and(body_string_contains("rtype=3"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "errno": 0, "uploadid": "u1", "block_list": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/2.0/pcs/file"))
+            .and(query_param("method", "locateupload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error_code": 0, "servers": [{"server": server.uri()}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/pcs/superfile2"))
+            .and(query_param("method", "upload"))
+            .and(query_param("partseq", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "md5": "5d41402abc4b2a76b9719d911017c592"
             })))
             .mount(&server)
             .await;
@@ -1231,6 +1252,23 @@ mod api_tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/2.0/pcs/file"))
+            .and(query_param("method", "locateupload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error_code": 0, "servers": [{"server": server.uri()}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/pcs/superfile2"))
+            .and(query_param("method", "upload"))
+            .and(query_param("partseq", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "md5": "5d41402abc4b2a76b9719d911017c592"
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/rest/2.0/xpan/file"))
             .and(query_param("method", "create"))
@@ -1245,10 +1283,8 @@ mod api_tests {
             .upload_file_detailed("/f.bin", &local, 5, 0)
             .await
             .unwrap_err();
-        // 秒传轮（block_list=[]）⇒ rapid 必须随失败返回（假冲突守卫的依据）。
-        assert!(failure.rapid, "本轮为秒传，rapid 必须随 -8 返回");
         // ADR-112 §3.3 冲突入口：-8 必须能分类为 AlreadyExists（含原始 errno）。
-        let cloud = crate::cloud::CloudError::from_message(failure.message);
+        let cloud = crate::cloud::CloudError::from_message(failure);
         assert_eq!(cloud.kind, crate::cloud::CloudErrorKind::AlreadyExists);
         assert_eq!(cloud.raw_errno, Some(-8));
         assert!(!cloud.retryable, "冲突不可重试（要走冲突流程，不是盲重）");

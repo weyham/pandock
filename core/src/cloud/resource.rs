@@ -127,8 +127,9 @@ impl std::fmt::Display for Revision {
     }
 }
 
-/// 上传回执（ADR-112）：NativeSync 冲突检测与回声抑制的硬依赖。
-/// `rapid` = precreate 返回的待传分片列表为空（秒传候选；假冲突守卫据此决定是否先比 md5）。
+/// 上传回执（ADR-112）：NativeSync 回声抑制的基线来源（create 响应）。
+/// 注：曾有 `rapid` 字段（"空 block_list = 秒传"），2026-10-13 实测推翻——
+/// 文档「空 = 等价 [0]」且各变体恒返回 [0]，秒传触发路径未能定位 ⇒ 该字段已退役。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UploadOutcome {
     pub fs_id: Option<u64>,
@@ -136,21 +137,6 @@ pub struct UploadOutcome {
     pub size: u64,
     /// 服务端 mtime（epoch 秒）。
     pub mtime: Option<i64>,
-    pub rapid: bool,
-}
-
-/// 详细上传的失败（ADR-112）：`rapid` 跟随失败一同返回——秒传假冲突守卫需要知道
-/// 「本轮 precreate 是否秒传命中」才能决定 -8 时先比 md5 还是直接进冲突流程。
-#[derive(Clone, Debug)]
-pub struct UploadFailure {
-    pub rapid: bool,
-    pub message: String,
-}
-
-impl std::fmt::Display for UploadFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
 }
 
 #[derive(Clone, Debug)]

@@ -24,8 +24,6 @@ pub struct CloudError {
     pub request_id: Option<String>,
     pub retryable: bool,
     pub message: String,
-    /// ADR-112：上传 -8 时标记「本轮为秒传」——真秒传守卫据此先比 md5 再判冲突；其他路径恒 false。
-    pub rapid_hint: bool,
 }
 
 impl CloudError {
@@ -41,7 +39,6 @@ impl CloudError {
             request_id: None,
             retryable,
             message: message.into(),
-            rapid_hint: false,
         }
     }
 

@@ -163,6 +163,7 @@ mod tests {
             _: &'a RemotePath,
             _: &'a std::path::Path,
             _: u64,
+            _: u32,
         ) -> futures_util::future::BoxFuture<
             'a,
             Result<pandock_core::cloud::UploadOutcome, CloudError>,
