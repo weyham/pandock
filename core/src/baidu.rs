@@ -60,6 +60,15 @@ pub struct ListResponse {
     pub list: Vec<FileEntry>,
 }
 
+/// 批量 filemetas 的逐项结果（见 `metas` 的部分失败语义）。
+#[derive(Clone, Debug)]
+pub enum MetaOutcome {
+    /// 条目存在（新鲜确认存活）。
+    Hit(FileEntry),
+    /// 逐项 errno=-9：确认不存在（真删除）。
+    Missing,
+}
+
 /// `upload_precreate_and_parts` 的产物：待 create 的全部材料。
 struct UploadPrepared {
     path: String,
@@ -278,8 +287,11 @@ impl BaiduClient {
 
     /// 批量 filemetas（target=[路径数组]，生产 meta 同形态）——
     /// 陈旧 listing 守卫的确认通道：list 管广度、stat 管生杀（2026-10-13 实测 meta 是新鲜的）。
-    /// 返回与输入同序的命中项（每项含 `path` 字段可归属）；未命中的路径**不在返回里**。
-    pub async fn metas(&self, dav_paths: &[String]) -> Result<Vec<FileEntry>, String> {
+    /// **部分失败形态**（2026-10-14 实测）：顶层 errno=12 =「有条目查无」，
+    /// `info[]` 逐项 errno 0=存在 / -9=确认不存在——这是**完整证据**，不是调用失败。
+    /// 返回与输入同序的逐项结果（Hit/Missing）；其他顶层 errno、逐项未知 errno、
+    /// 或 info 覆盖数与请求数对不上 ⇒ 才整体报错（不拿半信证据动刀）。
+    pub async fn metas(&self, dav_paths: &[String]) -> Result<Vec<MetaOutcome>, String> {
         if dav_paths.is_empty() {
             return Ok(Vec::new());
         }
@@ -295,15 +307,46 @@ impl BaiduClient {
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        let data = self.decode_json(response).await?;
-        let entries: Vec<FileEntry> = serde_json::from_value(
-            data.get("info")
-                .or_else(|| data.get("list"))
-                .cloned()
-                .unwrap_or(serde_json::json!([])),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(entries)
+        let status = response.status();
+        let body = response.text().await.map_err(|e| e.to_string())?;
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|_| format!("百度 API 返回非 JSON（HTTP {status}）"))?;
+        let top_errno = value
+            .get("errno")
+            .and_then(|v| v.as_i64())
+            .or_else(|| value.get("error_code").and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        if !matches!(top_errno, 0 | 12) {
+            return Err(format!("百度 API 错误：{body}"));
+        }
+        let items = value
+            .get("info")
+            .or_else(|| value.get("list"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if items.len() != paths.len() {
+            return Err(format!(
+                "filemetas 覆盖数与请求数对不上（{} vs {}）: {body}",
+                items.len(),
+                paths.len()
+            ));
+        }
+        let mut outcomes = Vec::with_capacity(items.len());
+        for item in items {
+            let item_errno = item.get("errno").and_then(|v| v.as_i64()).unwrap_or(0);
+            match item_errno {
+                0 => outcomes.push(MetaOutcome::Hit(
+                    serde_json::from_value(item.clone()).map_err(|e| e.to_string())?,
+                )),
+                // -9：该条目确认不存在（真删除）——陈旧 listing 守卫要的就是这个答案。
+                -9 => outcomes.push(MetaOutcome::Missing),
+                other => {
+                    return Err(format!("filemetas 逐项未知 errno={other}: {body}"));
+                }
+            }
+        }
+        Ok(outcomes)
     }
 
     pub async fn meta(&self, dav_path: &str) -> Result<FileEntry, String> {
@@ -1110,6 +1153,75 @@ mod api_tests {
         assert_eq!(list[0].server_filename, "hello.txt");
         let meta = client.meta("/hello.txt").await.unwrap();
         assert_eq!(meta.dlink.as_deref(), Some("http://example.invalid/file"));
+    }
+
+    #[tokio::test]
+    async fn metas_parses_partial_failure_item_errno() {
+        // 2026-10-14 实测形态：顶层 12 =「有条目查无」，逐项 0=存在 / -9=确认不存在——
+        // 这是完整证据，不是调用失败。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "filemetas"))
+            .and(body_string_contains("dead.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 12,
+                "info": [
+                    {"server_filename":"alive.txt","path":"/apps/Demo/alive.txt","fs_id":42,"size":5,"isdir":0,"server_mtime":1700000000,"errno":0},
+                    {"server_filename":"dead.txt","path":"/apps/Demo/dead.txt","fs_id":43,"size":0,"isdir":0,"errno":-9}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
+            .with_base_urls(&server.uri());
+        let outcomes = client
+            .metas(&["/alive.txt".into(), "/dead.txt".into()])
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(&outcomes[0], crate::baidu::MetaOutcome::Hit(entry) if entry.fs_id == 42));
+        assert!(matches!(&outcomes[1], crate::baidu::MetaOutcome::Missing));
+    }
+
+    #[tokio::test]
+    async fn metas_rejects_unaccounted_lengths_and_unknown_errno() {
+        let server = MockServer::start().await;
+        // 覆盖数对不上（2 请求只回 1 项）⇒ 整层报错（不拿半信证据动刀）。
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "filemetas"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 12,
+                "info": [
+                    {"server_filename":"dead.txt","path":"/apps/Demo/dead.txt","fs_id":43,"size":0,"isdir":0,"errno":-9}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
+            .with_base_urls(&server.uri());
+        let error = client
+            .metas(&["/alive.txt".into(), "/dead.txt".into()])
+            .await
+            .unwrap_err();
+        assert!(error.contains("对不上"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn metas_rejects_other_top_level_errno() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "filemetas"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": -6, "request_id": 1
+            })))
+            .mount(&server)
+            .await;
+        let client = BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
+            .with_base_urls(&server.uri());
+        assert!(client.metas(&["/a.txt".into()]).await.is_err());
     }
 
     #[tokio::test]

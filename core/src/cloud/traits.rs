@@ -250,16 +250,18 @@ impl CloudFs for BaiduCloudFs {
         async move {
             let dav_paths: Vec<String> =
                 paths.iter().map(|path| path.as_str().to_string()).collect();
-            let entries = self
+            let outcomes = self
                 .client
                 .metas(&dav_paths)
                 .await
                 .map_err(CloudError::from_message)?;
-            let mut snapshots = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let remote = RemotePath::parse(&entry.path)
-                    .map_err(|e| CloudError::unknown(format!("百度返回非法路径: {e}")))?;
-                snapshots.push(self.convert_entry(remote, entry));
+            let mut snapshots = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                if let crate::baidu::MetaOutcome::Hit(entry) = outcome {
+                    let remote = RemotePath::parse(&entry.path)
+                        .map_err(|e| CloudError::unknown(format!("百度返回非法路径: {e}")))?;
+                    snapshots.push(self.convert_entry(remote, entry));
+                }
             }
             Ok(snapshots)
         }
