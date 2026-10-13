@@ -1631,8 +1631,19 @@ impl NativeSyncManager {
             if local_only {
                 continue; // 已捕获，不重复记账（与 close-completion 路径同原则）。
             }
-            if hydration_state == "online_only" {
-                continue; // 占位符内容不在本地，谈不上本地编辑。
+            if hydration_state == "online_only"
+                && self
+                    .platform
+                    .on_disk_data_size(&entry.path())
+                    .unwrap_or(0)
+                    <= 0
+            {
+                // 未动占位符 ⇒ 跳过。**绝不读内容**（on_disk_data_size 是只读占位符
+                // 信息，不触发水合）——扫描器不得自己变成水合器，否则每层把全部
+                // 占位符召回一遍。on_disk>0（被召回/被编辑）⇒ 落到下方共用判定：
+                // 召回读取的内容与远端一致 ⇒ md5 漏斗放行只更新基线（读≠改）；
+                // 真编辑 ⇒ pending upload。
+                continue;
             }
             if meta.is_dir() {
                 continue; // 目录没有内容比对；改名/删除不在本通道（范围纪律）。
@@ -4196,6 +4207,73 @@ mod manager_tests {
             "pending 必须留给 worker 处理"
         );
         assert_eq!(report.changed, 0, "pending 条目的云端变化不得计入本层变更");
+    }
+
+    #[tokio::test]
+    async fn local_scan_online_only_untouched_placeholder_never_reads_content() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        // online_only 条目 + 磁盘上其实是不同内容的文件（on_disk=None ⇒ 未动占位符语义）：
+        // 若扫描器读了内容，md5 与远端 aaa 不同就会误判成编辑——没有 pending ⇒ 证明从未读。
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend);
+        manager.sync_now().await.unwrap();
+        std::fs::write(root.join("a.txt"), b"totally different content!!").unwrap();
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!((report.local_new, report.local_edited), (0, 0));
+        assert!(
+            manager.db.pending_op_of(11).unwrap().is_none(),
+            "on_disk=0 的未动占位符绝不读内容、绝不误判编辑（扫描器不得变成水合器）"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_scan_online_only_edited_is_captured() {
+        let (_dir, root, calls, mut manager, on_disk) = setup_with_disk();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend);
+        manager.sync_now().await.unwrap();
+        // 用户编辑了 online_only 占位符：磁盘有内容（on_disk>0）且与远端不同。
+        std::fs::write(root.join("a.txt"), b"world!!").unwrap();
+        on_disk.lock().unwrap().insert(
+            root.join("a.txt").to_string_lossy().to_string(),
+            38,
+        );
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(report.local_edited, 1, "online_only 起点的真编辑必须被捕获");
+        assert_eq!(
+            manager.db.pending_op_of(11).unwrap().as_deref(),
+            Some("upload")
+        );
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c.starts_with("mark_not_in_sync:")), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn local_scan_recalled_read_only_updates_baseline_without_pending() {
+        let (_dir, root, _calls, mut manager, on_disk) = setup_with_disk();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        // 远端内容 = md5("hello")：召回读取产生的一致内容 ⇒ 只更新基线（读≠改保持）。
+        let backend = backend_with(vec![(
+            "/",
+            vec![file_snap("/a.txt", 11, Some("5d41402abc4b2a76b9719d911017c592"))],
+        )]);
+        manager.backend = Some(backend);
+        manager.sync_now().await.unwrap();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        on_disk.lock().unwrap().insert(
+            root.join("a.txt").to_string_lossy().to_string(),
+            5,
+        );
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(report.local_edited, 0, "召回未改 ⇒ 不算编辑");
+        assert!(manager.db.pending_op_of(11).unwrap().is_none());
+        let snap = manager.db.snapshot_for(11).unwrap().unwrap();
+        assert_eq!(snap.size, Some(5), "基线已更新为召回后的真实内容大小");
     }
 
     #[tokio::test]
