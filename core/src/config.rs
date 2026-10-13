@@ -23,6 +23,8 @@ pub struct Config {
     /// NativeSync 本地变更通知捕获的紧急开关（默认开启）。
     /// 环境变量 `PANDOCK_NATIVESYNC_NOTIFICATIONS` 优先级更高，用于卡死时免编辑恢复。
     pub native_sync_notifications: bool,
+    /// NativeSync 自动对账（ADR-111 无感同步）开关：false = 退回纯手动「立即对账」。
+    pub native_sync_auto: bool,
 }
 
 impl Default for Config {
@@ -41,6 +43,7 @@ impl Default for Config {
             launch_at_login: false,
             start_webdav_automatically: true,
             native_sync_notifications: true,
+            native_sync_auto: true,
         }
     }
 }
@@ -139,6 +142,23 @@ mod migration_tests {
         // 显式关闭必须被读到。
         let off: Config = serde_json::from_str(r#"{"native_sync_notifications":false}"#).unwrap();
         assert!(!off.native_sync_notifications);
+    }
+
+    #[test]
+    fn native_sync_auto_defaults_on_and_reads_explicit_off() {
+        let cfg = Config::default();
+        assert!(cfg.native_sync_auto, "自动对账默认开启（ADR-111）");
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["native_sync_auto"], true);
+        assert!(
+            json.get("nativeSyncAuto").is_none(),
+            "config.json 不使用 camelCase 键"
+        );
+        // 老配置文件没有该字段 ⇒ serde(default) 落到 true。
+        let legacy: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(legacy.native_sync_auto);
+        let off: Config = serde_json::from_str(r#"{"native_sync_auto":false}"#).unwrap();
+        assert!(!off.native_sync_auto);
     }
 
     #[test]

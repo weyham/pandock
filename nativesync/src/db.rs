@@ -97,6 +97,20 @@ impl IndexDb {
                 [],
             )
             .map_err(|e| e.to_string())?;
+        // ---- v4（ADR-111 / S1.5）：自动对账调度状态（kv）----
+        // 键：deep_scan_cursor / consecutive_failures / paused / backoff_until /
+        //     last_layer_at / last_ok_at / last_error。纯增量建表。
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS auto_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version) VALUES(4)",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
     pub fn path(&self) -> &Path {
@@ -303,6 +317,167 @@ impl IndexDb {
     pub fn has_hydrated_descendant(&self, relative: &str) -> Result<bool, String> {
         let prefix = format!("{}/%", relative.trim_end_matches('/'));
         self.conn.query_row("SELECT EXISTS(SELECT 1 FROM local_state WHERE relative_path LIKE ?1 AND hydration_state='hydrated')", params![prefix], |r| r.get(0)).map_err(|e| e.to_string())
+    }
+    /// 自动对账计数器：(consecutive_failures, paused, backoff_until, last_layer_at, last_ok_at, last_error)。
+    /// 空字符串一律归一为 None（写入侧用 "" 表示清除）。
+    #[allow(clippy::type_complexity)]
+    pub fn auto_counters(
+        &self,
+    ) -> Result<
+        (
+            u32,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+        String,
+    > {
+        let get = |key: &str| -> Result<Option<String>, String> {
+            Ok(self.auto_state_get(key)?.filter(|value| !value.is_empty()))
+        };
+        let failures = get("consecutive_failures")?
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+        let paused = get("paused")?.as_deref() == Some("1");
+        Ok((
+            failures,
+            paused,
+            get("backoff_until")?,
+            get("last_layer_at")?,
+            get("last_ok_at")?,
+            get("last_error")?,
+        ))
+    }
+    /// 成功（手动「立即对账」或自动层）：清失败/暂停/退避，记 last_ok_at；
+    /// `layer=true` 时同时记 last_layer_at（自动层专用）。
+    pub fn note_auto_success(&self, layer: bool) -> Result<(), String> {
+        let now = now();
+        self.auto_state_set("consecutive_failures", "0")?;
+        self.auto_state_set("paused", "0")?;
+        self.auto_state_set("backoff_until", "")?;
+        self.auto_state_set("last_error", "")?;
+        self.auto_state_set("last_ok_at", &now)?;
+        if layer {
+            self.auto_state_set("last_layer_at", &now)?;
+        }
+        Ok(())
+    }
+    /// 自动层失败：连续失败 +1，达到阈值置 paused；返回新的连续失败数。
+    pub fn note_auto_failure(&self, message: &str, pause_threshold: u32) -> Result<u32, String> {
+        let (failures, ..) = self.auto_counters()?;
+        let failures = failures + 1;
+        self.auto_state_set("consecutive_failures", &failures.to_string())?;
+        self.auto_state_set("last_error", message)?;
+        if failures >= pause_threshold {
+            self.auto_state_set("paused", "1")?;
+        }
+        Ok(failures)
+    }
+    /// 授权恢复（reconnect 成功）：清失败/暂停，让调度器自动恢复（ADR-111 §2.3）。
+    pub fn clear_auto_failures(&self) -> Result<(), String> {
+        self.auto_state_set("consecutive_failures", "0")?;
+        self.auto_state_set("paused", "0")?;
+        self.auto_state_set("backoff_until", "")?;
+        Ok(())
+    }
+    /// 索引中的云端目录总数（ADR-111 §2.7 大树降级：> 500 时 K 减半、间隔拉长）。
+    pub fn count_dirs(&self) -> Result<u64, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM remote_entry WHERE is_dir=1 AND tombstone=0 AND local_only=0",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(|e| e.to_string())
+    }
+    /// 自动对账调度状态（ADR-111）：kv 读取。
+    pub fn auto_state_get(&self, key: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM auto_state WHERE key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+    pub fn auto_state_set(&self, key: &str, value: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO auto_state(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    /// 交错深扫游标：按 remote_path 字典序推进；`after=None` 从头开始。
+    /// 返回 (remote_path)。只覆盖云端目录（非 tombstone、非本地新建）。
+    pub fn dirs_after(&self, after: Option<&str>, limit: usize) -> Result<Vec<String>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT remote_path FROM remote_entry WHERE is_dir=1 AND tombstone=0 AND local_only=0 AND remote_path > ?1 ORDER BY remote_path LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![after.unwrap_or(""), limit as i64], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+    /// 某目录的**直接子项**中不在 `seen` 里的条目（scoped 远端删除对账）。
+    /// 与 `missing_entries` 同形，但范围限定为单个目录——增量层绝不能按全树判 missing
+    /// （未扫到的目录会被误判成远端删除）。
+    pub fn missing_children_of(
+        &self,
+        parent_relative: &str,
+        seen: &[u64],
+    ) -> Result<Vec<(u64, String, String, bool)>, String> {
+        let prefix = if parent_relative.is_empty() {
+            "%".to_string()
+        } else {
+            format!("{parent_relative}/%")
+        };
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT r.fs_id,l.relative_path,l.hydration_state,r.is_dir FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0 AND r.local_only=0 AND l.relative_path LIKE ?1 AND instr(substr(l.relative_path,length(?1)+1),'/')=0",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![prefix], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            let row = row.map_err(|e| e.to_string())?;
+            if !seen.contains(&row.0) {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+    /// 索引中该 fs_id 的云端元数据（增量比对基线）：(size, md5, modified_at)。
+    #[allow(clippy::type_complexity)]
+    pub fn remote_meta_by_fs_id(
+        &self,
+        fs_id: u64,
+    ) -> Result<Option<(u64, Option<String>, Option<i64>)>, String> {
+        self.conn
+            .query_row(
+                "SELECT size,md5,modified_at FROM remote_entry WHERE fs_id=?1 AND tombstone=0",
+                params![fs_id as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
     }
     pub fn missing_entries(
         &self,
@@ -777,7 +952,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 3, "schema_migrations 应记录 1/2/3 三个版本");
+        assert_eq!(count, 4, "schema_migrations 应记录 1/2/3/4 四个版本");
         // v3：本地变更捕获表、索引与待同步/快照列必须存在
         let table: i64 = db
             .conn
@@ -788,6 +963,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table, 1, "local_change 表应存在");
+        // v4：自动对账调度状态表必须存在
+        let auto_table: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='auto_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_table, 1, "auto_state 表应存在");
         let index: i64 = db
             .conn
             .query_row(
@@ -953,7 +1138,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(versions, 3, "v1 库升级后应记录到 3");
+        assert_eq!(versions, 4, "v1 库升级后应记录到 4");
         db.migrate().unwrap();
         // 幂等：二次迁移不得报错，且 v3 对象已在 v1 库上升级出来
         let table: i64 = db
@@ -1260,5 +1445,135 @@ mod tests {
         assert_eq!(state, "online_only");
         assert_eq!(db.pending_op_of(9).unwrap().as_deref(), Some("rename"));
         assert!(db.entry_by_relative("old.txt").unwrap().is_none());
+    }
+
+    #[test]
+    fn auto_state_kv_roundtrip_and_counters_normalize_empty() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        assert_eq!(db.auto_state_get("deep_scan_cursor").unwrap(), None);
+        db.auto_state_set("deep_scan_cursor", "/docs").unwrap();
+        assert_eq!(
+            db.auto_state_get("deep_scan_cursor").unwrap().as_deref(),
+            Some("/docs")
+        );
+        db.auto_state_set("deep_scan_cursor", "/z").unwrap();
+        assert_eq!(
+            db.auto_state_get("deep_scan_cursor").unwrap().as_deref(),
+            Some("/z"),
+            "ON CONFLICT 必须更新而非重复插入"
+        );
+        // 空字符串 ⇒ None（清除语义）。
+        db.auto_state_set("last_error", "").unwrap();
+        let (fails, paused, backoff, layer, ok, err) = db.auto_counters().unwrap();
+        assert_eq!((fails, paused), (0, false));
+        assert!(backoff.is_none() && layer.is_none() && ok.is_none() && err.is_none());
+    }
+
+    #[test]
+    fn note_auto_failure_counts_and_pauses_at_threshold() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        for expect in 1..=4u32 {
+            assert_eq!(db.note_auto_failure("boom", 5).unwrap(), expect);
+            let (_, paused, ..) = db.auto_counters().unwrap();
+            assert!(!paused);
+        }
+        assert_eq!(db.note_auto_failure("boom", 5).unwrap(), 5);
+        let (_, paused, _, _, _, err) = db.auto_counters().unwrap();
+        assert!(paused, "达到阈值必须置 paused");
+        assert_eq!(err.as_deref(), Some("boom"));
+        // 成功 ⇒ 全部复位。
+        db.note_auto_success(true).unwrap();
+        let (fails, paused, _, layer, ok, _) = db.auto_counters().unwrap();
+        assert_eq!((fails, paused), (0, false));
+        assert!(layer.is_some() && ok.is_some());
+        // 授权恢复只清失败/暂停，不动 last_ok_at。
+        db.note_auto_failure("x", 5).unwrap();
+        db.clear_auto_failures().unwrap();
+        let (fails, paused, ..) = db.auto_counters().unwrap();
+        assert_eq!((fails, paused), (0, false));
+    }
+
+    #[test]
+    fn dirs_after_paginates_lexicographically() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        for (fs_id, path) in [(1, "/b"), (2, "/a"), (3, "/a/sub")] {
+            db.upsert(&crate::model::EntryRecord {
+                fs_id,
+                local_only: false,
+                parent_fs_id: None,
+                remote_path: path.into(),
+                relative_path: path.trim_start_matches('/').into(),
+                name: path.rsplit('/').next().unwrap().into(),
+                is_dir: true,
+                size: 0,
+                md5: None,
+                modified_at: None,
+                state: crate::model::NativeSyncState::OnlineOnly,
+                pin_state: crate::model::PinState::Unpinned,
+                error: None,
+                pending_op: None,
+                pending_since: None,
+                has_children: true,
+            })
+            .unwrap();
+        }
+        assert_eq!(db.count_dirs().unwrap(), 3);
+        assert_eq!(db.dirs_after(None, 2).unwrap(), vec!["/a", "/a/sub"]);
+        assert_eq!(db.dirs_after(Some("/a/sub"), 5).unwrap(), vec!["/b"]);
+        assert!(db.dirs_after(Some("/b"), 5).unwrap().is_empty());
+        // tombstone 后不再参与深扫。
+        db.tombstone(2).unwrap();
+        assert_eq!(db.count_dirs().unwrap(), 2);
+        assert_eq!(db.dirs_after(None, 5).unwrap(), vec!["/a/sub", "/b"]);
+    }
+
+    #[test]
+    fn missing_children_of_is_scoped_to_direct_children() {
+        let dir = tempdir().unwrap();
+        let db = IndexDb::open(dir.path()).unwrap();
+        let seed = |fs_id: i64, remote: &str, relative: &str, is_dir: bool| {
+            db.upsert(&crate::model::EntryRecord {
+                fs_id,
+                local_only: false,
+                parent_fs_id: None,
+                remote_path: remote.into(),
+                relative_path: relative.into(),
+                name: relative.rsplit('/').next().unwrap().into(),
+                is_dir,
+                size: 0,
+                md5: None,
+                modified_at: None,
+                state: crate::model::NativeSyncState::OnlineOnly,
+                pin_state: crate::model::PinState::Unpinned,
+                error: None,
+                pending_op: None,
+                pending_since: None,
+                has_children: is_dir,
+            })
+            .unwrap();
+        };
+        seed(1, "/A", "A", true);
+        seed(2, "/A/a1", "A/a1", false);
+        seed(3, "/A/a2", "A/a2", false);
+        seed(4, "/A/sub", "A/sub", true);
+        seed(5, "/A/sub/deep", "A/sub/deep", false);
+        seed(6, "/B/b1", "B/b1", false);
+        // 只看见 a1 ⇒ a2 与 sub（直接子项）missing；sub/deep 不是直接子项 ⇒ 不在内；
+        // B/b1 不在 A 下 ⇒ 绝不受影响。
+        let missing = db.missing_children_of("A", &[2]).unwrap();
+        let mut ids: Vec<u64> = missing.iter().map(|row| row.0).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![3, 4]);
+        // 根目录视角：A 是直接子项，A/a1 不是。
+        let missing = db.missing_children_of("", &[1]).unwrap();
+        assert!(
+            missing.is_empty(),
+            "看见根的直接子项 A 后无 missing: {missing:?}"
+        );
+        let missing = db.missing_children_of("", &[]).unwrap();
+        assert_eq!(missing.len(), 1, "根 missing 只含直接子项 A: {missing:?}");
     }
 }

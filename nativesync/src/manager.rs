@@ -6,8 +6,11 @@ use crate::model::{
 };
 use crate::path::{default_root_path, sanitize_component, validate_root_path};
 use crate::platform::{new_platform, PlatformError, PlatformSync};
-use pandock_core::cloud::RemotePath;
+use crate::scheduler::AutoSyncParams;
+use pandock_core::cloud::{RemotePath, ResourceSnapshot};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -24,6 +27,66 @@ impl From<PlatformError> for NativeSyncError {
     fn from(e: PlatformError) -> Self {
         Self::Message(e.to_string())
     }
+}
+
+/// 一次自动对账层（增量）的报告：日志汇总与调度器决策的依据。
+#[derive(Clone, Debug, Default)]
+pub struct AutoLayerReport {
+    /// 折算后的 API 调用数（`count / LIST_PAGE_SIZE + 1`，翻页计入）。
+    pub calls: u32,
+    pub added: u64,
+    pub changed: u64,
+    /// 远端删除 → 本地移除占位符并 tombstone 的条数。
+    pub removed: u64,
+    /// 远端删除但本地 hydrated/有水合后代 → 仅标 remote_missing 的条数。
+    pub remote_missing_marked: u64,
+    pub drilled: u32,
+    pub deep_scanned: u32,
+    /// 因预算/上限被推迟到下一层的目录数。
+    pub deferred: u32,
+    /// 未执行的原因（no_root / disabled / paused）；None = 执行了。
+    pub skipped: Option<&'static str>,
+    /// 被手动「立即对账」抢占：部分完成，不算失败。
+    pub preempted: bool,
+    /// 本层失败后的连续失败数（成功层为 0）。
+    pub consecutive_failures: u32,
+}
+
+/// 一次目录列举折算的 API 调用数：PAGE_SIZE 整页时会多一次空页请求（core baidu.rs 的循环）。
+fn list_call_cost(entry_count: usize) -> u32 {
+    (entry_count / pandock_core::baidu::LIST_PAGE_SIZE + 1) as u32
+}
+
+/// 云端条目相对索引基线是否变化（ADR-111 比对键）：size 不同 ⇒ 变；
+/// md5 双侧都有 ⇒ 比 md5；缺任一侧 ⇒ 退化为 mtime（定稿：可接受残余风险）。
+fn remote_content_changed(
+    prior: Option<(u64, Option<String>, Option<i64>)>,
+    size: u64,
+    md5: &Option<String>,
+    modified: Option<i64>,
+) -> bool {
+    match prior {
+        None => true,
+        Some((prior_size, prior_md5, prior_mtime)) => {
+            if prior_size != size {
+                return true;
+            }
+            match (prior_md5, md5) {
+                (Some(a), Some(b)) => a != *b,
+                _ => prior_mtime != modified,
+            }
+        }
+    }
+}
+
+/// 单个目录列举的消化结果（全量 BFS 与增量层共用）。
+struct DirIngestOutcome {
+    seen: Vec<u64>,
+    subdirs: Vec<RemotePath>,
+    /// 根快查中「新增或内容变化」的顶层目录（定向下钻候选）。
+    changed_top_dirs: Vec<RemotePath>,
+    added: u64,
+    changed: u64,
 }
 
 pub struct NativeSyncManager {
@@ -98,6 +161,17 @@ impl NativeSyncManager {
             .unwrap_or((None, false, "disabled".into()));
         let (total, placeholders, hydrated, attention, jobs) =
             self.db.counts().map_err(NativeSyncError::Message)?;
+        let (failures, paused, backoff_until, last_layer_at, last_ok_at, last_error) =
+            self.db.auto_counters().map_err(NativeSyncError::Message)?;
+        let auto_sync_state = if !enabled {
+            "disabled"
+        } else if paused {
+            "paused"
+        } else if failures > 0 {
+            "backing_off"
+        } else {
+            "ok"
+        };
         Ok(NativeSyncStatusView {
             enabled,
             supported: supported.is_ok(),
@@ -111,8 +185,12 @@ impl NativeSyncManager {
             pending_entries: self.db.pending_count().map_err(NativeSyncError::Message)?,
             notifications_enabled: self.notifications_enabled,
             active_jobs: jobs,
-            last_sync_at: None,
-            last_error: None,
+            last_sync_at: last_ok_at,
+            last_error,
+            auto_sync_state: auto_sync_state.into(),
+            consecutive_failures: failures as u64,
+            backoff_until,
+            last_layer_at,
         })
     }
     pub fn enable(
@@ -170,6 +248,10 @@ impl NativeSyncManager {
         self.db
             .set_root(&root, true, "connected")
             .map_err(NativeSyncError::Message)?;
+        // 授权恢复 = 自动对账的恢复信号（ADR-111 §2.3：清退避/暂停，调度器自行复位）。
+        self.db
+            .clear_auto_failures()
+            .map_err(NativeSyncError::Message)?;
         self.status()
     }
     fn restore_platform_mappings(&mut self) {
@@ -220,148 +302,9 @@ impl NativeSyncManager {
                 .list(&remote)
                 .await
                 .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
-            for snapshot in entries {
-                let fs_id = snapshot
-                    .fs_id
-                    .ok_or_else(|| NativeSyncError::Message("远端条目缺少 fs_id".into()))?;
-                // 云端仍存在：先登记，否则下面的 missing 对账会把它误判成远端删除。
-                seen.push(fs_id);
-                // H1：本地已删除/改名、尚未同步到云端的条目不得被重建，
-                // 否则用户删掉的文件会在下次同步无声复活、改名会多出旧路径副本。
-                if let Some((pending_fs_id, op)) = self
-                    .db
-                    .pending_op_for_remote(snapshot.path.as_str())
-                    .map_err(NativeSyncError::Message)?
-                {
-                    if op == "delete" || op == "rename" {
-                        log::info!(
-                            "native-sync sync_now keeps local pending entry fs_id={pending_fs_id} op={op}"
-                        );
-                        continue;
-                    }
-                }
-                let name = sanitize_component(
-                    snapshot
-                        .server_filename
-                        .as_deref()
-                        .or_else(|| snapshot.path.file_name())
-                        .unwrap_or("unnamed"),
-                );
-                let parent_remote = remote.as_str().trim_start_matches('/');
-                // 父目录在本轮枚举中必然已先入库（目录出队后才枚举其子项），
-                // 此处回填 parent_fs_id，修复 has_children 恒 false 的根因；
-                // upsert 的 ON CONFLICT 子句已会更新该列，老库随下次 sync_now 自愈。
-                let parent_fs_id = if remote.is_root() {
-                    None
-                } else {
-                    self.db
-                        .fs_id_for_remote(parent_remote)
-                        .map_err(NativeSyncError::Message)?
-                };
-                let parent_local = if remote.is_root() {
-                    String::new()
-                } else {
-                    self.db
-                        .relative_for_remote(parent_remote)
-                        .map_err(NativeSyncError::Message)?
-                        .unwrap_or_else(|| parent_remote.to_string())
-                };
-                let relative = if parent_local.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{parent_local}/{name}")
-                };
-                let local = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-                let record = crate::model::EntryRecord {
-                    fs_id: fs_id as i64,
-                    local_only: false,
-                    parent_fs_id,
-                    remote_path: snapshot.path.as_str().to_string(),
-                    relative_path: relative.clone(),
-                    name,
-                    is_dir: snapshot.is_dir(),
-                    size: snapshot.size,
-                    md5: snapshot.md5.clone(),
-                    modified_at: snapshot
-                        .modified
-                        .duration_since(UNIX_EPOCH)
-                        .ok()
-                        .map(|x| x.as_secs() as i64),
-                    state: NativeSyncState::OnlineOnly,
-                    pin_state: PinState::Unpinned,
-                    error: None,
-                    pending_op: None,
-                    pending_since: None,
-                    has_children: snapshot.is_dir(),
-                };
-                self.db.upsert(&record).map_err(NativeSyncError::Message)?;
-                self.platform
-                    .set_remote_mapping(&relative, snapshot.path.clone(), fs_id);
-                self.platform.create_placeholder(
-                    &local,
-                    snapshot.is_dir(),
-                    snapshot.size,
-                    &fs_id.to_le_bytes(),
-                )?;
-                // 先算 in-sync 自愈的前置条件（**必须在写入新快照之前**，否则就是自证。
-                let (pending_change, snapshot_matches) = if let Ok(meta) = std::fs::metadata(&local)
-                {
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64);
-                    let pending = self
-                        .db
-                        .pending_op_of(fs_id as i64)
-                        .map_err(NativeSyncError::Message)?
-                        .is_some();
-                    let matches = matches!(
-                        self.db
-                            .snapshot_for(fs_id as i64)
-                            .map_err(NativeSyncError::Message)?,
-                        Some(snap) if snap.size == Some(meta.len()) && snap.mtime == mtime
-                    );
-                    // 记录本地快照作为基线：关闭完成通知靠它与磁盘现状比对来识别本地编辑。
-                    let _ = self.db.set_snapshot(fs_id as i64, mtime, meta.len());
-                    (pending, matches)
-                } else {
-                    (true, false)
-                };
-                // 占位符被平台标成"未同步"且内容确实与云端一致时才恢复 in-sync。
-                self.platform.repair_in_sync_if_needed(
-                    &local,
-                    fs_id,
-                    snapshot.is_dir(),
-                    pending_change,
-                    snapshot_matches,
-                );
-                // 回读文件系统上的真实 pin 状态：只跟自己的操作走会与磁盘不一致
-                // （实测：磁盘 PINNED、数据库 unpinned，界面与 Explorer 互相矛盾）。
-                if !snapshot.is_dir() {
-                    if let Some(pinned) = self.platform.pin_state(&local) {
-                        let _ = self.db.set_pin_state(fs_id, pinned);
-                    }
-                    // 平台侧可能已经把文件水合回来或释放掉了：每轮用磁盘真值对账，
-                    // 免得管理台显示的状态与 Explorer 看到的实际情况互相矛盾。
-                    self.reconcile_hydration_with_disk(fs_id, &relative, &local, snapshot.size)?;
-                    // 甲方案守卫（收敛路径）：库里仍有未同步本地改动的条目，重新标回
-                    // NOT_IN_SYNC，让平台（及外部工具）**拒绝对它脱水**。捕获那一刻已标过一次，
-                    // 这里覆盖「老库行 / 重启后遗留」的情形。S1 无上传方向 ⇒ 该标记可能长期保持，
-                    // 这是诚实状态（S2 上传成功后再清回 IN_SYNC）。
-                    if self
-                        .db
-                        .pending_op_of(fs_id as i64)
-                        .map_err(NativeSyncError::Message)?
-                        .is_some()
-                    {
-                        self.platform.mark_not_in_sync(&local);
-                    }
-                }
-                if snapshot.is_dir() {
-                    queue.push(snapshot.path.clone());
-                }
-            }
+            let outcome = self.ingest_dir_entries(&root, &remote, entries)?;
+            seen.extend(outcome.seen);
+            queue.extend(outcome.subdirs);
         }
         // 每轮对账一行 info 汇总：一眼看出"有没有重复转换"，便于与 fsutil 对照。
         let (checked, placeholders, converted, convert_failed) = self.platform.take_probe_summary();
@@ -374,6 +317,200 @@ impl NativeSyncManager {
             .db
             .missing_entries(&seen)
             .map_err(NativeSyncError::Message)?;
+        self.apply_missing(&root, missing)?;
+        // 手动「立即对账」成功 = 自动对账的恢复信号（ADR-111 §2.3：清退避/暂停）。
+        self.db
+            .note_auto_success(false)
+            .map_err(NativeSyncError::Message)?;
+        self.status()
+    }
+    /// 消化一个目录的列举结果（全量 BFS 与增量自动层**同一条路径**，ADR-111 §2.4：
+    /// 不许两套逻辑分叉）：upsert、占位符、in-sync 自愈、pin/水合对账、pending 守卫。
+    fn ingest_dir_entries(
+        &mut self,
+        root: &Path,
+        remote: &RemotePath,
+        entries: Vec<ResourceSnapshot>,
+    ) -> Result<DirIngestOutcome, NativeSyncError> {
+        let mut outcome = DirIngestOutcome {
+            seen: Vec::new(),
+            subdirs: Vec::new(),
+            changed_top_dirs: Vec::new(),
+            added: 0,
+            changed: 0,
+        };
+        for snapshot in entries {
+            let fs_id = snapshot
+                .fs_id
+                .ok_or_else(|| NativeSyncError::Message("远端条目缺少 fs_id".into()))?;
+            // 云端仍存在：先登记，否则下面的 missing 对账会把它误判成远端删除。
+            outcome.seen.push(fs_id);
+            // H1：本地已删除/改名、尚未同步到云端的条目不得被重建，
+            // 否则用户删掉的文件会在下次同步无声复活、改名会多出旧路径副本。
+            if let Some((pending_fs_id, op)) = self
+                .db
+                .pending_op_for_remote(snapshot.path.as_str())
+                .map_err(NativeSyncError::Message)?
+            {
+                if op == "delete" || op == "rename" {
+                    log::info!(
+                        "native-sync sync_now keeps local pending entry fs_id={pending_fs_id} op={op}"
+                    );
+                    continue;
+                }
+            }
+            let name = sanitize_component(
+                snapshot
+                    .server_filename
+                    .as_deref()
+                    .or_else(|| snapshot.path.file_name())
+                    .unwrap_or("unnamed"),
+            );
+            let parent_remote = remote.as_str().trim_start_matches('/');
+            // 父目录在本轮枚举中必然已先入库（目录出队后才枚举其子项），
+            // 此处回填 parent_fs_id，修复 has_children 恒 false 的根因；
+            // upsert 的 ON CONFLICT 子句已会更新该列，老库随下次 sync_now 自愈。
+            let parent_fs_id = if remote.is_root() {
+                None
+            } else {
+                self.db
+                    .fs_id_for_remote(parent_remote)
+                    .map_err(NativeSyncError::Message)?
+            };
+            let parent_local = if remote.is_root() {
+                String::new()
+            } else {
+                self.db
+                    .relative_for_remote(parent_remote)
+                    .map_err(NativeSyncError::Message)?
+                    .unwrap_or_else(|| parent_remote.to_string())
+            };
+            let relative = if parent_local.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent_local}/{name}")
+            };
+            let local = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+            // 变化检测必须在 upsert 之前读基线（之后就是自证）。
+            let new_modified = snapshot
+                .modified
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|x| x.as_secs() as i64);
+            let prior = self
+                .db
+                .remote_meta_by_fs_id(fs_id)
+                .map_err(NativeSyncError::Message)?;
+            let prior_absent = prior.is_none();
+            let is_changed =
+                remote_content_changed(prior, snapshot.size, &snapshot.md5, new_modified);
+            let record = crate::model::EntryRecord {
+                fs_id: fs_id as i64,
+                local_only: false,
+                parent_fs_id,
+                remote_path: snapshot.path.as_str().to_string(),
+                relative_path: relative.clone(),
+                name,
+                is_dir: snapshot.is_dir(),
+                size: snapshot.size,
+                md5: snapshot.md5.clone(),
+                modified_at: new_modified,
+                state: NativeSyncState::OnlineOnly,
+                pin_state: PinState::Unpinned,
+                error: None,
+                pending_op: None,
+                pending_since: None,
+                has_children: snapshot.is_dir(),
+            };
+            self.db.upsert(&record).map_err(NativeSyncError::Message)?;
+            if prior_absent {
+                outcome.added += 1;
+            } else if is_changed {
+                outcome.changed += 1;
+            }
+            self.platform
+                .set_remote_mapping(&relative, snapshot.path.clone(), fs_id);
+            self.platform.create_placeholder(
+                &local,
+                snapshot.is_dir(),
+                snapshot.size,
+                &fs_id.to_le_bytes(),
+            )?;
+            // 先算 in-sync 自愈的前置条件（**必须在写入新快照之前**，否则就是自证。
+            let (pending_change, snapshot_matches) = if let Ok(meta) = std::fs::metadata(&local) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+                let pending = self
+                    .db
+                    .pending_op_of(fs_id as i64)
+                    .map_err(NativeSyncError::Message)?
+                    .is_some();
+                let matches = matches!(
+                    self.db
+                        .snapshot_for(fs_id as i64)
+                        .map_err(NativeSyncError::Message)?,
+                    Some(snap) if snap.size == Some(meta.len()) && snap.mtime == mtime
+                );
+                // 记录本地快照作为基线：关闭完成通知靠它与磁盘现状比对来识别本地编辑。
+                let _ = self.db.set_snapshot(fs_id as i64, mtime, meta.len());
+                (pending, matches)
+            } else {
+                (true, false)
+            };
+            // 占位符被平台标成"未同步"且内容确实与云端一致时才恢复 in-sync。
+            self.platform.repair_in_sync_if_needed(
+                &local,
+                fs_id,
+                snapshot.is_dir(),
+                pending_change,
+                snapshot_matches,
+            );
+            // 回读文件系统上的真实 pin 状态：只跟自己的操作走会与磁盘不一致
+            // （实测：磁盘 PINNED、数据库 unpinned，界面与 Explorer 互相矛盾）。
+            if !snapshot.is_dir() {
+                if let Some(pinned) = self.platform.pin_state(&local) {
+                    let _ = self.db.set_pin_state(fs_id, pinned);
+                }
+                // 平台侧可能已经把文件水合回来或释放掉了：每轮用磁盘真值对账，
+                // 免得管理台显示的状态与 Explorer 看到的实际情况互相矛盾。
+                self.reconcile_hydration_with_disk(fs_id, &relative, &local, snapshot.size)?;
+                // 甲方案守卫（收敛路径）：库里仍有未同步本地改动的条目，重新标回
+                // NOT_IN_SYNC，让平台（及外部工具）**拒绝对它脱水**。捕获那一刻已标过一次，
+                // 这里覆盖「老库行 / 重启后遗留」的情形。S1 无上传方向 ⇒ 该标记可能长期保持，
+                // 这是诚实状态（S2 上传成功后再清回 IN_SYNC）。
+                if self
+                    .db
+                    .pending_op_of(fs_id as i64)
+                    .map_err(NativeSyncError::Message)?
+                    .is_some()
+                {
+                    self.platform.mark_not_in_sync(&local);
+                }
+            }
+
+            if snapshot.is_dir() {
+                if remote.is_root() && is_changed {
+                    outcome.changed_top_dirs.push(snapshot.path.clone());
+                }
+                outcome.subdirs.push(snapshot.path.clone());
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// 远端删除对账（全量=全树 missing，增量=单目录 scoped missing，同一处理逻辑）：
+    /// hydrated/有水合后代 ⇒ 仅标 remote_missing；否则移除占位符并 tombstone。
+    /// 返回 (tombstoned, preserved_remote_missing)。
+    fn apply_missing(
+        &mut self,
+        root: &Path,
+        missing: Vec<(u64, String, String, bool)>,
+    ) -> Result<(u64, u64), NativeSyncError> {
+        let mut tombstoned = 0u64;
+        let mut preserved = 0u64;
         for (fs_id, relative, state, is_dir) in missing {
             let local = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
             let preserve = state == "hydrated"
@@ -390,17 +527,275 @@ impl NativeSyncManager {
                         Some("远端条目已删除，保留本地内容"),
                     )
                     .map_err(NativeSyncError::Message)?;
+                preserved += 1;
             } else if local.exists() {
                 self.platform.remove_placeholder(&local, is_dir)?;
                 self.db.tombstone(fs_id).map_err(NativeSyncError::Message)?;
+                tombstoned += 1;
             } else {
                 // 本地已不存在（用户在 Explorer 删除、或父目录本轮被跳过枚举）：
                 // 直接记账，不再调用平台删除接口（对不存在的路径会 ENOENT 而中断整轮）。
                 self.db.tombstone(fs_id).map_err(NativeSyncError::Message)?;
+                tombstoned += 1;
             }
         }
-        self.status()
+        Ok((tombstoned, preserved))
     }
+
+    /// 调度器记账：reconcile 未执行到的失败（如 backend 缺失）由运行循环代记。
+    /// reconcile 内部的层失败已自行记账，**不得**再经这里重复计。
+    pub fn note_auto_failure(
+        &mut self,
+        message: &str,
+        pause_threshold: u32,
+    ) -> Result<u32, NativeSyncError> {
+        self.db
+            .note_auto_failure(message, pause_threshold)
+            .map_err(NativeSyncError::Message)
+    }
+    /// 大树降级的间隔覆盖秒数（ADR-111 §2.7：D>500 ⇒ 15m）；无覆盖 ⇒ None。
+    pub fn auto_interval_override_secs(&self) -> Option<u64> {
+        self.db
+            .auto_state_get("interval_override_secs")
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse().ok())
+    }
+    /// 退避截止时间由调度器（src-tauri 运行循环）计算后回写，供 status/UI 展示。
+    pub fn set_backoff_until(&mut self, until: Option<String>) -> Result<(), NativeSyncError> {
+        self.db
+            .auto_state_set("backoff_until", until.as_deref().unwrap_or(""))
+            .map_err(NativeSyncError::Message)
+    }
+
+    /// 自动对账一层（增量，ADR-111 §2.2）：根目录快查 + 定向下钻 ≤ drilldown_max +
+    /// 交错深扫 ≤ deep_scan_batch，全程受 layer_budget 调用预算约束。
+    ///
+    /// 与手动「立即对账」**同一条引擎路径**（`ingest_dir_entries`/`apply_missing`），
+    /// 差别只在范围：手动 = 全树 BFS + 全树 missing；自动 = 有界的每层子集 + scoped missing。
+    /// 被手动抢占（`cancel` 置位）⇒ 在目录列举边界停止，`preempted=true`，**不算失败**。
+    pub async fn reconcile_incremental(
+        &mut self,
+        params: &AutoSyncParams,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<AutoLayerReport, NativeSyncError> {
+        static AUTO_RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let run_id = AUTO_RUN_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        self.platform.set_run_id(run_id);
+        let mut report = AutoLayerReport::default();
+        let Some((root, enabled, _)) = self.db.root().map_err(NativeSyncError::Message)? else {
+            report.skipped = Some("no_root");
+            return Ok(report);
+        };
+        if !enabled {
+            report.skipped = Some("disabled");
+            return Ok(report);
+        }
+        let (_, paused, ..) = self.db.auto_counters().map_err(NativeSyncError::Message)?;
+        if paused {
+            report.skipped = Some("paused");
+            return Ok(report);
+        }
+        let Some(backend) = self.backend.clone() else {
+            return Err(NativeSyncError::Message("请先完成百度网盘授权".into()));
+        };
+        self.platform.set_hydration_backend(backend.clone());
+        self.platform.set_state_db(self.db.path());
+        // ADR-111 §2.7 大树降级：目录总数 > 500 ⇒ 深扫批量减半、间隔拉长（运行循环读
+        // `interval_override_secs`；小树时清除覆盖）。
+        let dir_total = self.db.count_dirs().map_err(NativeSyncError::Message)?;
+        let mut effective = params.clone();
+        if dir_total > 500 {
+            effective.deep_scan_batch = (params.deep_scan_batch / 2).max(1);
+            self.db
+                .auto_state_set("interval_override_secs", "900")
+                .map_err(NativeSyncError::Message)?;
+        } else {
+            self.db
+                .auto_state_set("interval_override_secs", "")
+                .map_err(NativeSyncError::Message)?;
+        }
+        let outcome = self
+            .run_auto_layer(&root, &backend, &effective, cancel, &mut report)
+            .await;
+        match &outcome {
+            Ok(()) if report.preempted => {
+                log::info!(
+                    "native-sync auto layer run={run_id} preempted calls={} added={} changed={} removed={}",
+                    report.calls, report.added, report.changed, report.removed
+                );
+            }
+            Ok(()) => {
+                self.db
+                    .note_auto_success(true)
+                    .map_err(NativeSyncError::Message)?;
+                log::info!(
+                    "native-sync auto layer run={run_id} ok calls={} added={} changed={} removed={} missing_marked={} drilled={} deep={} deferred={} dirs={dir_total}",
+                    report.calls, report.added, report.changed, report.removed,
+                    report.remote_missing_marked, report.drilled, report.deep_scanned, report.deferred
+                );
+            }
+            Err(error) => {
+                let fails = self
+                    .db
+                    .note_auto_failure(&error.to_string(), params.pause_threshold)
+                    .map_err(NativeSyncError::Message)?;
+                report.consecutive_failures = fails;
+                log::warn!(
+                    "native-sync auto layer run={run_id} failed consecutive={fails} calls={} error={error}",
+                    report.calls
+                );
+            }
+        }
+        outcome.map(|_| report)
+    }
+
+    /// 一层的三段执行（根快查 → 定向下钻 → 交错深扫）；失败即中断，剩余目录自然推迟。
+    async fn run_auto_layer(
+        &mut self,
+        root: &Path,
+        backend: &Arc<dyn CloudBackend>,
+        params: &AutoSyncParams,
+        cancel: &Arc<AtomicBool>,
+        report: &mut AutoLayerReport,
+    ) -> Result<(), NativeSyncError> {
+        // 1) 根目录快查：顶层新增/删除/改名/内容变化在 1 层内被发现；翻页折算计入预算。
+        let root_remote = RemotePath::root();
+        let entries = backend
+            .list(&root_remote)
+            .await
+            .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
+        report.calls += list_call_cost(entries.len());
+        let outcome = self.ingest_dir_entries(root, &root_remote, entries)?;
+        report.added += outcome.added;
+        report.changed += outcome.changed;
+        let (removed, marked) = self.scoped_missing(root, "", &outcome.seen)?;
+        report.removed += removed;
+        report.remote_missing_marked += marked;
+        // 本层已覆盖的目录（定向下钻/深扫），游标走位时跳过不重列。
+        let mut covered: HashSet<String> = HashSet::new();
+
+        // 2) 定向下钻：根查发现的可疑顶层目录（新增或元数据变化），≤ drilldown_max。
+        for dir in &outcome.changed_top_dirs {
+            if report.drilled >= params.drilldown_max || report.calls >= params.layer_budget {
+                report.deferred += 1;
+                continue;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                report.preempted = true;
+                return Ok(());
+            }
+            let entries = backend
+                .list(dir)
+                .await
+                .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
+            report.calls += list_call_cost(entries.len());
+            report.drilled += 1;
+            covered.insert(dir.as_str().to_string());
+            let sub = self.ingest_dir_entries(root, dir, entries)?;
+            report.added += sub.added;
+            report.changed += sub.changed;
+            let rel = self.relative_of(dir);
+            let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen)?;
+            report.removed += removed;
+            report.remote_missing_marked += marked;
+        }
+
+        // 3) 交错深扫：游标按 remote_path 字典序轮转，把全量目录覆盖摊到 ceil(D/K) 层。
+        let mut cursor = self
+            .db
+            .auto_state_get("deep_scan_cursor")
+            .map_err(NativeSyncError::Message)?
+            .filter(|value| !value.is_empty());
+        let dir_total = self.db.count_dirs().map_err(NativeSyncError::Message)?;
+        let mut walked = 0u64;
+        // 游标走位是本地索引查询（免费），但必须有界：覆盖集 + 全圈检测防死循环。
+        let walk_cap = dir_total + params.drilldown_max as u64 + 2;
+        while report.deep_scanned < params.deep_scan_batch && report.calls < params.layer_budget {
+            if cancel.load(Ordering::Relaxed) {
+                report.preempted = true;
+                break;
+            }
+            if walked >= walk_cap {
+                break;
+            }
+            walked += 1;
+            let next = self
+                .db
+                .dirs_after(cursor.as_deref(), 1)
+                .map_err(NativeSyncError::Message)?
+                .into_iter()
+                .next();
+            let dir = match next {
+                Some(dir) => dir,
+                None => {
+                    // 一轮覆盖完成：回到开头；若开头即本层已覆盖 ⇒ 整圈走完。
+                    match self
+                        .db
+                        .dirs_after(None, 1)
+                        .map_err(NativeSyncError::Message)?
+                        .into_iter()
+                        .next()
+                    {
+                        Some(dir) if !covered.contains(&dir) => dir,
+                        _ => break,
+                    }
+                }
+            };
+            cursor = Some(dir.clone());
+            if covered.contains(&dir) {
+                continue;
+            }
+            let remote = RemotePath::parse(&dir)
+                .map_err(|e| NativeSyncError::Message(format!("索引目录路径非法: {e}")))?;
+            let entries = backend
+                .list(&remote)
+                .await
+                .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
+            report.calls += list_call_cost(entries.len());
+            report.deep_scanned += 1;
+            covered.insert(dir.clone());
+            let sub = self.ingest_dir_entries(root, &remote, entries)?;
+            report.added += sub.added;
+            report.changed += sub.changed;
+            let rel = self.relative_of(&remote);
+            let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen)?;
+            report.removed += removed;
+            report.remote_missing_marked += marked;
+        }
+        if let Some(cursor) = cursor {
+            self.db
+                .auto_state_set("deep_scan_cursor", &cursor)
+                .map_err(NativeSyncError::Message)?;
+        }
+        Ok(())
+    }
+
+    /// 目录 remote → 本地相对路径（scoped missing 的参数）；索引缺失时退化为路径本身。
+    fn relative_of(&self, remote: &RemotePath) -> String {
+        let trimmed = remote.as_str().trim_start_matches('/');
+        self.db
+            .relative_for_remote(trimmed)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| trimmed.to_string())
+    }
+
+    /// 单目录 scoped 远端删除对账：只处理该目录的**直接子项**。
+    /// 增量层绝不能按全树判 missing——未扫到的目录会被误判成远端删除。
+    fn scoped_missing(
+        &mut self,
+        root: &Path,
+        parent_relative: &str,
+        seen: &[u64],
+    ) -> Result<(u64, u64), NativeSyncError> {
+        let missing = self
+            .db
+            .missing_children_of(parent_relative, seen)
+            .map_err(NativeSyncError::Message)?;
+        self.apply_missing(root, missing)
+    }
+
     /// 用**磁盘真值**校正 `hydration_state`（面板必须与磁盘一致）。
     ///
     /// 水合/脱水都会被外部驱动（Explorer、平台后台、第三方程序），只在自家动作里写库就
@@ -882,6 +1277,8 @@ mod manager_tests {
     struct FakeBackend {
         listings: Mutex<HashMap<String, Vec<ResourceSnapshot>>>,
         fail_list: AtomicBool,
+        /// 记录每次 list 的目录（调用预算/游标断言用）。
+        list_calls: Mutex<Vec<String>>,
     }
     impl FakeBackend {
         fn replace(&self, entries: Vec<(&str, Vec<ResourceSnapshot>)>) {
@@ -912,6 +1309,10 @@ mod manager_tests {
             path: &'a RemotePath,
         ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>>
         {
+            self.list_calls
+                .lock()
+                .unwrap()
+                .push(path.as_str().to_string());
             let out = if self.fail_list.load(Ordering::SeqCst) {
                 Err(CloudError::unknown("list failed"))
             } else {
@@ -970,9 +1371,40 @@ mod manager_tests {
         let backend = Arc::new(FakeBackend {
             listings: Mutex::new(HashMap::new()),
             fail_list: AtomicBool::new(false),
+            list_calls: Mutex::new(Vec::new()),
         });
         backend.replace(entries);
         backend
+    }
+    /// 索引全量快照（干净树断言用；不含 auto_state —— 那本来就是会变的调度状态）。
+    fn dump_index(manager: &NativeSyncManager) -> Vec<String> {
+        let mut rows = Vec::new();
+        let mut st = manager
+            .db
+            .conn
+            .prepare(
+                "SELECT r.fs_id,r.remote_path,r.size,r.md5,r.modified_at,r.tombstone,l.relative_path,l.hydration_state FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id ORDER BY r.fs_id",
+            )
+            .unwrap();
+        let mapped = st
+            .query_map([], |r| {
+                Ok(format!(
+                    "{}|{}|{}|{:?}|{:?}|{}|{}|{}",
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?
+                ))
+            })
+            .unwrap();
+        for row in mapped {
+            rows.push(row.unwrap());
+        }
+        rows
     }
     fn record(fs_id: i64, relative: &str, md5: Option<&str>) -> EntryRecord {
         EntryRecord {
@@ -1433,6 +1865,385 @@ mod manager_tests {
             .iter()
             .any(|c| c == "mapping:docs/b.txt:/docs/b.txt:12"));
         assert!(calls.iter().any(|c| c.contains("b.txt")));
+    }
+
+    #[tokio::test]
+    async fn incremental_root_quick_check_detects_top_changes() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![(
+            "/",
+            vec![dir_snap("/docs", 10), file_snap("/a.txt", 11, Some("aaa"))],
+        )]);
+        manager.backend = Some(backend.clone());
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert!(report.calls >= 1, "根快查至少 1 次调用: {}", report.calls);
+        assert_eq!(report.added, 2);
+        assert_eq!(report.skipped, None);
+        assert!(!report.preempted);
+        // 与 sync_now 同一条 ingest 路径：占位符与映射已落。
+        let page = manager.list(None, None, 50).unwrap();
+        assert_eq!(page.total, 2);
+        // /docs 是新目录（可疑顶层）⇒ 被定向下钻一次；不变子树（无）不重复列。
+        let lists = backend.list_calls.lock().unwrap().clone();
+        assert_eq!(lists, vec!["/".to_string(), "/docs".to_string()]);
+        assert_eq!(report.drilled, 1);
+        // 成功层写回调度状态。
+        let status = manager.status().unwrap();
+        assert_eq!(status.auto_sync_state, "ok");
+        assert!(status.last_sync_at.is_some());
+        assert!(status.last_layer_at.is_some());
+        assert_eq!(status.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn incremental_drilldown_capped_at_4_and_counts_into_budget() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        // 6 个**新**顶层目录（prior_absent ⇒ 可疑），每个带一个子文件。
+        let mut root_listing = Vec::new();
+        let mut entries: Vec<(&str, Vec<ResourceSnapshot>)> = Vec::new();
+        let mut owned: Vec<(String, Vec<ResourceSnapshot>)> = Vec::new();
+        for i in 0..6 {
+            root_listing.push(dir_snap(&format!("/d{i}"), 100 + i));
+            owned.push((
+                format!("/d{i}"),
+                vec![file_snap(&format!("/d{i}/f.txt"), 200 + i, None)],
+            ));
+        }
+        for (k, v) in &owned {
+            entries.push((k.as_str(), v.clone()));
+        }
+        entries.insert(0, ("/", root_listing));
+        let backend = backend_with(entries);
+        manager.backend = Some(backend.clone());
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.drilled, 4, "定向下钻 ≤4（ADR-111 定稿）");
+        assert_eq!(report.deferred, 2, "其余 2 个推迟到下一层");
+        let lists = backend.list_calls.lock().unwrap().clone();
+        assert_eq!(
+            lists.len(),
+            1 + 4 + 2,
+            "根 1 + 钻 4 + 深扫 2（已钻目录跳过不重列）"
+        );
+        // 深扫游标跳过本层已钻的 /d0../d3，只列 /d4 /d5。
+        let deep: Vec<_> = lists[5..].to_vec();
+        assert_eq!(
+            deep,
+            vec!["/d4", "/d5"],
+            "深扫游标跳过本层已钻目录: {deep:?}"
+        );
+        assert_eq!(report.deep_scanned, 2);
+    }
+
+    #[tokio::test]
+    async fn incremental_budget_defers_overflow() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let entries = vec![
+            (
+                "/",
+                vec![
+                    dir_snap("/d0", 100),
+                    dir_snap("/d1", 101),
+                    dir_snap("/d2", 102),
+                ],
+            ),
+            ("/d0", vec![file_snap("/d0/f.txt", 200, None)]),
+        ];
+        let backend = backend_with(entries);
+        manager.backend = Some(backend.clone());
+        let params = AutoSyncParams {
+            layer_budget: 2,
+            ..Default::default()
+        };
+        let report = manager
+            .reconcile_incremental(&params, &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.drilled, 1, "预算 2 = 根 1 + 钻 1");
+        assert_eq!(report.deferred, 2);
+        assert_eq!(report.deep_scanned, 0, "预算耗尽不得再深扫");
+        assert!(report.calls <= 2);
+    }
+
+    #[tokio::test]
+    async fn incremental_deep_scan_cursor_round_robin_persists() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![
+            (
+                "/",
+                vec![
+                    dir_snap("/d1", 101),
+                    dir_snap("/d2", 102),
+                    dir_snap("/d3", 103),
+                ],
+            ),
+            ("/d1", vec![file_snap("/d1/a.txt", 201, None)]),
+            ("/d2", vec![file_snap("/d2/b.txt", 202, None)]),
+            ("/d3", vec![file_snap("/d3/c.txt", 203, None)]),
+        ]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        let params = AutoSyncParams {
+            deep_scan_batch: 2,
+            ..Default::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        // 第一层：扫 /d1 /d2，游标停在 /d2。
+        backend.list_calls.lock().unwrap().clear();
+        let r1 = manager
+            .reconcile_incremental(&params, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(r1.deep_scanned, 2);
+        assert_eq!(
+            manager
+                .db
+                .auto_state_get("deep_scan_cursor")
+                .unwrap()
+                .as_deref(),
+            Some("/d2")
+        );
+        // 第二层：/d3 扫完后回绕到 /d1（继续覆盖，不算错误）。
+        backend.list_calls.lock().unwrap().clear();
+        let r2 = manager
+            .reconcile_incremental(&params, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(r2.deep_scanned, 2);
+        let lists = backend.list_calls.lock().unwrap().clone();
+        let deep: Vec<_> = lists[1..].to_vec();
+        assert_eq!(deep, vec!["/d3", "/d1"], "游标回绕继续覆盖: {deep:?}");
+        assert_eq!(
+            manager
+                .db
+                .auto_state_get("deep_scan_cursor")
+                .unwrap()
+                .as_deref(),
+            Some("/d1")
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_scoped_missing_only_within_scanned_dir() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![
+            ("/", vec![dir_snap("/A", 101), dir_snap("/B", 102)]),
+            (
+                "/A",
+                vec![file_snap("/A/a1", 201, None), file_snap("/A/a2", 202, None)],
+            ),
+            ("/B", vec![file_snap("/B/b1", 203, None)]),
+        ]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // 云端删了 /A/a2；本层只深扫 /A（/B 未扫 ⇒ b1 绝不能被误判远端删除）。
+        backend.replace(vec![
+            ("/", vec![dir_snap("/A", 101), dir_snap("/B", 102)]),
+            ("/A", vec![file_snap("/A/a1", 201, None)]),
+            ("/B", vec![file_snap("/B/b1", 203, None)]),
+        ]);
+        let params = AutoSyncParams {
+            deep_scan_batch: 1,
+            ..Default::default()
+        };
+        let report = manager
+            .reconcile_incremental(&params, &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.deep_scanned, 1);
+        assert_eq!(report.removed, 1, "只移除 /A/a2: {report:?}");
+        let page_a = manager.list(Some("A".into()), None, 50).unwrap();
+        assert_eq!(page_a.total, 1);
+        assert_eq!(page_a.entries[0].name, "a1");
+        let page_b = manager.list(Some("B".into()), None, 50).unwrap();
+        assert_eq!(page_b.total, 1, "/B 未扫 ⇒ b1 必须原样保留");
+        assert_eq!(page_b.entries[0].name, "b1");
+    }
+
+    #[tokio::test]
+    async fn incremental_skips_when_disabled_or_paused() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, false, "disabled").unwrap();
+        let backend = backend_with(vec![]);
+        manager.backend = Some(backend.clone());
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.skipped, Some("disabled"));
+        assert!(backend.list_calls.lock().unwrap().is_empty());
+        // paused 同样跳过（不消耗后端调用）。
+        manager.db.set_root(&root, true, "connected").unwrap();
+        manager.db.auto_state_set("paused", "1").unwrap();
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.skipped, Some("paused"));
+        assert!(backend.list_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incremental_preempted_between_listings_is_not_failure() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![
+            ("/", vec![dir_snap("/d0", 100)]),
+            ("/d0", vec![file_snap("/d0/f.txt", 200, None)]),
+        ]);
+        manager.backend = Some(backend.clone());
+        let cancel = Arc::new(AtomicBool::new(true));
+        let report = manager
+            .reconcile_incremental(&AutoSyncParams::default(), &cancel)
+            .await
+            .unwrap();
+        assert!(report.preempted);
+        assert_eq!(report.drilled, 0, "抢占在目录列举边界生效");
+        // 抢占不算失败：不记连续失败、不暂停。
+        let status = manager.status().unwrap();
+        assert_eq!(status.consecutive_failures, 0);
+        assert_eq!(status.auto_sync_state, "ok");
+    }
+
+    #[tokio::test]
+    async fn incremental_clean_tree_writes_nothing() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![
+            (
+                "/",
+                vec![dir_snap("/docs", 10), file_snap("/a.txt", 11, Some("aaa"))],
+            ),
+            ("/docs", vec![file_snap("/docs/b.txt", 12, None)]),
+        ]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        let dump_before = dump_index(&manager);
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!((report.added, report.changed, report.removed), (0, 0, 0));
+        assert_eq!(
+            dump_index(&manager),
+            dump_before,
+            "干净树的增量层不得写索引"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_failures_backoff_then_pause_then_manual_resume() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![]);
+        backend.fail_list.store(true, Ordering::SeqCst);
+        manager.backend = Some(backend.clone());
+        let params = AutoSyncParams::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for expect in 1..=4u64 {
+            let err = manager
+                .reconcile_incremental(&params, &cancel)
+                .await
+                .unwrap_err();
+            let status = manager.status().unwrap();
+            assert_eq!(status.consecutive_failures, expect, "{err}");
+            assert_eq!(status.auto_sync_state, "backing_off");
+            assert!(status.last_error.is_some());
+        }
+        // 第 5 次失败 → paused；之后层直接 skipped，不再调用后端。
+        let _ = manager
+            .reconcile_incremental(&params, &cancel)
+            .await
+            .unwrap_err();
+        let status = manager.status().unwrap();
+        assert_eq!(status.auto_sync_state, "paused");
+        assert_eq!(status.consecutive_failures, 5);
+        backend.list_calls.lock().unwrap().clear();
+        let report = manager
+            .reconcile_incremental(&params, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(report.skipped, Some("paused"));
+        assert!(backend.list_calls.lock().unwrap().is_empty());
+        // 手动「立即对账」成功 ⇒ 恢复（ADR-111 §2.3）。
+        backend.fail_list.store(false, Ordering::SeqCst);
+        manager.sync_now().await.unwrap();
+        let status = manager.status().unwrap();
+        assert_eq!(status.auto_sync_state, "ok");
+        assert_eq!(status.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn list_call_cost_charges_pagination() {
+        assert_eq!(list_call_cost(0), 1);
+        assert_eq!(list_call_cost(999), 1);
+        assert_eq!(list_call_cost(1000), 2, "整页会多一次空页请求");
+        assert_eq!(list_call_cost(1001), 2);
+        assert_eq!(list_call_cost(2000), 3);
+    }
+
+    #[test]
+    fn remote_content_changed_md5_fallback_rules() {
+        // 无基线 ⇒ 变。
+        assert!(remote_content_changed(None, 5, &Some("a".into()), Some(1)));
+        // size 不同 ⇒ 变（其余相同也挡不住）。
+        assert!(remote_content_changed(
+            Some((3, Some("a".into()), Some(1))),
+            5,
+            &Some("a".into()),
+            Some(1)
+        ));
+        // 双侧 md5 ⇒ 比 md5（mtime 不同也不误判）。
+        assert!(!remote_content_changed(
+            Some((5, Some("a".into()), Some(1))),
+            5,
+            &Some("a".into()),
+            Some(2)
+        ));
+        assert!(remote_content_changed(
+            Some((5, Some("a".into()), Some(1))),
+            5,
+            &Some("b".into()),
+            Some(1)
+        ));
+        // 缺任一侧 md5 ⇒ 退化 mtime（ADR-111 定稿）。
+        assert!(!remote_content_changed(
+            Some((5, None, Some(1))),
+            5,
+            &Some("b".into()),
+            Some(1)
+        ));
+        assert!(remote_content_changed(
+            Some((5, None, Some(1))),
+            5,
+            &Some("b".into()),
+            Some(2)
+        ));
     }
 
     #[tokio::test]

@@ -48,6 +48,14 @@ pub struct AppState {
     pub status_item: Mutex<Option<MenuItem<Wry>>>,
     pub autostart_item: Mutex<Option<CheckMenuItem<Wry>>>,
     pub native_sync: tokio::sync::Mutex<Option<pandock_nativesync::NativeSyncManager>>,
+    /// 对账引擎串行锁：手动「立即对账」与自动层互斥（ADR-111 §2.4 单飞）。
+    pub native_sync_engine: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// 手动对账抢占自动层的取消标记（自动层在目录列举边界让位）。
+    pub auto_sync_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 调度器唤醒：开关切换/启用成功时立即重估，不必等满一个间隔。
+    pub auto_sync_wake: std::sync::Arc<tokio::sync::Notify>,
+    /// 已完成的手动对账轮数：排队中的 sync_now 发现它变化 ⇒ 合并不重跑（ADR-111 §2.4）。
+    pub native_sync_runs: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -576,11 +584,21 @@ fn save_config(app: AppHandle, mut config: Config) -> Result<(), String> {
         .lock()
         .unwrap()
         .native_sync_notifications;
+    let auto_before = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .native_sync_auto;
     app.state::<AppState>()
         .config
         .lock()
         .unwrap()
         .clone_from(&config);
+    if auto_before != config.native_sync_auto {
+        // 自动对账开关即时生效：唤醒调度器重估（ADR-111 §2.5 回滚路径）。
+        app.state::<AppState>().auto_sync_wake.notify_one();
+    }
     if notifications_before != config.native_sync_notifications {
         // 通知捕获开关是即时生效的：不必重启应用，也不影响已登记的同步根。
         if let Ok(mut guard) = app.state::<AppState>().native_sync.try_lock() {
@@ -1060,6 +1078,10 @@ pub fn run() {
             status_item: Mutex::new(None),
             autostart_item: Mutex::new(None),
             native_sync: tokio::sync::Mutex::new(None),
+            native_sync_engine: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            auto_sync_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            auto_sync_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            native_sync_runs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
         .setup(|app| {
             migrate_legacy_runtime(app.handle())?;
@@ -1204,6 +1226,8 @@ pub fn run() {
                             status.total_entries
                         );
                     }
+                    // 自动对账调度器（ADR-111）：幂等；循环自身按 enabled/config/暂停门控。
+                    crate::native_sync::spawn_auto_sync(&autostart_app);
                 });
             }
             {

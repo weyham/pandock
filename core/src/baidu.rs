@@ -59,6 +59,10 @@ pub struct ListResponse {
     pub list: Vec<FileEntry>,
 }
 
+/// `method=list` 的固定分页大小。NativeSync 自动对账按它把一次目录列举折算成实际 HTTP
+/// 调用数（`count / LIST_PAGE_SIZE + 1`），计入每层配额预算——改动它必须同步 nativesync 的折算逻辑。
+pub const LIST_PAGE_SIZE: usize = 1000;
+
 impl BaiduClient {
     pub fn new(app_key: String, app_secret: String, app_name: String, token: String) -> Self {
         Self {
@@ -236,7 +240,7 @@ impl BaiduClient {
         let dir = self.remote_path(dav_path)?;
         let mut all = Vec::new();
         let mut start = 0usize;
-        const PAGE_SIZE: usize = 1000;
+        const PAGE_SIZE: usize = LIST_PAGE_SIZE;
         loop {
             let query = vec![
                 ("method", "list".to_string()),
