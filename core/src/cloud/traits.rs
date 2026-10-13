@@ -258,7 +258,13 @@ impl CloudFs for BaiduCloudFs {
             let mut snapshots = Vec::with_capacity(outcomes.len());
             for outcome in outcomes {
                 if let crate::baidu::MetaOutcome::Hit(entry) = outcome {
-                    let remote = RemotePath::parse(&entry.path)
+                    // entry.path 是含 /apps/<APP_NAME>/ 前缀的百度全路径：
+                    // 剥回 DAV 相对路径，否则存活判定与候选（DAV 相对路径）永远错配。
+                    let dav = self
+                        .client
+                        .dav_path_from_remote(&entry.path)
+                        .map_err(CloudError::unknown)?;
+                    let remote = RemotePath::parse(&dav)
                         .map_err(|e| CloudError::unknown(format!("百度返回非法路径: {e}")))?;
                     snapshots.push(self.convert_entry(remote, entry));
                 }
@@ -318,6 +324,43 @@ mod tests {
             BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
                 .with_base_urls(&server.uri()),
         )
+    }
+
+    #[tokio::test]
+    async fn stats_strips_app_prefix_to_dav_relative_paths() {
+        // 生产实锤（2026-10-14）：filemetas 返回含 /apps/<APP>/ 前缀的全路径，
+        // stats() 必须剥回 DAV 相对路径，否则存活判定永远错配。
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "filemetas"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 0,
+                "info": [
+                    {"server_filename":"a.txt","path":"/apps/Demo/sub/a.txt","fs_id":7,"size":5,"isdir":0,"server_mtime":1700000000,"errno":0}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = std::sync::Arc::new(
+            crate::baidu::BaiduClient::new(
+                "key".into(),
+                "secret".into(),
+                "Demo".into(),
+                "token".into(),
+            )
+            .with_base_urls(&server.uri()),
+        );
+        let fs = BaiduCloudFs::new(client);
+        let paths = vec![RemotePath::parse("/sub/a.txt").unwrap()];
+        let snapshots = fs.stats(&paths).await.unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].path.as_str(),
+            "/sub/a.txt",
+            "必须是 DAV 相对路径"
+        );
+        assert_eq!(snapshots[0].fs_id, Some(7));
     }
 
     #[tokio::test]

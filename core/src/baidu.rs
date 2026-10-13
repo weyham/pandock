@@ -104,6 +104,18 @@ impl BaiduClient {
         self
     }
 
+    /// `remote_path` 的逆运算：把百度全路径（`/apps/<APP_NAME>/x/y`）剥回 DAV 相对路径。
+    /// filemetas 返回的 `entry.path` 是全路径——批量 stat 的存活判定按路径比对，
+    /// 不剥前缀会导致 alive 与候选永远错配（2026-10-14 生产实锤：stat 确认整体反相，
+    /// 云端存在的本地编辑文件被 missing 流程误删）。
+    pub fn dav_path_from_remote(&self, full_path: &str) -> Result<String, String> {
+        let prefix = format!("/apps/{}/", self.app_name);
+        full_path
+            .strip_prefix(&prefix)
+            .map(|rest| format!("/{rest}"))
+            .ok_or_else(|| format!("百度返回了应用目录外的路径: {full_path}"))
+    }
+
     pub fn remote_path(&self, dav_path: &str) -> Result<String, String> {
         let path = dav_path.trim_matches('/');
         if path.split('/').any(|part| part == ".." || part.is_empty()) && !path.is_empty() {

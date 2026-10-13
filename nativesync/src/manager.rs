@@ -619,6 +619,22 @@ impl NativeSyncManager {
                 );
                 continue;
             }
+            // pending upload 条目豁免 missing（与 H1 保留基线同原则）：
+            // 本地有待传编辑 ⇒ 不做 missing 处理——否则云端一动（含 fs_id 轮换），
+            // 本地未上传的编辑会被 missing 流程物理删除（2026-10-14 C4 实锤）。
+            if self
+                .db
+                .pending_op_of(row.0 as i64)
+                .map_err(NativeSyncError::Message)?
+                .as_deref()
+                == Some("upload")
+            {
+                log::info!(
+                    "native-sync missing skip: pending upload entry kept fs_id={}",
+                    row.0
+                );
+                continue;
+            }
             candidates.push(row);
         }
         // ② 异常闸门。
@@ -2276,6 +2292,8 @@ mod manager_tests {
         renames: Mutex<Vec<(String, String)>>,
         created_dirs: Mutex<Vec<String>>,
         /// 批量 stat 的独立视图（模拟「listing 滞后但 stat 新鲜」，默认空 = 查无）。
+        /// **生产形态**：键与快照 path 都是含 `/apps/CloudDock/` 前缀的百度全路径——
+        /// fake 的输出形态必须与 filemetas 一致（否则形态错配在 fake 层永远抓不到）。
         stat_listings: Mutex<HashMap<String, ResourceSnapshot>>,
         /// 批量 stat 调用记录（每次调用的路径数）。
         stats_calls: Mutex<Vec<usize>>,
@@ -2396,16 +2414,22 @@ mod manager_tests {
         ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>>
         {
             self.stats_calls.lock().unwrap().push(paths.len());
-            let found: Vec<ResourceSnapshot> = paths
-                .iter()
-                .filter_map(|path| {
-                    self.stat_listings
-                        .lock()
-                        .unwrap()
-                        .get(path.as_str())
-                        .cloned()
-                })
-                .collect();
+            // 与 BaiduCloudFs::stats 的归一化**同语义**：查询用 DAV 相对路径补全为
+            // 百度全路径去查（filemetas 形态），返回前再剥回 DAV 相对路径。
+            let found: Vec<ResourceSnapshot> = {
+                let map = self.stat_listings.lock().unwrap();
+                paths
+                    .iter()
+                    .filter_map(|path| {
+                        let full = format!("/apps/CloudDock{}", path.as_str());
+                        map.get(&full).map(|snap| {
+                            let mut snap = snap.clone();
+                            snap.path = path.clone();
+                            snap
+                        })
+                    })
+                    .collect()
+            };
             async move { Ok(found) }.boxed()
         }
         fn create_dir<'a>(
@@ -4217,11 +4241,10 @@ mod manager_tests {
         manager.sync_now().await.unwrap();
         // listing 滞后：a.txt 从 listing 消失；但 stat（新鲜路径）确认它还在。
         backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
-        backend
-            .stat_listings
-            .lock()
-            .unwrap()
-            .insert("/a.txt".to_string(), file_snap("/a.txt", 11, Some("aaa")));
+        backend.stat_listings.lock().unwrap().insert(
+            "/apps/CloudDock/a.txt".to_string(),
+            file_snap("/apps/CloudDock/a.txt", 11, Some("aaa")),
+        );
         let report = manager
             .reconcile_incremental(
                 &AutoSyncParams::default(),
@@ -4259,8 +4282,8 @@ mod manager_tests {
         // listing 滞后：a.txt 消失；stat 命中**同路径但 fs_id 已被轮换**（999 ≠ 11）。
         backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
         backend.stat_listings.lock().unwrap().insert(
-            "/a.txt".to_string(),
-            file_snap("/a.txt", 999, Some("rotated")),
+            "/apps/CloudDock/a.txt".to_string(),
+            file_snap("/apps/CloudDock/a.txt", 999, Some("rotated")),
         );
         let report = manager
             .reconcile_incremental(
@@ -4704,6 +4727,48 @@ mod manager_tests {
             vec!["f.txt".to_string(), "B".to_string(), "A".to_string()],
             "必须先删子项再删父目录（深度降序）: {removes:?}"
         );
+    }
+
+    /// pending upload 条目豁免 missing（C4 实锤形态）：本地有待传编辑 ⇒
+    /// 不进 missing 候选、不 tombstone、不删本地文件、pending 保留。
+    #[tokio::test]
+    async fn missing_candidate_with_pending_upload_is_exempted() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        std::fs::write(root.join("a.txt"), b"mine!").unwrap();
+        make_pending_old(&manager, 11, "upload");
+        // listing 滞后（a.txt 消失）：若无豁免，pending upload 的行会被 tombstone + 误删。
+        backend.replace(vec![("/", vec![])]);
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.removed, 0,
+            "pending upload 必须豁免 missing: {report:?}"
+        );
+        let tomb: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT tombstone FROM remote_entry WHERE fs_id=11",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tomb, 0, "不得 tombstone");
+        assert_eq!(
+            manager.db.pending_op_of(11).unwrap().as_deref(),
+            Some("upload"),
+            "pending 必须保留给 worker"
+        );
+        assert!(root.join("a.txt").exists(), "本地编辑文件不得被删");
     }
 
     #[tokio::test]

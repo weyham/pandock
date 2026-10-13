@@ -207,3 +207,14 @@ CF 通知是**占位符作用域**的，`CF_CALLBACK_TYPE` 无 CREATE 类通知�
 `rapid_hint`/`UploadFailure` 管线整体退役；§3.3 原「秒传假冲突守卫」由上文 B 的
 「rtype 分流 + stat 比对」主路径取代。验收轮 ②（WebDAV 双 PUT）结论降级为
 「同内容重传在两种语义下都通过」，不再作为秒传证据引用。
+
+### D. pending upload 条目豁免 missing 候选（2026-10-14 追加，含偏差说明）
+
+生产实锤（C4）：本地编辑已捕获（pending upload）后，云端经 WebDAV 并发改（fs_id 轮换）
+⇒ 该条目同时成为 missing 候选 ⇒ missing 流程把**本地未上传的编辑文件物理删除**（编辑两失）。
+⇒ `apply_missing` 对 `pending_op='upload'` 的条目**豁免**（与 H1 保留基线同一原则：
+pending 条目不做 missing 处理）。
+**偏差说明（如实）**：豁免后，「云端删除 vs 本地待传编辑」的相遇点移到上传时——
+届时路径已不在云端，rtype=0 的 create 会**以原路径重建**（编辑胜出、原地复活），
+与 §3.3「改名保留」的字面有偏差，但与 OneDrive 实际语义一致
+（有本地未同步修改的文件不会被远端删除带走）。
