@@ -818,10 +818,31 @@ fn spawn_auth_wait(
 
                 match start_webdav_and_report(&app).await {
                     Ok(()) => {
-                        let state = app.state::<AppState>();
-                        let mut auth = state.auth.lock().unwrap();
-                        auth.connected(now_secs());
-                        emit_auth_state(&app, &auth);
+                        {
+                            let state = app.state::<AppState>();
+                            let mut auth = state.auth.lock().unwrap();
+                            auth.connected(now_secs());
+                            emit_auth_state(&app, &auth);
+                        } // auth guard 在此析构（不得在 await 间存活）
+                          // 交互式授权成功 ⇒ 自动对账恢复信号（对齐 autostart reconnect 挂点）：
+                          // 否则暂停/退避中的调度循环会睡满计时才恢复（2026-10-14 实测：
+                          // 重新授权后层是退避自然到点才跑的，不是被授权事件唤醒的）。
+                        {
+                            let state = app.state::<AppState>();
+                            let mut guard = state.native_sync.lock().await;
+                            if let Some(manager) = guard.as_mut() {
+                                // reconnect_from_db 内含 clear_auto_failures（清暂停/退避）。
+                                match manager.reconnect_from_db() {
+                                    Ok(_) => log::info!(
+                                        "native-sync reconnect after interactive auth: ok"
+                                    ),
+                                    Err(error) => log::warn!(
+                                        "native-sync reconnect after interactive auth failed: {error}"
+                                    ),
+                                }
+                            }
+                        }
+                        app.state::<AppState>().auto_sync_wake.notify_one();
                     }
                     Err(error) => {
                         fail_auth(
