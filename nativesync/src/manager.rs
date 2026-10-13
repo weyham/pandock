@@ -613,7 +613,12 @@ impl NativeSyncManager {
             return Ok((0, 0));
         }
         // ③ 批量 stat 确认（一次 filemetas 调用）。
-        let mut alive: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // 存活判定**按路径**，绝不按 fs_id：覆盖/替换会轮换 fs_id（2026-10-13 实测
+        // rtype=3 覆盖产生新 fs_id）——若按 fs_id 比对，外部「替换式保存」后的新文件
+        // 会被误判查无，占位符照删不误（正是本守卫要防的误删）。
+        let mut alive: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut candidate_remotes: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
         if !candidates.is_empty() {
             let mut paths = Vec::with_capacity(candidates.len());
             for (fs_id, _, _, _) in &candidates {
@@ -622,6 +627,7 @@ impl NativeSyncManager {
                     .remote_path_by_fs_id(*fs_id as i64)
                     .map_err(NativeSyncError::Message)?
                     .ok_or_else(|| NativeSyncError::Message("missing 候选缺 remote_path".into()))?;
+                candidate_remotes.insert(*fs_id, remote.clone());
                 paths.push(
                     RemotePath::parse(&remote)
                         .map_err(|e| NativeSyncError::Message(format!("remote_path 非法: {e}")))?,
@@ -632,16 +638,15 @@ impl NativeSyncManager {
                 .await
                 .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
             for snapshot in &hits {
-                if let Some(fs_id) = snapshot.fs_id {
-                    alive.insert(fs_id);
-                }
+                alive.insert(snapshot.path.as_str().to_string());
             }
         }
         let mut tombstoned = 0u64;
         let mut preserved = 0u64;
         let mut stale_kept = 0u64;
         for (fs_id, relative, state, is_dir) in candidates {
-            if alive.contains(&fs_id) {
+            let remote_key = candidate_remotes.get(&fs_id).cloned().unwrap_or_default();
+            if !remote_key.is_empty() && alive.contains(&remote_key) {
                 stale_kept += 1;
                 continue;
             }
@@ -4117,6 +4122,42 @@ mod manager_tests {
         );
         let (_, state, ..) = manager.db.entry_by_relative("a.txt").unwrap().unwrap();
         assert_eq!(state, "online_only", "a.txt 状态不受陈旧 listing 影响");
+    }
+
+    /// stat 确认必须按**路径**判存活：覆盖/替换会轮换 fs_id（实测），
+    /// 同路径不同 fs_id 的命中照样算存活——否则外部「替换式保存」会把我们的
+    /// 占位符从 fs_id 侧门误删掉。
+    #[tokio::test]
+    async fn missing_confirm_matches_by_path_not_fs_id() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![(
+            "/",
+            vec![
+                file_snap("/a.txt", 11, Some("aaa")),
+                file_snap("/b.txt", 12, Some("bbb")),
+            ],
+        )]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // listing 滞后：a.txt 消失；stat 命中**同路径但 fs_id 已被轮换**（999 ≠ 11）。
+        backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
+        backend.stat_listings.lock().unwrap().insert(
+            "/a.txt".to_string(),
+            file_snap("/a.txt", 999, Some("rotated")),
+        );
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.removed, 0,
+            "fs_id 已轮换但路径存活 ⇒ 不得删除: {report:?}"
+        );
+        assert_eq!(tombstone_of(&manager, 11), 0, "a.txt 不得 tombstone");
     }
 
     #[tokio::test]
