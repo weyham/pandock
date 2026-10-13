@@ -34,10 +34,7 @@ pub trait CloudFs: Send + Sync {
     /// 批量 stat（陈旧 listing 守卫）：list 管广度、stat 管生杀。
     /// 返回命中项（每项 path 可归属）；未命中（查无）的路径不在返回里。
     /// 默认未实现（Unsupported）；BaiduCloudFs 覆盖。Additive。
-    fn stats<'a>(
-        &'a self,
-        paths: &'a [RemotePath],
-    ) -> CloudFuture<'a, Vec<ResourceSnapshot>> {
+    fn stats<'a>(&'a self, paths: &'a [RemotePath]) -> CloudFuture<'a, Vec<ResourceSnapshot>> {
         let _ = paths;
         Box::pin(async move { Err(CloudError::unsupported("stats 未实现")) })
     }
@@ -249,15 +246,10 @@ impl CloudFs for BaiduCloudFs {
         }
         .boxed()
     }
-    fn stats<'a>(
-        &'a self,
-        paths: &'a [RemotePath],
-    ) -> CloudFuture<'a, Vec<ResourceSnapshot>> {
+    fn stats<'a>(&'a self, paths: &'a [RemotePath]) -> CloudFuture<'a, Vec<ResourceSnapshot>> {
         async move {
-            let dav_paths: Vec<String> = paths
-                .iter()
-                .map(|path| path.as_str().to_string())
-                .collect();
+            let dav_paths: Vec<String> =
+                paths.iter().map(|path| path.as_str().to_string()).collect();
             let entries = self
                 .client
                 .metas(&dav_paths)

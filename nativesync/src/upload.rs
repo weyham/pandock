@@ -81,9 +81,7 @@ pub fn device_name() -> String {
 #[cfg(windows)]
 fn windows_computer_name() -> Option<String> {
     use windows::core::PWSTR;
-    use windows::Win32::System::SystemInformation::{
-        GetComputerNameExW, COMPUTER_NAME_FORMAT,
-    };
+    use windows::Win32::System::SystemInformation::{GetComputerNameExW, COMPUTER_NAME_FORMAT};
     let mut buffer = [0u16; 256];
     let mut length = buffer.len() as u32;
     unsafe {
@@ -177,7 +175,8 @@ mod tests {
         // 生产上回退成 "device" 的根源）——所以这里只能断言「取到了合法的真实名字」，
         // 不能拿环境变量做期望值。
         assert!(
-            name.chars().all(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')),
+            name.chars()
+                .all(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')),
             "计算机名不得含 Windows 非法字符: {name}"
         );
     }

@@ -621,9 +621,7 @@ impl NativeSyncManager {
                     .db
                     .remote_path_by_fs_id(*fs_id as i64)
                     .map_err(NativeSyncError::Message)?
-                    .ok_or_else(|| {
-                        NativeSyncError::Message("missing 候选缺 remote_path".into())
-                    })?;
+                    .ok_or_else(|| NativeSyncError::Message("missing 候选缺 remote_path".into()))?;
                 paths.push(
                     RemotePath::parse(&remote)
                         .map_err(|e| NativeSyncError::Message(format!("remote_path 非法: {e}")))?,
@@ -815,7 +813,9 @@ impl NativeSyncManager {
         let outcome = self.ingest_dir_entries(root, &root_remote, entries)?;
         report.added += outcome.added;
         report.changed += outcome.changed;
-        let (removed, marked) = self.scoped_missing(root, "", &outcome.seen, backend).await?;
+        let (removed, marked) = self
+            .scoped_missing(root, "", &outcome.seen, backend)
+            .await?;
         report.removed += removed;
         report.remote_missing_marked += marked;
         // 本层已覆盖的目录（定向下钻/深扫），游标走位时跳过不重列。
@@ -1632,11 +1632,7 @@ impl NativeSyncManager {
                 continue; // 已捕获，不重复记账（与 close-completion 路径同原则）。
             }
             if hydration_state == "online_only"
-                && self
-                    .platform
-                    .on_disk_data_size(&entry.path())
-                    .unwrap_or(0)
-                    <= 0
+                && self.platform.on_disk_data_size(&entry.path()).unwrap_or(0) <= 0
             {
                 // 未动占位符 ⇒ 跳过。**绝不读内容**（on_disk_data_size 是只读占位符
                 // 信息，不触发水合）——扫描器不得自己变成水合器，否则每层把全部
@@ -2307,14 +2303,18 @@ mod manager_tests {
         fn stats<'a>(
             &'a self,
             paths: &'a [RemotePath],
-        ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>> {
-            self.stats_calls
-                .lock()
-                .unwrap()
-                .push(paths.len());
+        ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>>
+        {
+            self.stats_calls.lock().unwrap().push(paths.len());
             let found: Vec<ResourceSnapshot> = paths
                 .iter()
-                .filter_map(|path| self.stat_listings.lock().unwrap().get(path.as_str()).cloned())
+                .filter_map(|path| {
+                    self.stat_listings
+                        .lock()
+                        .unwrap()
+                        .get(path.as_str())
+                        .cloned()
+                })
                 .collect();
             async move { Ok(found) }.boxed()
         }
@@ -4087,7 +4087,10 @@ mod manager_tests {
         manager.db.set_root(&root, true, "connected").unwrap();
         let backend = backend_with(vec![(
             "/",
-            vec![file_snap("/a.txt", 11, Some("aaa")), file_snap("/b.txt", 12, Some("bbb"))],
+            vec![
+                file_snap("/a.txt", 11, Some("aaa")),
+                file_snap("/b.txt", 12, Some("bbb")),
+            ],
         )]);
         manager.backend = Some(backend.clone());
         manager.sync_now().await.unwrap();
@@ -4099,12 +4102,19 @@ mod manager_tests {
             .unwrap()
             .insert("/a.txt".to_string(), file_snap("/a.txt", 11, Some("aaa")));
         let report = manager
-            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
             .await
             .unwrap();
         assert_eq!(report.removed, 0, "stat 确认存活 ⇒ 不得删除: {report:?}");
         assert_eq!(tombstone_of(&manager, 11), 0, "a.txt 不得 tombstone");
-        assert_eq!(backend.stats_calls.lock().unwrap().as_slice(), &[1], "批量 stat 恰好一次");
+        assert_eq!(
+            backend.stats_calls.lock().unwrap().as_slice(),
+            &[1],
+            "批量 stat 恰好一次"
+        );
         let (_, state, ..) = manager.db.entry_by_relative("a.txt").unwrap().unwrap();
         assert_eq!(state, "online_only", "a.txt 状态不受陈旧 listing 影响");
     }
@@ -4115,14 +4125,20 @@ mod manager_tests {
         manager.db.set_root(&root, true, "connected").unwrap();
         let backend = backend_with(vec![(
             "/",
-            vec![file_snap("/a.txt", 11, Some("aaa")), file_snap("/b.txt", 12, Some("bbb"))],
+            vec![
+                file_snap("/a.txt", 11, Some("aaa")),
+                file_snap("/b.txt", 12, Some("bbb")),
+            ],
         )]);
         manager.backend = Some(backend.clone());
         manager.sync_now().await.unwrap();
         // stat 也查无（stat_listings 默认空）⇒ 真删除，照原流程 tombstone + 移除占位符。
         backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
         let report = manager
-            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
             .await
             .unwrap();
         assert_eq!(report.removed, 1);
@@ -4137,7 +4153,10 @@ mod manager_tests {
         manager.db.set_root(&root, true, "connected").unwrap();
         let backend = backend_with(vec![(
             "/",
-            vec![file_snap("/a.txt", 11, Some("aaa")), file_snap("/b.txt", 12, Some("bbb"))],
+            vec![
+                file_snap("/a.txt", 11, Some("aaa")),
+                file_snap("/b.txt", 12, Some("bbb")),
+            ],
         )]);
         manager.backend = Some(backend.clone());
         manager.sync_now().await.unwrap();
@@ -4145,7 +4164,10 @@ mod manager_tests {
         manager.db.mark_uploaded(11).unwrap();
         backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
         let report = manager
-            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
             .await
             .unwrap();
         assert_eq!(report.removed, 0);
@@ -4170,11 +4192,17 @@ mod manager_tests {
         // 51 个候选（>50 闸门）⇒ 不是滞后是事故：本层不做任何 missing 动作、不打 API。
         backend.replace(vec![("/", vec![])]);
         let report = manager
-            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
             .await
             .unwrap();
         assert_eq!(report.removed, 0, "闸门触发 ⇒ 零删除: {report:?}");
-        assert!(backend.stats_calls.lock().unwrap().is_empty(), "闸门触发 ⇒ 零 stat 调用");
+        assert!(
+            backend.stats_calls.lock().unwrap().is_empty(),
+            "闸门触发 ⇒ 零 stat 调用"
+        );
         assert_eq!(tombstone_of(&manager, 1000), 0);
     }
 
@@ -4190,9 +4218,15 @@ mod manager_tests {
         // 本地编辑已捕获（pending upload）；期间云端被别人改成 v2changed。
         std::fs::write(root.join("a.txt"), b"mine!").unwrap();
         make_pending_old(&manager, 11, "upload");
-        backend.replace(vec![("/", vec![file_snap("/a.txt", 11, Some("v2changed"))])]);
+        backend.replace(vec![(
+            "/",
+            vec![file_snap("/a.txt", 11, Some("v2changed"))],
+        )]);
         let report = manager
-            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
             .await
             .unwrap();
         let (_, baseline_md5, _) = manager.db.remote_meta_by_fs_id(11).unwrap().unwrap();
@@ -4237,10 +4271,10 @@ mod manager_tests {
         manager.sync_now().await.unwrap();
         // 用户编辑了 online_only 占位符：磁盘有内容（on_disk>0）且与远端不同。
         std::fs::write(root.join("a.txt"), b"world!!").unwrap();
-        on_disk.lock().unwrap().insert(
-            root.join("a.txt").to_string_lossy().to_string(),
-            38,
-        );
+        on_disk
+            .lock()
+            .unwrap()
+            .insert(root.join("a.txt").to_string_lossy().to_string(), 38);
         let mut report = AutoLayerReport::default();
         manager.scan_local_dir(&root, "", &mut report).unwrap();
         assert_eq!(report.local_edited, 1, "online_only 起点的真编辑必须被捕获");
@@ -4249,7 +4283,10 @@ mod manager_tests {
             Some("upload")
         );
         let calls = calls.lock().unwrap();
-        assert!(calls.iter().any(|c| c.starts_with("mark_not_in_sync:")), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c.starts_with("mark_not_in_sync:")),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test]
@@ -4259,15 +4296,19 @@ mod manager_tests {
         // 远端内容 = md5("hello")：召回读取产生的一致内容 ⇒ 只更新基线（读≠改保持）。
         let backend = backend_with(vec![(
             "/",
-            vec![file_snap("/a.txt", 11, Some("5d41402abc4b2a76b9719d911017c592"))],
+            vec![file_snap(
+                "/a.txt",
+                11,
+                Some("5d41402abc4b2a76b9719d911017c592"),
+            )],
         )]);
         manager.backend = Some(backend);
         manager.sync_now().await.unwrap();
         std::fs::write(root.join("a.txt"), b"hello").unwrap();
-        on_disk.lock().unwrap().insert(
-            root.join("a.txt").to_string_lossy().to_string(),
-            5,
-        );
+        on_disk
+            .lock()
+            .unwrap()
+            .insert(root.join("a.txt").to_string_lossy().to_string(), 5);
         let mut report = AutoLayerReport::default();
         manager.scan_local_dir(&root, "", &mut report).unwrap();
         assert_eq!(report.local_edited, 0, "召回未改 ⇒ 不算编辑");

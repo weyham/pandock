@@ -186,7 +186,8 @@ mod tests {
         fn stats<'a>(
             &'a self,
             _: &'a [RemotePath],
-        ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>> {
+        ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>>
+        {
             async move { Ok(vec![]) }.boxed()
         }
         fn create_dir<'a>(
