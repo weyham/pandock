@@ -1715,14 +1715,16 @@ impl NativeSyncManager {
             if local_only {
                 continue; // 已捕获，不重复记账（与 close-completion 路径同原则）。
             }
-            if hydration_state == "online_only"
-                && self.platform.on_disk_data_size(&entry.path()).unwrap_or(0) <= 0
+            if hydration_state == "online_only" && self.platform.is_cloud_placeholder(&entry.path())
             {
-                // 未动占位符 ⇒ 跳过。**绝不读内容**（on_disk_data_size 是只读占位符
-                // 信息，不触发水合）——扫描器不得自己变成水合器，否则每层把全部
-                // 占位符召回一遍。on_disk>0（被召回/被编辑）⇒ 落到下方共用判定：
-                // 召回读取的内容与远端一致 ⇒ md5 漏斗放行只更新基线（读≠改）；
-                // 真编辑 ⇒ pending upload。
+                // 未动占位符（RECALL 属性在）⇒ 跳过。**绝不读内容**（读属性不触发召回，
+                // 扫描器不得自己变成水合器）。召回/编辑过的文件（RECALL 属性已清）⇒
+                // 落到下方共用判定：与远端一致 ⇒ md5 漏斗放行只更新基线（读≠改）；
+                // 不一致 ⇒ pending upload。
+                // 【2026-10-14 生产实锤】曾用 `on_disk_data_size()==0` 做判据（终审裁决版），
+                // 但 recall+write 后的第三形态（有 reparse 点、无 RECALL 属性）使
+                // CfGetPlaceholderInfo 返回 hr=0x80070178 ⇒ 探针失败被当成"未动占位符"
+                // ⇒ 编辑漏捕并被 ingest 当水合吸收——该判据对主场景从未生效过。
                 continue;
             }
             if meta.is_dir() {
@@ -2564,6 +2566,36 @@ mod manager_tests {
             notifications_enabled: true,
         };
         (dir, root, calls, manager, on_disk)
+    }
+    /// 同 `setup_with_disk`，但额外交回占位符集合句柄——用例据此模拟
+    /// 「recall+write 后 RECALL 属性已清」的生产形态（从集合移除路径）。
+    #[allow(clippy::type_complexity)]
+    fn setup_with_handles() -> (
+        TempDir,
+        PathBuf,
+        Calls,
+        NativeSyncManager,
+        DiskTruth,
+        Arc<Mutex<std::collections::HashSet<String>>>,
+    ) {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let on_disk = Arc::new(Mutex::new(HashMap::new()));
+        let placeholder_paths = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let manager = NativeSyncManager {
+            db: IndexDb::open(dir.path()).unwrap(),
+            backend: None,
+            platform: Box::new(FakePlatform {
+                calls: calls.clone(),
+                on_disk: on_disk.clone(),
+                placeholder_paths: placeholder_paths.clone(),
+            }),
+            notifications_config: true,
+            notifications_enabled: true,
+        };
+        (dir, root, calls, manager, on_disk, placeholder_paths)
     }
     fn set_on_disk(on_disk: &DiskTruth, path: &Path, bytes: i64) {
         on_disk
@@ -4389,17 +4421,19 @@ mod manager_tests {
 
     #[tokio::test]
     async fn local_scan_online_only_edited_is_captured() {
-        let (_dir, root, calls, mut manager, on_disk) = setup_with_disk();
+        let (_dir, root, calls, mut manager, _on_disk, placeholder_paths) = setup_with_handles();
         manager.db.set_root(&root, true, "connected").unwrap();
         let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
         manager.backend = Some(backend);
         manager.sync_now().await.unwrap();
-        // 用户编辑了 online_only 占位符：磁盘有内容（on_disk>0）且与远端不同。
+        // 用户编辑了 online_only 占位符（recall+write 形态：RECALL 属性已清——
+        // 从占位符集合移除来模拟。生产的 CfGetPlaceholderInfo 此刻会 hr=0x80070178，
+        // 旧的 on_disk 判据必然漏捕；属性判据必须捕获）。
         std::fs::write(root.join("a.txt"), b"world!!").unwrap();
-        on_disk
+        placeholder_paths
             .lock()
             .unwrap()
-            .insert(root.join("a.txt").to_string_lossy().to_string(), 38);
+            .remove(&root.join("a.txt").to_string_lossy().to_string());
         let mut report = AutoLayerReport::default();
         manager.scan_local_dir(&root, "", &mut report).unwrap();
         assert_eq!(report.local_edited, 1, "online_only 起点的真编辑必须被捕获");
@@ -4416,7 +4450,7 @@ mod manager_tests {
 
     #[tokio::test]
     async fn local_scan_recalled_read_only_updates_baseline_without_pending() {
-        let (_dir, root, _calls, mut manager, on_disk) = setup_with_disk();
+        let (_dir, root, _calls, mut manager, _on_disk, placeholder_paths) = setup_with_handles();
         manager.db.set_root(&root, true, "connected").unwrap();
         // 远端内容 = md5("hello")：召回读取产生的一致内容 ⇒ 只更新基线（读≠改保持）。
         let backend = backend_with(vec![(
@@ -4430,10 +4464,11 @@ mod manager_tests {
         manager.backend = Some(backend);
         manager.sync_now().await.unwrap();
         std::fs::write(root.join("a.txt"), b"hello").unwrap();
-        on_disk
+        // 召回读取后的形态（RECALL 属性已清，内容未改）：
+        placeholder_paths
             .lock()
             .unwrap()
-            .insert(root.join("a.txt").to_string_lossy().to_string(), 5);
+            .remove(&root.join("a.txt").to_string_lossy().to_string());
         let mut report = AutoLayerReport::default();
         manager.scan_local_dir(&root, "", &mut report).unwrap();
         assert_eq!(report.local_edited, 0, "召回未改 ⇒ 不算编辑");
