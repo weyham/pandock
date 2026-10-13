@@ -43,6 +43,10 @@ pub struct AutoLayerReport {
     pub remote_missing_marked: u64,
     pub drilled: u32,
     pub deep_scanned: u32,
+    /// 本地侧对账（Gap A/B/C 捕获）：本层新发现的本地新建条数。
+    pub local_new: u32,
+    /// 本地侧对账：本层新发现的本地编辑条数（md5 漏斗判定为真改动）。
+    pub local_edited: u32,
     /// 因预算/上限被推迟到下一层的目录数。
     pub deferred: u32,
     /// 未执行的原因（no_root / disabled / paused）；None = 执行了。
@@ -681,9 +685,10 @@ impl NativeSyncManager {
                     .note_auto_success(true)
                     .map_err(NativeSyncError::Message)?;
                 log::info!(
-                    "native-sync auto layer run={run_id} ok calls={} added={} changed={} removed={} missing_marked={} drilled={} deep={} deferred={} dirs={dir_total}",
+                    "native-sync auto layer run={run_id} ok calls={} added={} changed={} removed={} missing_marked={} drilled={} deep={} deferred={} dirs={dir_total} local_new={} local_edited={}",
                     report.calls, report.added, report.changed, report.removed,
-                    report.remote_missing_marked, report.drilled, report.deep_scanned, report.deferred
+                    report.remote_missing_marked, report.drilled, report.deep_scanned, report.deferred,
+                    report.local_new, report.local_edited
                 );
             }
             Err(error) => {
@@ -723,6 +728,8 @@ impl NativeSyncManager {
         let (removed, marked) = self.scoped_missing(root, "", &outcome.seen)?;
         report.removed += removed;
         report.remote_missing_marked += marked;
+        // 本地侧对账（Gap A/B/C）：根层每层必扫，顶层新建/编辑 ≤1 层被发现。
+        self.scan_local_dir(root, "", report)?;
         // 本层已覆盖的目录（定向下钻/深扫），游标走位时跳过不重列。
         let mut covered: HashSet<String> = HashSet::new();
 
@@ -750,6 +757,7 @@ impl NativeSyncManager {
             let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen)?;
             report.removed += removed;
             report.remote_missing_marked += marked;
+            self.scan_local_dir(root, &rel, report)?;
         }
 
         // 3) 交错深扫：游标按 remote_path 字典序轮转，把全量目录覆盖摊到 ceil(D/K) 层。
@@ -813,6 +821,7 @@ impl NativeSyncManager {
             let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen)?;
             report.removed += removed;
             report.remote_missing_marked += marked;
+            self.scan_local_dir(root, &rel, report)?;
         }
         if let Some(cursor) = cursor {
             self.db
@@ -1422,6 +1431,115 @@ impl NativeSyncManager {
         })
     }
 
+    /// 本地侧对账（Gap A/B/C 捕获，ADR-112 §3.1 修订）：
+    /// CF 通知是占位符作用域——新建普通文件无 CREATE 通知、hydrated 文件编辑无
+    /// open/close 通知（真实机实测）。本函数在自动对账层覆盖到的每个目录上，
+    /// 用「索引 vs 磁盘」补齐捕获：新建 ⇒ insert_local_only（pending upload）；
+    /// 已水合条目 mtime/size 变 ⇒ **md5 漏斗**（一致只更新基线，不一致才记 upload）。
+    /// 纯本地 stat，零 API 配额成本。删除/改名不在这里处理
+    /// （placeholder 的 DELETE/RENAME 通知是生产验证过的可靠通道）。
+    fn scan_local_dir(
+        &mut self,
+        root: &Path,
+        dir_relative: &str,
+        report: &mut AutoLayerReport,
+    ) -> Result<(), NativeSyncError> {
+        let dir_local = if dir_relative.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(dir_relative.replace('/', std::path::MAIN_SEPARATOR_STR))
+        };
+        let Ok(read_dir) = std::fs::read_dir(&dir_local) else {
+            // 目录本地不存在（纯云端目录、尚未有本地内容）：无本地侧可扫。
+            return Ok(());
+        };
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let relative = if dir_relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{dir_relative}/{name}")
+            };
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let indexed = self
+                .db
+                .entry_by_relative(&relative)
+                .map_err(NativeSyncError::Message)?;
+            let Some((fs_id, hydration_state, remote_md5, _, _, local_only)) = indexed else {
+                // 索引无此行：本地新建（云占位符竞态保险除外）。
+                if self.platform.is_cloud_placeholder(&entry.path()) {
+                    continue;
+                }
+                let size = if meta.is_dir() { 0 } else { meta.len() };
+                let next_id = self
+                    .db
+                    .next_local_fs_id()
+                    .map_err(NativeSyncError::Message)?;
+                self.db
+                    .insert_local_only_entry(next_id, &relative, &name, meta.is_dir(), size)
+                    .map_err(NativeSyncError::Message)?;
+                report.local_new += 1;
+                log::info!(
+                    "native-sync local scan: new local entry fs_id={next_id} dir={}",
+                    meta.is_dir()
+                );
+                continue;
+            };
+            if local_only {
+                continue; // 已捕获，不重复记账（与 close-completion 路径同原则）。
+            }
+            if hydration_state == "online_only" {
+                continue; // 占位符内容不在本地，谈不上本地编辑。
+            }
+            if meta.is_dir() {
+                continue; // 目录没有内容比对；改名/删除不在本通道（范围纪律）。
+            }
+            // 已水合条目：mtime/size vs 快照基线。
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            let baseline = self
+                .db
+                .snapshot_for(fs_id)
+                .map_err(NativeSyncError::Message)?;
+            let Some(snap) = baseline else {
+                // 无基线（老库行）：只补记，不判修改（ADR-109「读≠改」老原则）。
+                let _ = self.db.set_snapshot(fs_id, mtime, meta.len());
+                continue;
+            };
+            if snap.size.is_none() {
+                let _ = self.db.set_snapshot(fs_id, mtime, meta.len());
+                continue;
+            }
+            if snap.size == Some(meta.len()) && snap.mtime == mtime {
+                continue;
+            }
+            // mtime/size 不一致 ⇒ md5 漏斗：内容其实没变就只更新基线。
+            let local_md5 = upload::local_md5(&entry.path()).map_err(NativeSyncError::Message)?;
+            if Some(local_md5.as_str()) == remote_md5.as_deref() {
+                let _ = self.db.set_snapshot(fs_id, mtime, meta.len());
+                continue;
+            }
+            // 真编辑：记 upload + 防脱水（未上云期间被脱水 = 编辑丢失）。
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_string();
+            self.db
+                .set_pending_op(fs_id, Some("upload"), Some(&now_secs))
+                .map_err(NativeSyncError::Message)?;
+            self.platform.mark_not_in_sync(&entry.path());
+            report.local_edited += 1;
+            log::info!("native-sync local scan: edit detected fs_id={fs_id}");
+        }
+        Ok(())
+    }
+
     /// 用**磁盘真值**校正 `hydration_state`（面板必须与磁盘一致）。
     ///
     /// 水合/脱水都会被外部驱动（Explorer、平台后台、第三方程序），只在自家动作里写库就
@@ -1797,6 +1915,8 @@ mod manager_tests {
         /// 磁盘真值表：路径 → 本地实际占用字节（生产来自 CFAPI 的 OnDiskDataSize）。
         /// 缺省为空 ⇒ `on_disk_data_size` 返回 None，既有用例行为不变。
         on_disk: Arc<Mutex<HashMap<String, i64>>>,
+        /// 经 create_placeholder 创建的路径（is_cloud_placeholder 的判定集）。
+        placeholder_paths: Arc<Mutex<std::collections::HashSet<String>>>,
     }
     impl PlatformSync for FakePlatform {
         fn supported(&self) -> Result<(), String> {
@@ -1853,6 +1973,10 @@ mod manager_tests {
             } else if !path.exists() {
                 std::fs::write(path, b"").expect("fake placeholder file");
             }
+            self.placeholder_paths
+                .lock()
+                .unwrap()
+                .insert(path.to_string_lossy().to_string());
             Ok(())
         }
         fn pin(&mut self, _path: &Path, pinned: bool) -> Result<(), PlatformError> {
@@ -1868,6 +1992,12 @@ mod manager_tests {
         }
         fn pin_state(&self, _path: &Path) -> Option<bool> {
             None
+        }
+        fn is_cloud_placeholder(&self, path: &Path) -> bool {
+            self.placeholder_paths
+                .lock()
+                .unwrap()
+                .contains(&path.to_string_lossy().to_string())
         }
         fn on_disk_data_size(&self, path: &Path) -> Option<i64> {
             self.on_disk
@@ -2167,6 +2297,7 @@ mod manager_tests {
             platform: Box::new(FakePlatform {
                 calls: calls.clone(),
                 on_disk: on_disk.clone(),
+                placeholder_paths: Arc::new(Mutex::new(std::collections::HashSet::new())),
             }),
             notifications_config: true,
             notifications_enabled: true,
@@ -3466,6 +3597,229 @@ mod manager_tests {
             vec!["a.txt", "zdir", "zdir/f.txt"],
             "父目录必须先于其子项"
         );
+    }
+
+    // ---------- PR-3a：本地侧对账捕获（Gap A/B/C + md5 漏斗） ----------
+
+    #[tokio::test]
+    async fn local_scan_detects_new_file_and_marks_pending_upload() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        std::fs::write(root.join("new.txt"), b"brand new").unwrap();
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(report.local_new, 1);
+        let (fs_id, _, _, remote, _, local_only) =
+            manager.db.entry_by_relative("new.txt").unwrap().unwrap();
+        assert!(
+            fs_id < 0 && local_only,
+            "本地新建必须是负数 fs_id 的 local_only 行"
+        );
+        assert_eq!(remote, "local:new.txt");
+        assert_eq!(
+            manager.db.pending_op_of(fs_id).unwrap().as_deref(),
+            Some("upload"),
+            "新建即待上传（worker 沿用 3s 防抖）"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_scan_skips_indexed_cloud_placeholder() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend);
+        manager.sync_now().await.unwrap();
+        // 占位符在磁盘上（online_only）：本地侧扫描不得把它当新建或编辑。
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!((report.local_new, report.local_edited), (0, 0));
+        assert!(manager.db.upload_queue().unwrap().is_empty());
+        // 竞态保险：索引缺失但磁盘是云占位符（属性判定）也不得误捕。
+        manager.db.tombstone(11).unwrap();
+        manager
+            .platform
+            .create_placeholder(&root.join("ghost.txt"), false, 0, &99u64.to_le_bytes())
+            .unwrap();
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(report.local_new, 0, "云占位符属性命中 ⇒ 跳过");
+        assert!(manager.db.entry_by_relative("ghost.txt").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_scan_skips_local_only_already_captured() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        std::fs::write(root.join("n.txt"), b"hello").unwrap();
+        manager
+            .db
+            .insert_local_only_entry(-5, "n.txt", "n.txt", false, 5)
+            .unwrap();
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(report.local_new, 0, "已在索引的 local_only 不重复捕获");
+        let rows: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM remote_entry WHERE local_only=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn local_scan_records_baseline_when_snapshot_missing() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        let mut rec = record(11, "a.txt", Some("aaa"));
+        rec.state = NativeSyncState::Hydrated;
+        rec.size = 5;
+        manager.db.upsert(&rec).unwrap();
+        // 快照为 NULL（老库行）⇒ 只补记基线，绝不判修改（ADR-109「读≠改」）。
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(report.local_edited, 0);
+        assert!(manager.db.pending_op_of(11).unwrap().is_none());
+        let snap = manager.db.snapshot_for(11).unwrap().unwrap();
+        assert_eq!(snap.size, Some(5), "基线已被补记");
+    }
+
+    #[tokio::test]
+    async fn local_scan_md5_funnel_mtime_only_change_updates_baseline_without_pending() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        // 基线 md5 与本地内容一致（只是 mtime 会被碰）：md5 漏斗必须放行。
+        let mut rec = record(11, "a.txt", Some("5d41402abc4b2a76b9719d911017c592"));
+        rec.state = NativeSyncState::Hydrated;
+        rec.size = 5;
+        manager.db.upsert(&rec).unwrap();
+        manager.db.set_snapshot(11, Some(1_000_000), 5).unwrap();
+        let before = manager.db.snapshot_for(11).unwrap().unwrap();
+        // 同内容重写 ⇒ mtime 变化、size/md5 不变。
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(report.local_edited, 0, "md5 一致 ⇒ 不算编辑");
+        assert!(manager.db.pending_op_of(11).unwrap().is_none());
+        let after = manager.db.snapshot_for(11).unwrap().unwrap();
+        assert_eq!(after.size, Some(5));
+        assert_ne!(after.mtime, before.mtime, "基线已更新到新 mtime");
+    }
+
+    #[tokio::test]
+    async fn local_scan_marks_edit_when_content_differs() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        std::fs::write(root.join("a.txt"), b"world!").unwrap();
+        let mut rec = record(11, "a.txt", Some("aaa"));
+        rec.state = NativeSyncState::Hydrated;
+        rec.size = 5;
+        manager.db.upsert(&rec).unwrap();
+        manager.db.set_snapshot(11, Some(1_000_000), 5).unwrap();
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(report.local_edited, 1);
+        assert_eq!(
+            manager.db.pending_op_of(11).unwrap().as_deref(),
+            Some("upload")
+        );
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("mark_not_in_sync:")),
+            "未上云期间必须防脱水: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_scan_runs_within_auto_layer_root() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![])]);
+        manager.backend = Some(backend);
+        std::fs::write(root.join("stray.txt"), b"i am new here").unwrap();
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.local_new, 1, "层内本地侧对账必须捕获新建");
+        let (fs_id, _, _, _, _, local_only) =
+            manager.db.entry_by_relative("stray.txt").unwrap().unwrap();
+        assert!(fs_id < 0 && local_only);
+        assert_eq!(manager.db.upload_queue().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_scan_covers_deep_scanned_dirs() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![dir_snap("/d", 101)]), ("/d", vec![])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // 深目录里的本地新建：目录已落位后新出现的文件。
+        std::fs::write(root.join("d").join("f.txt"), b"deep new").unwrap();
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert!(report.deep_scanned >= 1);
+        assert_eq!(report.local_new, 1, "交错深扫目录的本地侧对账同样生效");
+        let (fs_id, _, _, _, _, local_only) =
+            manager.db.entry_by_relative("d/f.txt").unwrap().unwrap();
+        assert!(fs_id < 0 && local_only);
+    }
+
+    #[tokio::test]
+    async fn conflict_copy_with_matching_index_row_is_not_recaptured() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        // 冲突副本：已落库（hydrated、placeholder=0）且快照与磁盘一致 ⇒ 自杀防护靠索引判定。
+        std::fs::write(root.join("a-PC.txt"), b"conflict copy").unwrap();
+        let rec = EntryRecord {
+            fs_id: 7777,
+            local_only: false,
+            parent_fs_id: None,
+            remote_path: "/a-PC.txt".into(),
+            relative_path: "a-PC.txt".into(),
+            name: "a-PC.txt".into(),
+            is_dir: false,
+            size: 13,
+            md5: Some("ccc".into()),
+            modified_at: Some(1_700_000_000),
+            state: NativeSyncState::Hydrated,
+            pin_state: PinState::Unpinned,
+            error: None,
+            pending_op: None,
+            pending_since: None,
+            has_children: false,
+        };
+        manager.db.insert_uploaded_entry(&rec).unwrap();
+        let meta = std::fs::metadata(root.join("a-PC.txt")).unwrap();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        manager.db.set_snapshot(7777, mtime, meta.len()).unwrap();
+        let mut report = AutoLayerReport::default();
+        manager.scan_local_dir(&root, "", &mut report).unwrap();
+        assert_eq!(
+            (report.local_new, report.local_edited),
+            (0, 0),
+            "冲突副本不得被误捕"
+        );
+        assert!(manager.db.upload_queue().unwrap().is_empty());
     }
 
     #[tokio::test]

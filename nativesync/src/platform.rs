@@ -247,6 +247,11 @@ pub trait PlatformSync: Send + Sync {
     /// 登记应用自身发起的路径操作（自杀回调守卫，ADR-112 冲突副本改名）：
     /// 随后这些路径的 NOTIFY_* 不得记为用户的本地变更。路径为**完整路径**。
     fn note_self_path_ops(&mut self, _paths: &[std::path::PathBuf]) {}
+    /// 是否云占位符（RECALL 属性）。本地侧对账据此把「云端托管内容」与
+    /// 「本地新建的真实文件」分开（Gap A 捕获的判定输入）。非 Windows 恒 false。
+    fn is_cloud_placeholder(&self, _path: &Path) -> bool {
+        false
+    }
     /// 从文件系统回读 pin 状态（None = 未知/非占位符）。
     /// CFAPI 会把「固定到本地」镜像到 FILE_ATTRIBUTE_PINNED 属性位。
     fn pin_state(&self, path: &Path) -> Option<bool>;
@@ -3621,6 +3626,11 @@ mod windows_impl {
             for path in paths {
                 note_app_path_op(&self.runtime, path);
             }
+        }
+        fn is_cloud_placeholder(&self, path: &Path) -> bool {
+            std::fs::metadata(path)
+                .map(|meta| is_cloud_placeholder(&meta))
+                .unwrap_or(false)
         }
         fn remove_placeholder(&mut self, path: &Path, is_dir: bool) -> Result<(), PlatformError> {
             // 远端删除对账时应用会删本地占位符，随之而来的 NOTIFY_DELETE 不是用户操作。

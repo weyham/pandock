@@ -434,7 +434,13 @@ async fn auto_sync_loop(app: AppHandle) {
                 sleep_or_wake(std::time::Duration::from_secs(5), &wake).await;
             }
             Ok(report) => {
-                let _ = report; // 汇总日志已在 reconcile 内落盘。
+                // 本地侧对账有捕获（新建/编辑）⇒ 立即唤醒上传 worker 取件
+                // （一行接线：否则新建文件要等满 worker 的 60 秒兜底）。
+                if let Some(report) = report {
+                    if report.local_new + report.local_edited > 0 {
+                        app.state::<AppState>().auto_sync_wake.notify_one();
+                    }
+                }
                 emit_current_state(&app).await;
                 let interval = interval_override
                     .map(std::time::Duration::from_secs)
