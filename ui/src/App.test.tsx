@@ -46,6 +46,7 @@ function mockInvoke(
   updateState: UpdateStateView = baseUpdate,
   updateCheckResult: UpdateStateView | Promise<UpdateStateView> | (() => UpdateStateView | Promise<UpdateStateView>) = { ...updateState, phase: "update_available", availableVersion: "1.0.1" },
   saveResult: unknown = undefined,
+  nativeSyncStatus: Record<string, unknown> | null = null,
 ) {
   invokeMock.mockImplementation(async (command: string) => {
     switch (command) {
@@ -61,6 +62,7 @@ function mockInvoke(
       case "auth_retry": return beginChallenge;
       case "auth_cancel": return undefined;
       case "auth_disconnect": return undefined;
+      case "native_sync_status": return nativeSyncStatus ?? undefined;
       case "native_sync_list": return { entries: [], nextCursor: null, total: 0, parentPath: "/" };
       case "set_autostart": return undefined;
       case "save_config": return typeof saveResult === "function" ? (saveResult as () => unknown)() : saveResult;
@@ -411,5 +413,35 @@ describe("Pandock auth modal", () => {
     await user.click(saveButton);
     expect(await screen.findByText(/disk full/)).toBeInTheDocument();
     expect(saveButton).toBeEnabled();
+  });
+
+  it("auto-sync toggle saves from the last-saved config, never unsaved form edits", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    // 生产里状态来自后端启动后的事件推送（App 只在事件里 apply，不主动拉取）——测试同路径注入。
+    await act(async () => {
+      eventListeners.get("pandock://nativesync/state")?.({
+        payload: {
+          enabled: true, supported: true, rootPath: "C:\\Pandock\\NativeSync", state: "idle",
+          totalEntries: 0, placeholderEntries: 0, hydratedEntries: 0, attentionEntries: 0,
+          activeJobs: 0, autoSyncState: "ok", consecutiveFailures: 0,
+        },
+      });
+    });
+    // 1) 在「WebDAV」页改端口但不按保存（表单脏值）。
+    await user.click(await screen.findByRole("button", { name: "WebDAV" }));
+    const listenInput = await screen.findByLabelText(/本地监听地址/);
+    await user.clear(listenInput);
+    await user.type(listenInput, "127.0.0.1:19091");
+    // 2) 切到 NativeSync 页拨自动对账开关。
+    await user.click(screen.getByRole("button", { name: "NativeSync" }));
+    const toggle = await screen.findByRole("checkbox", { name: /自动同步云端变化/ });
+    await user.click(toggle);
+    // 3) save_config 的 payload 必须以上次落盘态为底：端口仍是 19090，只带开关变化。
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_config", expect.anything()));
+    const saveCall = invokeMock.mock.calls.find(([command]) => command === "save_config");
+    const payload = (saveCall![1] as { config: Record<string, unknown> }).config;
+    expect(payload.listen).toBe("127.0.0.1:19090");
+    expect(payload.native_sync_auto).toBe(false);
   });
 });

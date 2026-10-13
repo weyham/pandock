@@ -273,7 +273,10 @@ export function App() {
     } catch (error) { setMessage(String(error)); }
   };
   const toggleNativeSyncAuto = async (next: boolean) => {
-    const payload = { ...config, native_sync_auto: next, app_secret: "" };
+    // 以「上次落盘态」为底：表单里未保存的修改（例如改了端口没按保存）
+    // 不得被开关切换静默捎带写盘（PR-2 终审修复）。
+    const base = savedConfig ?? config;
+    const payload = { ...base, native_sync_auto: next, app_secret: "" };
     try {
       await busy.run("save_config", () => invoke("save_config", { config: payload }));
       setConfig((prev) => ({ ...prev, native_sync_auto: next, webdav_password: "" }));

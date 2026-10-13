@@ -93,7 +93,7 @@ pub struct NativeSyncStatusView {
     pub auto_sync_state: String,
     /// 自动对账连续失败次数（成功即清零；>= 阈值进入 paused）。
     pub consecutive_failures: u64,
-    /// 退避截止时间（RFC3339 本地格式，与 db 时间戳一致）；无退避时缺省。
+    /// 退避截止时间（epoch 秒字符串，与 db 时间戳一致）；无退避时缺省。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff_until: Option<String>,
     /// 最近一次自动对账层结束时间；从未跑过自动层时缺省。
