@@ -722,14 +722,16 @@ impl NativeSyncManager {
             .await
             .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
         report.calls += list_call_cost(entries.len());
+        // 本地侧对账（Gap A/B/C）**必须先于 ingest**：scan 的语义是「磁盘 vs 本层之前
+        // 的基线」——ingest 会无条件 set_snapshot 把基线刷成磁盘现状，先收编就会把
+        // 本地编辑的证据当场擦除（2026-10-13 真实机实证：先 ingest 时 local_edited 恒 0）。
+        self.scan_local_dir(root, "", report)?;
         let outcome = self.ingest_dir_entries(root, &root_remote, entries)?;
         report.added += outcome.added;
         report.changed += outcome.changed;
         let (removed, marked) = self.scoped_missing(root, "", &outcome.seen)?;
         report.removed += removed;
         report.remote_missing_marked += marked;
-        // 本地侧对账（Gap A/B/C）：根层每层必扫，顶层新建/编辑 ≤1 层被发现。
-        self.scan_local_dir(root, "", report)?;
         // 本层已覆盖的目录（定向下钻/深扫），游标走位时跳过不重列。
         let mut covered: HashSet<String> = HashSet::new();
 
@@ -750,14 +752,14 @@ impl NativeSyncManager {
             report.calls += list_call_cost(entries.len());
             report.drilled += 1;
             covered.insert(dir.as_str().to_string());
+            let rel = self.relative_of(dir);
+            self.scan_local_dir(root, &rel, report)?;
             let sub = self.ingest_dir_entries(root, dir, entries)?;
             report.added += sub.added;
             report.changed += sub.changed;
-            let rel = self.relative_of(dir);
             let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen)?;
             report.removed += removed;
             report.remote_missing_marked += marked;
-            self.scan_local_dir(root, &rel, report)?;
         }
 
         // 3) 交错深扫：游标按 remote_path 字典序轮转，把全量目录覆盖摊到 ceil(D/K) 层。
@@ -814,14 +816,14 @@ impl NativeSyncManager {
             report.calls += list_call_cost(entries.len());
             report.deep_scanned += 1;
             covered.insert(dir.clone());
+            let rel = self.relative_of(&remote);
+            self.scan_local_dir(root, &rel, report)?;
             let sub = self.ingest_dir_entries(root, &remote, entries)?;
             report.added += sub.added;
             report.changed += sub.changed;
-            let rel = self.relative_of(&remote);
             let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen)?;
             report.removed += removed;
             report.remote_missing_marked += marked;
-            self.scan_local_dir(root, &rel, report)?;
         }
         if let Some(cursor) = cursor {
             self.db
@@ -3903,6 +3905,46 @@ mod manager_tests {
             "冲突副本不得被误捕"
         );
         assert!(manager.db.upload_queue().unwrap().is_empty());
+    }
+
+    /// 排序缺陷的端到端回归（2026-10-13 真实机实证）：
+    /// scan 必须先于 ingest——否则 ingest 的 set_snapshot 会先把基线刷成磁盘现状，
+    /// 编辑证据在比对前被擦除（先 ingest 时本测试 local_edited 恒 0）。
+    #[tokio::test]
+    async fn local_scan_runs_before_ingest_so_layer_captures_edit() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // 模拟已水合且有基线：写内容 + 状态 hydrated + 快照一致。
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        manager.db.set_state_by_fs_id(11, "hydrated", None).unwrap();
+        let meta = std::fs::metadata(root.join("a.txt")).unwrap();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        manager.db.set_snapshot(11, mtime, meta.len()).unwrap();
+        // 本地编辑（内容变为 6 字节）。
+        std::fs::write(root.join("a.txt"), b"world!").unwrap();
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.local_edited, 1,
+            "scan 必须先于 ingest，否则编辑证据被快照刷新擦除: {report:?}"
+        );
+        assert_eq!(
+            manager.db.pending_op_of(11).unwrap().as_deref(),
+            Some("upload"),
+            "编辑必须进入上传队列"
+        );
     }
 
     #[tokio::test]
