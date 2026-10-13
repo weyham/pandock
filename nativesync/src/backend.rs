@@ -45,6 +45,12 @@ pub trait CloudBackend: Send + Sync {
         &'a self,
         path: &'a RemotePath,
     ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>>;
+    /// 批量 stat（陈旧 listing 守卫）：list 管广度、stat 管生杀；
+    /// 未命中（查无）的路径不在返回里。生产走 filemetas 批量（一次调用）。
+    fn stats<'a>(
+        &'a self,
+        paths: &'a [RemotePath],
+    ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>>;
 }
 
 pub struct SnapshotBackend {
@@ -85,6 +91,12 @@ impl CloudBackend for SnapshotBackend {
         path: &'a RemotePath,
     ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
         self.inner.create_collection(path)
+    }
+    fn stats<'a>(
+        &'a self,
+        paths: &'a [RemotePath],
+    ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>> {
+        self.inner.stats(paths)
     }
 
     fn stat<'a>(

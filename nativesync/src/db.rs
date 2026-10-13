@@ -111,6 +111,32 @@ impl IndexDb {
                 [],
             )
             .map_err(|e| e.to_string())?;
+        // ---- v5（陈旧 listing 守卫）：remote_entry.uploaded_at（**我方上传**回写时间，epoch 秒）----
+        // 宽限判据只认「我方刚上传的」（listing 没追上是常态）；listing ingest 不写此列，
+        // 否则每个刚被 listing 刷新的条目都会错误享受宽限（旧 missing 测试会全灭）。
+        let has_ingested: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('remote_entry') WHERE name='uploaded_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if has_ingested.is_none() {
+            self.conn
+                .execute(
+                    "ALTER TABLE remote_entry ADD COLUMN uploaded_at INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version) VALUES(5)",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
     pub fn path(&self) -> &Path {
@@ -391,6 +417,42 @@ impl IndexDb {
                 |r| r.get::<_, i64>(0),
             )
             .map(|v| v as u64)
+            .map_err(|e| e.to_string())
+    }
+    /// 宽限判据（陈旧 listing 守卫）：该条目**由我方上传**回写的时间距今 < `secs`。
+    /// 老库行 uploaded_at=0 ⇒ 恒 false（不享受宽限）。
+    pub fn uploaded_recently(&self, fs_id: i64, secs: i64) -> Result<bool, String> {
+        let at: i64 = self
+            .conn
+            .query_row(
+                "SELECT uploaded_at FROM remote_entry WHERE fs_id=?1",
+                params![fs_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+        Ok(at > 0 && now_secs() - at < secs)
+    }
+    /// 云端条目经 upsert 回写上传结果后调用：标记「我方刚上传」（宽限判据来源）。
+    pub fn mark_uploaded(&self, fs_id: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE remote_entry SET uploaded_at=?2 WHERE fs_id=?1",
+                params![fs_id, now_secs()],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    /// fs_id → remote_path（stat 确认的目标）。
+    pub fn remote_path_by_fs_id(&self, fs_id: i64) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT remote_path FROM remote_entry WHERE fs_id=?1",
+                params![fs_id],
+                |r| r.get(0),
+            )
+            .optional()
             .map_err(|e| e.to_string())
     }
     /// 自动对账调度状态（ADR-111）：kv 读取。
@@ -864,7 +926,7 @@ impl IndexDb {
     pub fn insert_uploaded_entry(&self, record: &EntryRecord) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone) VALUES(?,?,?,?,?,?,?,?,?,0,0) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0",
+                "INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?,0,0,?10) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0,uploaded_at=excluded.uploaded_at",
                 params![
                     record.fs_id,
                     record.parent_fs_id,
@@ -874,7 +936,8 @@ impl IndexDb {
                     record.size as i64,
                     record.md5,
                     record.modified_at,
-                    Option::<String>::None
+                    Option::<String>::None,
+                    now_secs()
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -961,7 +1024,7 @@ impl IndexDb {
             .unchecked_transaction()
             .map_err(|e| e.to_string())?;
         tx.execute(
-            "INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone) VALUES(?,?,?,?,?,?,?,?,?,0,0) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0",
+            "INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?,0,0,?10) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0,uploaded_at=excluded.uploaded_at",
             params![
                 record.fs_id,
                 record.parent_fs_id,
@@ -971,7 +1034,8 @@ impl IndexDb {
                 record.size as i64,
                 record.md5,
                 record.modified_at,
-                Option::<String>::None
+                Option::<String>::None,
+                now_secs()
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -1024,6 +1088,12 @@ pub struct LocalChangeRecord {
     pub error: Option<String>,
 }
 
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
 fn now() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1119,7 +1189,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 4, "schema_migrations 应记录 1/2/3/4 四个版本");
+        assert_eq!(count, 5, "schema_migrations 应记录 1..5 五个版本");
         // v3：本地变更捕获表、索引与待同步/快照列必须存在
         let table: i64 = db
             .conn
@@ -1140,6 +1210,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(auto_table, 1, "auto_state 表应存在");
+        // v5：uploaded_at 列必须存在（陈旧 listing 守卫的宽限判据）
+        let uploaded_col: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('remote_entry') WHERE name='uploaded_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(uploaded_col.as_deref(), Some("uploaded_at"));
         let index: i64 = db
             .conn
             .query_row(
@@ -1305,7 +1385,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(versions, 4, "v1 库升级后应记录到 4");
+        assert_eq!(versions, 5, "v1 库升级后应记录到 5");
         db.migrate().unwrap();
         // 幂等：二次迁移不得报错，且 v3 对象已在 v1 库上升级出来
         let table: i64 = db

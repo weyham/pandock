@@ -276,6 +276,36 @@ impl BaiduClient {
         Ok(all)
     }
 
+    /// 批量 filemetas（target=[路径数组]，生产 meta 同形态）——
+    /// 陈旧 listing 守卫的确认通道：list 管广度、stat 管生杀（2026-10-13 实测 meta 是新鲜的）。
+    /// 返回与输入同序的命中项（每项含 `path` 字段可归属）；未命中的路径**不在返回里**。
+    pub async fn metas(&self, dav_paths: &[String]) -> Result<Vec<FileEntry>, String> {
+        if dav_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut paths = Vec::with_capacity(dav_paths.len());
+        for dav_path in dav_paths {
+            paths.push(self.remote_path(dav_path)?);
+        }
+        let target = serde_json::to_string(&paths).map_err(|e| e.to_string())?;
+        let response = self
+            .api_post("/rest/2.0/xpan/file")
+            .query(&[("method", "filemetas")])
+            .form(&[("target", target.as_str()), ("dlink", "0")])
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let data = self.decode_json(response).await?;
+        let entries: Vec<FileEntry> = serde_json::from_value(
+            data.get("info")
+                .or_else(|| data.get("list"))
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(entries)
+    }
+
     pub async fn meta(&self, dav_path: &str) -> Result<FileEntry, String> {
         let path = self.remote_path(dav_path)?;
         let target = serde_json::to_string(&[path.as_str()]).map_err(|e| e.to_string())?;

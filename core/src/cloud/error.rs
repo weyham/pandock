@@ -156,7 +156,9 @@ fn classify_json_error(json: &serde_json::Value, message: &str) -> CloudErrorKin
 
 fn classify_errno(errno: i64, message: &str) -> CloudErrorKind {
     match errno {
-        -9 | 31066 => CloudErrorKind::NotFound,
+        // 12：filemetas 按路径查询不存在（含回收站）——2026-10-13 真实账号实测确认
+        // （两个 opera=delete 的探针按路径查 errno=12；现存路径 errno=0）。
+        12 | -9 | 31066 => CloudErrorKind::NotFound,
         -8 => CloudErrorKind::AlreadyExists,
         -10 => CloudErrorKind::QuotaExceeded,
         -7 => {
@@ -199,6 +201,11 @@ mod tests {
         assert_eq!(
             CloudError::from_message("百度 API 错误：{\"errno\":-8}".into()).kind,
             CloudErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            CloudError::from_message("百度 API 错误：{\"errno\":12}".into()).kind,
+            CloudErrorKind::NotFound,
+            "errno 12 = 按路径查无（含回收站），实测归类 NotFound"
         );
         assert_eq!(
             CloudError::from_message("百度 API 错误：{\"errno\":-10}".into()).kind,

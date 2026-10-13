@@ -183,6 +183,12 @@ mod tests {
         ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
             async move { Err(CloudError::unsupported("fake remove")) }.boxed()
         }
+        fn stats<'a>(
+            &'a self,
+            _: &'a [RemotePath],
+        ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>> {
+            async move { Ok(vec![]) }.boxed()
+        }
         fn create_dir<'a>(
             &'a self,
             _: &'a RemotePath,

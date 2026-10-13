@@ -372,7 +372,7 @@ impl NativeSyncManager {
             .db
             .missing_entries(&seen)
             .map_err(NativeSyncError::Message)?;
-        self.apply_missing(&root, missing)?;
+        self.apply_missing(&root, missing, &backend).await?;
         // 手动「立即对账」成功 = 自动对账的恢复信号（ADR-111 §2.3：清退避/暂停）。
         self.db
             .note_auto_success(false)
@@ -559,14 +559,83 @@ impl NativeSyncManager {
     /// 远端删除对账（全量=全树 missing，增量=单目录 scoped missing，同一处理逻辑）：
     /// hydrated/有水合后代 ⇒ 仅标 remote_missing；否则移除占位符并 tombstone。
     /// 返回 (tombstoned, preserved_remote_missing)。
-    fn apply_missing(
+    ///
+    /// **陈旧 listing 守卫**（2026-10-13 实测：method=list 最终一致延迟 >24 分钟，
+    /// 曾把刚上传 10 分钟的冲突副本误判 remote_missing 并物理删除）：list 管广度、
+    /// **stat 管生杀**——
+    /// ① 宽限：**我方刚上传**（uploaded_at < 30 分钟）的条目不进候选；
+    /// ② 候选 > 50 ⇒ 不是滞后是事故，本层不做任何 missing 动作（防 API 打爆 + 防误删）；
+    /// ③ 其余候选一次**批量 stat** 确认：路径存在 ⇒ 保留并记 stale listing 日志；
+    ///    查无 ⇒ 才走 remote_missing/删除流程；确认调用本身失败 ⇒ 整层报错（不拿半信证据动刀）。
+    async fn apply_missing(
         &mut self,
         root: &Path,
         missing: Vec<(u64, String, String, bool)>,
+        backend: &Arc<dyn CloudBackend>,
     ) -> Result<(u64, u64), NativeSyncError> {
+        const MISSING_GRACE_SECS: i64 = 30 * 60;
+        const MISSING_CONFIRM_MAX: usize = 50;
+        // ① 宽限。
+        let mut candidates = Vec::new();
+        for row in missing {
+            if self
+                .db
+                .uploaded_recently(row.0 as i64, MISSING_GRACE_SECS)
+                .map_err(NativeSyncError::Message)?
+            {
+                log::info!(
+                    "native-sync missing grace fs_id={} (uploaded <30min ago)",
+                    row.0
+                );
+                continue;
+            }
+            candidates.push(row);
+        }
+        // ② 异常闸门。
+        if candidates.len() > MISSING_CONFIRM_MAX {
+            log::warn!(
+                "native-sync missing candidates={} exceeds {}: skip ALL actions this layer (anomaly, not lag)",
+                candidates.len(),
+                MISSING_CONFIRM_MAX
+            );
+            return Ok((0, 0));
+        }
+        // ③ 批量 stat 确认（一次 filemetas 调用）。
+        let mut alive: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        if !candidates.is_empty() {
+            let mut paths = Vec::with_capacity(candidates.len());
+            for (fs_id, _, _, _) in &candidates {
+                let remote = self
+                    .db
+                    .remote_path_by_fs_id(*fs_id as i64)
+                    .map_err(NativeSyncError::Message)?
+                    .ok_or_else(|| {
+                        NativeSyncError::Message("missing 候选缺 remote_path".into())
+                    })?;
+                paths.push(
+                    RemotePath::parse(&remote)
+                        .map_err(|e| NativeSyncError::Message(format!("remote_path 非法: {e}")))?,
+                );
+            }
+            let hits = backend
+                .stats(&paths)
+                .await
+                .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
+            for snapshot in &hits {
+                if let Some(fs_id) = snapshot.fs_id {
+                    alive.insert(fs_id);
+                }
+            }
+        }
         let mut tombstoned = 0u64;
         let mut preserved = 0u64;
-        for (fs_id, relative, state, is_dir) in missing {
+        let mut stale_kept = 0u64;
+        for (fs_id, relative, state, is_dir) in candidates {
+            if alive.contains(&fs_id) {
+                stale_kept += 1;
+                continue;
+            }
+
             let local = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
             let preserve = state == "hydrated"
                 || (is_dir
@@ -593,6 +662,11 @@ impl NativeSyncManager {
                 self.db.tombstone(fs_id).map_err(NativeSyncError::Message)?;
                 tombstoned += 1;
             }
+        }
+        if stale_kept > 0 {
+            log::info!(
+                "native-sync stale listing observed: {stale_kept} entries kept alive by stat confirm"
+            );
         }
         Ok((tombstoned, preserved))
     }
@@ -729,7 +803,7 @@ impl NativeSyncManager {
         let outcome = self.ingest_dir_entries(root, &root_remote, entries)?;
         report.added += outcome.added;
         report.changed += outcome.changed;
-        let (removed, marked) = self.scoped_missing(root, "", &outcome.seen)?;
+        let (removed, marked) = self.scoped_missing(root, "", &outcome.seen, backend).await?;
         report.removed += removed;
         report.remote_missing_marked += marked;
         // 本层已覆盖的目录（定向下钻/深扫），游标走位时跳过不重列。
@@ -757,7 +831,7 @@ impl NativeSyncManager {
             let sub = self.ingest_dir_entries(root, dir, entries)?;
             report.added += sub.added;
             report.changed += sub.changed;
-            let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen)?;
+            let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen, backend).await?;
             report.removed += removed;
             report.remote_missing_marked += marked;
         }
@@ -821,7 +895,7 @@ impl NativeSyncManager {
             let sub = self.ingest_dir_entries(root, &remote, entries)?;
             report.added += sub.added;
             report.changed += sub.changed;
-            let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen)?;
+            let (removed, marked) = self.scoped_missing(root, &rel, &sub.seen, backend).await?;
             report.removed += removed;
             report.remote_missing_marked += marked;
         }
@@ -845,17 +919,18 @@ impl NativeSyncManager {
 
     /// 单目录 scoped 远端删除对账：只处理该目录的**直接子项**。
     /// 增量层绝不能按全树判 missing——未扫到的目录会被误判成远端删除。
-    fn scoped_missing(
+    async fn scoped_missing(
         &mut self,
         root: &Path,
         parent_relative: &str,
         seen: &[u64],
+        backend: &Arc<dyn CloudBackend>,
     ) -> Result<(u64, u64), NativeSyncError> {
         let missing = self
             .db
             .missing_children_of(parent_relative, seen)
             .map_err(NativeSyncError::Message)?;
-        self.apply_missing(root, missing)
+        self.apply_missing(root, missing, backend).await
     }
 
     /// S2 上传方向（ADR-112）：传播一轮待同步变更（本地 → 云端）。
@@ -1191,6 +1266,8 @@ impl NativeSyncManager {
         } else {
             self.db.upsert(&record).map_err(UploadTaskError::Hard)?;
         }
+        // 陈旧 listing 守卫的宽限来源：这是「我方刚上传」的条目（ingest 的 upsert 不写此列）。
+        let _ = self.db.mark_uploaded(real_fs_id as i64);
         let local_mtime = meta
             .modified()
             .ok()
@@ -2093,6 +2170,10 @@ mod manager_tests {
         removes: Mutex<Vec<String>>,
         renames: Mutex<Vec<(String, String)>>,
         created_dirs: Mutex<Vec<String>>,
+        /// 批量 stat 的独立视图（模拟「listing 滞后但 stat 新鲜」，默认空 = 查无）。
+        stat_listings: Mutex<HashMap<String, ResourceSnapshot>>,
+        /// 批量 stat 调用记录（每次调用的路径数）。
+        stats_calls: Mutex<Vec<usize>>,
     }
     impl FakeBackend {
         fn script_upload(
@@ -2200,6 +2281,20 @@ mod manager_tests {
             self.removes.lock().unwrap().push(path.as_str().to_string());
             async move { Ok(()) }.boxed()
         }
+        fn stats<'a>(
+            &'a self,
+            paths: &'a [RemotePath],
+        ) -> futures_util::future::BoxFuture<'a, Result<Vec<ResourceSnapshot>, CloudError>> {
+            self.stats_calls
+                .lock()
+                .unwrap()
+                .push(paths.len());
+            let found: Vec<ResourceSnapshot> = paths
+                .iter()
+                .filter_map(|path| self.stat_listings.lock().unwrap().get(path.as_str()).cloned())
+                .collect();
+            async move { Ok(found) }.boxed()
+        }
         fn create_dir<'a>(
             &'a self,
             path: &'a RemotePath,
@@ -2261,6 +2356,8 @@ mod manager_tests {
             removes: Mutex::new(Vec::new()),
             renames: Mutex::new(Vec::new()),
             created_dirs: Mutex::new(Vec::new()),
+            stat_listings: Mutex::new(HashMap::new()),
+            stats_calls: Mutex::new(Vec::new()),
         });
         backend.replace(entries);
         backend
@@ -3945,6 +4042,117 @@ mod manager_tests {
             Some("upload"),
             "编辑必须进入上传队列"
         );
+    }
+
+    // ---------- 陈旧 listing 守卫（list 管广度、stat 管生杀） ----------
+
+    fn tombstone_of(manager: &NativeSyncManager, fs_id: i64) -> i64 {
+        manager
+            .db
+            .conn
+            .query_row(
+                "SELECT tombstone FROM remote_entry WHERE fs_id=?1",
+                rusqlite::params![fs_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_candidate_alive_by_stat_is_kept() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![(
+            "/",
+            vec![file_snap("/a.txt", 11, Some("aaa")), file_snap("/b.txt", 12, Some("bbb"))],
+        )]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // listing 滞后：a.txt 从 listing 消失；但 stat（新鲜路径）确认它还在。
+        backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
+        backend
+            .stat_listings
+            .lock()
+            .unwrap()
+            .insert("/a.txt".to_string(), file_snap("/a.txt", 11, Some("aaa")));
+        let report = manager
+            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 0, "stat 确认存活 ⇒ 不得删除: {report:?}");
+        assert_eq!(tombstone_of(&manager, 11), 0, "a.txt 不得 tombstone");
+        assert_eq!(backend.stats_calls.lock().unwrap().as_slice(), &[1], "批量 stat 恰好一次");
+        let (_, state, ..) = manager.db.entry_by_relative("a.txt").unwrap().unwrap();
+        assert_eq!(state, "online_only", "a.txt 状态不受陈旧 listing 影响");
+    }
+
+    #[tokio::test]
+    async fn missing_candidate_confirmed_gone_is_processed() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![(
+            "/",
+            vec![file_snap("/a.txt", 11, Some("aaa")), file_snap("/b.txt", 12, Some("bbb"))],
+        )]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // stat 也查无（stat_listings 默认空）⇒ 真删除，照原流程 tombstone + 移除占位符。
+        backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
+        let report = manager
+            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(tombstone_of(&manager, 11), 1);
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c.starts_with("remove:")), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn recently_uploaded_entry_skips_missing_grace_and_stat() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![(
+            "/",
+            vec![file_snap("/a.txt", 11, Some("aaa")), file_snap("/b.txt", 12, Some("bbb"))],
+        )]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // a.txt 是我们刚上传的（uploaded_at < 30min）⇒ 宽限：不进候选、不调 stat。
+        manager.db.mark_uploaded(11).unwrap();
+        backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
+        let report = manager
+            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 0);
+        assert_eq!(tombstone_of(&manager, 11), 0);
+        assert!(
+            backend.stats_calls.lock().unwrap().is_empty(),
+            "宽限条目不得产生 stat 调用"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_candidates_over_50_skip_all_actions() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let mut seed = Vec::new();
+        for i in 0..51u64 {
+            seed.push(file_snap(&format!("/f{i}.txt"), 1000 + i, Some("x")));
+        }
+        let backend = backend_with(vec![("/", seed)]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // 51 个候选（>50 闸门）⇒ 不是滞后是事故：本层不做任何 missing 动作、不打 API。
+        backend.replace(vec![("/", vec![])]);
+        let report = manager
+            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.removed, 0, "闸门触发 ⇒ 零删除: {report:?}");
+        assert!(backend.stats_calls.lock().unwrap().is_empty(), "闸门触发 ⇒ 零 stat 调用");
+        assert_eq!(tombstone_of(&manager, 1000), 0);
     }
 
     #[tokio::test]
