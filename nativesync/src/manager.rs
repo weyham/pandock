@@ -630,6 +630,14 @@ impl NativeSyncManager {
             );
             return Ok((0, 0));
         }
+        // 通用深度降序：任何来源的候选都先处理子项、后处理父目录——
+        // 全 online_only 的多层已删树也不会撞「目录非空」（os error 145）。
+        candidates.sort_by(|a, b| {
+            b.1.matches('/')
+                .count()
+                .cmp(&a.1.matches('/').count())
+                .then_with(|| b.1.cmp(&a.1))
+        });
         // ③ 批量 stat 确认（一次 filemetas 调用）。
         // 存活判定**按路径**，绝不按 fs_id：覆盖/替换会轮换 fs_id（2026-10-13 实测
         // rtype=3 覆盖产生新 fs_id）——若按 fs_id 比对，外部「替换式保存」后的新文件
@@ -670,7 +678,11 @@ impl NativeSyncManager {
             }
 
             let local = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+            // 'remote_missing' 同样是保留态（跨层幂等）：上一轮按策略保留的本地内容，
+            // 下一轮不得被删除——否则用户水合的文件会在第二层被物理删掉
+            // （2026-10-14 生产实锤的同族缺陷）。
             let preserve = state == "hydrated"
+                || state == "remote_missing"
                 || (is_dir
                     && self
                         .db
@@ -978,26 +990,26 @@ impl NativeSyncManager {
     ) -> Result<(), NativeSyncError> {
         let rel = self.relative_of(remote);
         log::info!("native-sync dir gone remotely (list -9): reconcile subtree fs={rel}");
-        // 子树（直接子项全候选；其各自再经批量 stat 确认）。
-        let (removed, marked) = self.scoped_missing(root, &rel, &[], backend).await?;
-        report.removed += removed;
-        report.remote_missing_marked += marked;
-        // 目录自身：按删除处理（经 apply_missing 的宽限+确认+保留规则）。
+        // 整棵子树按深度降序一次收编（自底向上）：先删/标子占位符，父目录最后处理，
+        // 绝不撞「目录非空」（os error 145，2026-10-14 生产实锤）；且必须跨层幂等
+        // （remote_missing 是保留态——见 apply_missing 的保留规则）。
+        let mut batch: Vec<(u64, String, String, bool)> = self
+            .db
+            .subtree_rows(&rel)
+            .map_err(NativeSyncError::Message)?
+            .into_iter()
+            .map(|(fs_id, relative, state, is_dir)| (fs_id as u64, relative, state, is_dir))
+            .collect();
         if let Some((fs_id, state, _, _, _, _)) = self
             .db
             .entry_by_relative(&rel)
             .map_err(NativeSyncError::Message)?
         {
-            let (removed, marked) = self
-                .apply_missing(
-                    root,
-                    vec![(fs_id as u64, rel.clone(), state, true)],
-                    backend,
-                )
-                .await?;
-            report.removed += removed;
-            report.remote_missing_marked += marked;
+            batch.push((fs_id as u64, rel.clone(), state, true));
         }
+        let (removed, marked) = self.apply_missing(root, batch, backend).await?;
+        report.removed += removed;
+        report.remote_missing_marked += marked;
         Ok(())
     }
 
@@ -4526,6 +4538,137 @@ mod manager_tests {
             )
             .unwrap();
         assert_eq!((f_tomb, d_tomb), (1, 1));
+    }
+
+    /// 生产实锤（2026-10-14）：hydrated 子文件先被标 remote_missing 后，
+    /// 旧版 has_hydrated_descendant 查不到 'hydrated' 后代 ⇒ 删非空目录 145；
+    /// 且 remote_missing 条目在下一层会被物理删除。两层跑两遍都必须：
+    /// 保留、零删除、零失败（跨层幂等）。
+    #[tokio::test]
+    async fn gone_dir_tree_with_hydrated_file_is_preserved_and_idempotent_across_layers() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![
+            ("/", vec![dir_snap("/A", 101)]),
+            ("/A", vec![dir_snap("/A/B", 102)]),
+            ("/A/B", vec![file_snap("/A/B/f.txt", 301, Some("fff"))]),
+        ]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // f.txt 已水合（磁盘有真实内容）。
+        std::fs::write(
+            root.join("A").join("B").join("f.txt"),
+            b"user hydrated content",
+        )
+        .unwrap();
+        manager
+            .db
+            .set_state_by_fs_id(301, "hydrated", None)
+            .unwrap();
+        backend
+            .not_found_dirs
+            .lock()
+            .unwrap()
+            .insert("/A".to_string());
+        for round in 1..=2u32 {
+            let report = manager
+                .reconcile_incremental(
+                    &AutoSyncParams::default(),
+                    &Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("第 {round} 层不得失败: {e}"));
+            assert_eq!(
+                report.removed, 0,
+                "第 {round} 层不得删除任何条目: {report:?}"
+            );
+        }
+        let remove_calls = {
+            let guard = calls.lock().unwrap();
+            guard.iter().filter(|c| c.starts_with("remove:")).count()
+        };
+        assert_eq!(remove_calls, 0, "有水合内容的树绝不被物理删除");
+        assert!(
+            root.join("A").join("B").join("f.txt").exists(),
+            "用户水合内容必须保留"
+        );
+        for fs_id in [101i64, 102, 301] {
+            let state: String = manager
+                .db
+                .conn
+                .query_row(
+                    "SELECT hydration_state FROM local_state WHERE fs_id=?1",
+                    rusqlite::params![fs_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                state, "remote_missing",
+                "fs_id={fs_id} 应标 remote_missing 保留"
+            );
+        }
+    }
+
+    /// 全 online_only 多层已删树：自底向上收编——子文件先删、父目录最后删，
+    /// 绝不撞「目录非空」（os error 145）。
+    #[tokio::test]
+    async fn gone_dir_all_online_only_tree_removed_bottom_up_without_dir_not_empty() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![
+            ("/", vec![dir_snap("/A", 101)]),
+            ("/A", vec![dir_snap("/A/B", 102)]),
+            ("/A/B", vec![file_snap("/A/B/f.txt", 301, None)]),
+        ]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        backend
+            .not_found_dirs
+            .lock()
+            .unwrap()
+            .insert("/A".to_string());
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("全 online_only 已删树也不得失败（自底向上）");
+        assert_eq!(report.removed, 3, "三层全部收编: {report:?}");
+        for fs_id in [101i64, 102, 301] {
+            let tomb: i64 = manager
+                .db
+                .conn
+                .query_row(
+                    "SELECT tombstone FROM remote_entry WHERE fs_id=?1",
+                    rusqlite::params![fs_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tomb, 1, "fs_id={fs_id} 应 tombstone");
+        }
+        // 物理顺序：子文件 → 子目录 → 父目录（深度降序）。
+        let removes: Vec<String> = {
+            let guard = calls.lock().unwrap();
+            guard
+                .iter()
+                .filter(|c| c.starts_with("remove:"))
+                .cloned()
+                .collect()
+        };
+        let names: Vec<String> = removes
+            .iter()
+            .map(|c| {
+                let path = c.trim_start_matches("remove:");
+                let path = path.rsplit_once(":dir=").map(|(p, _)| p).unwrap_or(path);
+                path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["f.txt".to_string(), "B".to_string(), "A".to_string()],
+            "必须先删子项再删父目录（深度降序）: {removes:?}"
+        );
     }
 
     #[tokio::test]

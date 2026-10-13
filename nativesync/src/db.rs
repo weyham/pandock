@@ -340,9 +340,37 @@ impl IndexDb {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+    /// 目录是否有「本地内容需保留」的后代。'remote_missing' 同样是保留态
+    /// （它字面意思就是「本地内容按策略保留」）——否则同层先把子项标 remote_missing
+    /// 后评估目录时会误判无保留 ⇒ 删非空目录（os error 145，2026-10-14 生产实锤）。
     pub fn has_hydrated_descendant(&self, relative: &str) -> Result<bool, String> {
         let prefix = format!("{}/%", relative.trim_end_matches('/'));
-        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM local_state WHERE relative_path LIKE ?1 AND hydration_state='hydrated')", params![prefix], |r| r.get(0)).map_err(|e| e.to_string())
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM local_state WHERE relative_path LIKE ?1 AND hydration_state IN ('hydrated','remote_missing'))", params![prefix], |r| r.get(0)).map_err(|e| e.to_string())
+    }
+    /// 整棵子树（严格后代），按深度降序——自底向上收编的顺序保证
+    /// （先删子占位符，父目录最后才删，绝不撞「目录非空」）。
+    #[allow(clippy::type_complexity)]
+    pub fn subtree_rows(
+        &self,
+        parent_relative: &str,
+    ) -> Result<Vec<(i64, String, String, bool)>, String> {
+        let prefix = format!("{}/%", parent_relative.trim_end_matches('/'));
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT r.fs_id,l.relative_path,l.hydration_state,r.is_dir FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0 AND l.relative_path LIKE ?1 ORDER BY length(l.relative_path) DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map(params![prefix], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
     }
     /// 自动对账计数器：(consecutive_failures, paused, backoff_until, last_layer_at, last_ok_at, last_error)。
     /// 空字符串一律归一为 None（写入侧用 "" 表示清除）。
