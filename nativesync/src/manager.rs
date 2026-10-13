@@ -976,7 +976,7 @@ impl NativeSyncManager {
                 // delete pending 另行裁决，这里只清 upload 标记防卡死（无证据不传播）。
                 let _ = self.db.set_pending_op(fs_id, None, None);
                 if local_only {
-                    let _ = self.db.tombstone(fs_id as u64);
+                    let _ = self.db.tombstone_i64(fs_id);
                 }
                 log::info!("native-sync upload skipped: local file gone fs_id={fs_id}");
                 return Ok(UploadTaskEffect::Skipped);
@@ -1162,10 +1162,9 @@ impl NativeSyncManager {
         fs_id: i64,
         relative: &str,
         local: &Path,
-        local_only: bool,
+        _local_only: bool,
         size: u64,
     ) -> Result<UploadTaskEffect, UploadTaskError> {
-        let _ = local_only;
         let device = upload::device_name();
         let name = relative.rsplit('/').next().unwrap_or(relative);
         let dir_rel = relative.rsplit_once('/').map(|(dir, _)| dir);
@@ -1201,12 +1200,19 @@ impl NativeSyncManager {
             "native-sync conflict fs_id={fs_id}: cloud version keeps the name, local copy renamed with device suffix"
         );
         // 3) 原名条目：进「需处理」、清 pending；云端版本不动（下一轮自动对账把原名带回来）。
+        //    local_only（负数 fs_id）是本地新建撞名：原路径行**必须 tombstone**——
+        //    文件已改名离开原路径，留着它 ⇒ 下一轮对账把云端版本落到同一 relative，
+        //    同路径两行（幽灵行 + 云端真身），幽灵行永不再被任何流程触碰。
         if fs_id > 0 {
             let _ = self.db.set_state_by_fs_id(
                 fs_id as u64,
                 "error",
                 Some("与云端版本冲突：云端版本保留原名，本地副本已改名保留"),
             );
+        } else {
+            self.db
+                .tombstone_i64(fs_id)
+                .map_err(UploadTaskError::Hard)?;
         }
         self.db
             .set_pending_op(fs_id, None, None)
@@ -1290,7 +1296,7 @@ impl NativeSyncManager {
                 .set_pending_op(fs_id, None, None)
                 .map_err(UploadTaskError::Hard)?;
             if local_only {
-                let _ = self.db.tombstone(fs_id as u64);
+                let _ = self.db.tombstone_i64(fs_id);
             }
             return Ok(UploadTaskEffect::Skipped);
         }
@@ -1301,7 +1307,7 @@ impl NativeSyncManager {
             .await
             .map_err(|e| self.fail_entry(fs_id, &e, params))?;
         self.db
-            .tombstone(fs_id as u64)
+            .tombstone_i64(fs_id)
             .map_err(UploadTaskError::Hard)?;
         self.db
             .set_pending_op(fs_id, None, None)
@@ -3259,6 +3265,74 @@ mod manager_tests {
         let (copy_id, copy_state, ..) = manager.db.entry_by_relative(&copy_name).unwrap().unwrap();
         assert_eq!(copy_id, 7777);
         assert_eq!(copy_state, "hydrated");
+        assert!(manager.db.upload_queue().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_only_conflict_tombstones_original_row_and_copy_reuploads() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        // 本地新建 a.txt，云端恰好已有同名文件（无基线，local_only）⇒ 上传吃 -8。
+        std::fs::write(root.join("a.txt"), b"mine!").unwrap();
+        manager
+            .db
+            .insert_local_only_entry(-5, "a.txt", "a.txt", false, 5)
+            .unwrap();
+        make_pending_old(&manager, -5, "upload");
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        let mut conflict = CloudError::already_exists("百度 API 错误：{\"errno\":-8}");
+        conflict.raw_errno = Some(-8);
+        conflict.rapid_hint = false;
+        backend.script_upload(vec![
+            Err(conflict),
+            Ok(FakeBackend::upload_outcome(7777, 5)),
+        ]);
+        manager.backend = Some(backend.clone());
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.conflicts, 1);
+        // 副本改名保留并回传。
+        let copy_name =
+            crate::upload::conflict_copy_name("a.txt", &crate::upload::device_name(), 1);
+        assert!(root.join(&copy_name).exists());
+        assert_eq!(
+            backend.uploads.lock().unwrap()[1].0,
+            format!("/{copy_name}")
+        );
+        // 原路径的 local_only 行已 tombstone（不是留在索引里的幽灵行）。
+        let tombstoned: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT tombstone FROM remote_entry WHERE fs_id=-5",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstoned, 1, "local_only 原名行必须 tombstone");
+        // 下一轮对账：云端版本落到原名 ⇒ 同路径只剩云端真身一行。
+        let layer = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(layer.added, 1, "云端版本作为新条目落到原名");
+        let (real_id, ..) = manager.db.entry_by_relative("a.txt").unwrap().unwrap();
+        assert_eq!(real_id, 11, "原名路径现在属于云端真身");
+        let rows: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_state l JOIN remote_entry r ON r.fs_id=l.fs_id WHERE l.relative_path='a.txt' AND r.tombstone=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "同路径不得有幽灵行 + 真身两行");
         assert!(manager.db.upload_queue().unwrap().is_empty());
     }
 

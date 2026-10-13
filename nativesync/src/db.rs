@@ -498,6 +498,16 @@ impl IndexDb {
         }
         Ok(out)
     }
+    /// i64 变体：local_only 负数 fs_id 的 tombstone（u64 转型会静默失配）。
+    pub fn tombstone_i64(&self, fs_id: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE remote_entry SET tombstone=1 WHERE fs_id=?1",
+                params![fs_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
     pub fn tombstone(&self, fs_id: u64) -> Result<(), String> {
         self.conn
             .execute(
