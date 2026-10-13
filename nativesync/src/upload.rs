@@ -66,8 +66,35 @@ pub fn sanitize_device(raw: &str) -> String {
 }
 
 /// 设备名（Windows 计算机名；取不到回退 "device"）。冲突副本模板的后缀（ADR-112 §3.3）。
+///
+/// 取值用 Win32 `GetComputerNameW`——`COMPUTERNAME` 环境变量在某些进程上下文
+/// （服务/子进程/精简环境块）会缺失，实测生产上回退成了 "device"（2026-10-13
+/// 冲突副本被命名为 `…-device.txt` 而非 `…-<计算机名>.txt`）。
 pub fn device_name() -> String {
+    #[cfg(windows)]
+    if let Some(name) = windows_computer_name() {
+        return sanitize_device(&name);
+    }
     sanitize_device(&std::env::var("COMPUTERNAME").unwrap_or_default())
+}
+
+#[cfg(windows)]
+fn windows_computer_name() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::SystemInformation::{
+        GetComputerNameExW, COMPUTER_NAME_FORMAT,
+    };
+    let mut buffer = [0u16; 256];
+    let mut length = buffer.len() as u32;
+    unsafe {
+        GetComputerNameExW(
+            COMPUTER_NAME_FORMAT(0), // ComputerNameNetBIOS
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        )
+    }
+    .ok()?;
+    Some(String::from_utf16_lossy(&buffer[..length as usize]))
 }
 
 /// 冲突副本文件名：attempt=1 → `<stem>-<device>[.<ext>]`；
@@ -135,6 +162,24 @@ mod tests {
         assert_eq!(sanitize_device("   "), "device");
         assert_eq!(sanitize_device(""), "device");
         assert_eq!(sanitize_device("名字-01"), "名字-01", "中文设备名保留");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn device_name_resolves_real_computer_name_not_fallback() {
+        let name = device_name();
+        assert!(!name.is_empty());
+        assert_ne!(
+            name, "device",
+            "GetComputerNameW 必须取到真实计算机名（生产上曾回退成 device）"
+        );
+        // 注意：本机部分进程上下文 COMPUTERNAME 环境变量本来就缺失（这正是
+        // 生产上回退成 "device" 的根源）——所以这里只能断言「取到了合法的真实名字」，
+        // 不能拿环境变量做期望值。
+        assert!(
+            name.chars().all(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')),
+            "计算机名不得含 Windows 非法字符: {name}"
+        );
     }
 
     #[test]
