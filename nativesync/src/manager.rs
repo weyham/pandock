@@ -402,6 +402,7 @@ impl NativeSyncManager {
             outcome.seen.push(fs_id);
             // H1：本地已删除/改名、尚未同步到云端的条目不得被重建，
             // 否则用户删掉的文件会在下次同步无声复活、改名会多出旧路径副本。
+            let mut preserve_baseline = false;
             if let Some((pending_fs_id, op)) = self
                 .db
                 .pending_op_for_remote(snapshot.path.as_str())
@@ -412,6 +413,13 @@ impl NativeSyncManager {
                         "native-sync sync_now keeps local pending entry fs_id={pending_fs_id} op={op}"
                     );
                     continue;
+                }
+                if op == "upload" {
+                    // H1 扩展（finding #3 防御）：pending 上传的条目**不得被 ingest
+                    // 收编基线**——否则 worker 的 stat 比对永远落在收编之后：
+                    // 基线被刷成云端新版 ⇒ 一致 ⇒ rtype=3「安全覆盖」变「静默吃掉
+                    // 别人的云端版本」。保留最后一致版本，冲突才能被 stat 看见。
+                    preserve_baseline = true;
                 }
             }
             let name = sanitize_component(
@@ -477,11 +485,15 @@ impl NativeSyncManager {
                 pending_since: None,
                 has_children: snapshot.is_dir(),
             };
-            self.db.upsert(&record).map_err(NativeSyncError::Message)?;
-            if prior_absent {
-                outcome.added += 1;
-            } else if is_changed {
-                outcome.changed += 1;
+            if preserve_baseline {
+                log::info!("native-sync ingest keeps baseline for pending upload fs_id={fs_id}");
+            } else {
+                self.db.upsert(&record).map_err(NativeSyncError::Message)?;
+                if prior_absent {
+                    outcome.added += 1;
+                } else if is_changed {
+                    outcome.changed += 1;
+                }
             }
             self.platform
                 .set_remote_mapping(&relative, snapshot.path.clone(), fs_id);
@@ -4153,6 +4165,37 @@ mod manager_tests {
         assert_eq!(report.removed, 0, "闸门触发 ⇒ 零删除: {report:?}");
         assert!(backend.stats_calls.lock().unwrap().is_empty(), "闸门触发 ⇒ 零 stat 调用");
         assert_eq!(tombstone_of(&manager, 1000), 0);
+    }
+
+    /// H1 扩展的层内端到端：pending upload 条目在层内**不被收编基线**——
+    /// worker 的 stat 才能看见「云端已越过最后一致版本」并触发冲突（finding #3 防御）。
+    #[tokio::test]
+    async fn pending_upload_entry_keeps_baseline_through_layer() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // 本地编辑已捕获（pending upload）；期间云端被别人改成 v2changed。
+        std::fs::write(root.join("a.txt"), b"mine!").unwrap();
+        make_pending_old(&manager, 11, "upload");
+        backend.replace(vec![("/", vec![file_snap("/a.txt", 11, Some("v2changed"))])]);
+        let report = manager
+            .reconcile_incremental(&AutoSyncParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        let (_, baseline_md5, _) = manager.db.remote_meta_by_fs_id(11).unwrap().unwrap();
+        assert_eq!(
+            baseline_md5.as_deref(),
+            Some("aaa"),
+            "pending upload 条目的基线必须保留为最后一致版本（不得被 ingest 收编成 v2changed）"
+        );
+        assert_eq!(
+            manager.db.pending_op_of(11).unwrap().as_deref(),
+            Some("upload"),
+            "pending 必须留给 worker 处理"
+        );
+        assert_eq!(report.changed, 0, "pending 条目的云端变化不得计入本层变更");
     }
 
     #[tokio::test]
