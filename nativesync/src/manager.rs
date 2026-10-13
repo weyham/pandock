@@ -352,11 +352,28 @@ impl NativeSyncManager {
         self.platform.set_state_db(self.db.path());
         let mut queue = vec![RemotePath::root()];
         let mut seen = Vec::new();
+        let mut gone_dirs = Vec::new();
         while let Some(remote) = queue.pop() {
-            let entries = backend
-                .list(&remote)
-                .await
-                .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
+            let entries = match backend.list(&remote).await {
+                Ok(entries) => entries,
+                Err(error) if error.is_not_found() && !remote.is_root() => {
+                    // 目录在云端已被删除：自身按删除处理（与子树的 global missing 同批，
+                    // 排在最后——has_hydrated_descendant 在子树落地后评估）。
+                    let rel = self.relative_of(&remote);
+                    if let Some((fs_id, state, _, _, _, _)) = self
+                        .db
+                        .entry_by_relative(&rel)
+                        .map_err(NativeSyncError::Message)?
+                    {
+                        log::info!(
+                            "native-sync dir gone remotely in full sync (list -9) fs_id={fs_id}"
+                        );
+                        gone_dirs.push((fs_id as u64, rel, state, true));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(NativeSyncError::Backend(error.to_string())),
+            };
             let outcome = self.ingest_dir_entries(&root, &remote, entries)?;
             seen.extend(outcome.seen);
             queue.extend(outcome.subdirs);
@@ -368,10 +385,11 @@ impl NativeSyncManager {
                 "native-sync existing-path probe run={run_id} checked={checked} placeholders={placeholders} converted={converted} convert_failed={convert_failed}"
             );
         }
-        let missing = self
+        let mut missing = self
             .db
             .missing_entries(&seen)
             .map_err(NativeSyncError::Message)?;
+        missing.extend(gone_dirs);
         self.apply_missing(&root, missing, &backend).await?;
         // 手动「立即对账」成功 = 自动对账的恢复信号（ADR-111 §2.3：清退避/暂停）。
         self.db
@@ -836,10 +854,16 @@ impl NativeSyncManager {
                 report.preempted = true;
                 return Ok(());
             }
-            let entries = backend
-                .list(dir)
-                .await
-                .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
+            let entries = match backend.list(dir).await {
+                Ok(entries) => entries,
+                Err(error) if error.is_not_found() => {
+                    report.drilled += 1;
+                    covered.insert(dir.as_str().to_string());
+                    self.reconcile_gone_dir(root, backend, dir, report).await?;
+                    continue;
+                }
+                Err(error) => return Err(NativeSyncError::Backend(error.to_string())),
+            };
             report.calls += list_call_cost(entries.len());
             report.drilled += 1;
             covered.insert(dir.as_str().to_string());
@@ -900,10 +924,17 @@ impl NativeSyncManager {
             }
             let remote = RemotePath::parse(&dir)
                 .map_err(|e| NativeSyncError::Message(format!("索引目录路径非法: {e}")))?;
-            let entries = backend
-                .list(&remote)
-                .await
-                .map_err(|e| NativeSyncError::Backend(e.to_string()))?;
+            let entries = match backend.list(&remote).await {
+                Ok(entries) => entries,
+                Err(error) if error.is_not_found() => {
+                    report.deep_scanned += 1;
+                    covered.insert(dir.clone());
+                    self.reconcile_gone_dir(root, backend, &remote, report)
+                        .await?;
+                    continue;
+                }
+                Err(error) => return Err(NativeSyncError::Backend(error.to_string())),
+            };
             report.calls += list_call_cost(entries.len());
             report.deep_scanned += 1;
             covered.insert(dir.clone());
@@ -932,6 +963,42 @@ impl NativeSyncManager {
             .ok()
             .flatten()
             .unwrap_or_else(|| trimmed.to_string())
+    }
+
+    /// 目录在云端已被删除（`method=list` 顶层 -9，2026-10-14 实测）时的收编：
+    /// 先处理子树（scoped missing，经批量 stat 确认），最后处理目录自身
+    /// （同一套宽限+确认路径，has_hydrated_descendant 在子树落地后再评估）。
+    /// 绝不上抛当整层致命错误——「目录没了」是删除语义，不是故障。
+    async fn reconcile_gone_dir(
+        &mut self,
+        root: &Path,
+        backend: &Arc<dyn CloudBackend>,
+        remote: &RemotePath,
+        report: &mut AutoLayerReport,
+    ) -> Result<(), NativeSyncError> {
+        let rel = self.relative_of(remote);
+        log::info!("native-sync dir gone remotely (list -9): reconcile subtree fs={rel}");
+        // 子树（直接子项全候选；其各自再经批量 stat 确认）。
+        let (removed, marked) = self.scoped_missing(root, &rel, &[], backend).await?;
+        report.removed += removed;
+        report.remote_missing_marked += marked;
+        // 目录自身：按删除处理（经 apply_missing 的宽限+确认+保留规则）。
+        if let Some((fs_id, state, _, _, _, _)) = self
+            .db
+            .entry_by_relative(&rel)
+            .map_err(NativeSyncError::Message)?
+        {
+            let (removed, marked) = self
+                .apply_missing(
+                    root,
+                    vec![(fs_id as u64, rel.clone(), state, true)],
+                    backend,
+                )
+                .await?;
+            report.removed += removed;
+            report.remote_missing_marked += marked;
+        }
+        Ok(())
     }
 
     /// 单目录 scoped 远端删除对账：只处理该目录的**直接子项**。
@@ -2198,6 +2265,8 @@ mod manager_tests {
         stat_listings: Mutex<HashMap<String, ResourceSnapshot>>,
         /// 批量 stat 调用记录（每次调用的路径数）。
         stats_calls: Mutex<Vec<usize>>,
+        /// 对这些目录的 list 返回 NotFound（模拟「目录在云端已被删除」= 顶层 -9）。
+        not_found_dirs: Mutex<std::collections::HashSet<String>>,
     }
     impl FakeBackend {
         fn script_upload(
@@ -2248,7 +2317,9 @@ mod manager_tests {
                 .lock()
                 .unwrap()
                 .push(path.as_str().to_string());
-            let out = if self.fail_list.load(Ordering::SeqCst) {
+            let out = if self.not_found_dirs.lock().unwrap().contains(path.as_str()) {
+                Err(CloudError::not_found("dir gone remotely (fake -9)"))
+            } else if self.fail_list.load(Ordering::SeqCst) {
                 Err(CloudError::unknown("list failed"))
             } else {
                 Ok(self
@@ -2386,6 +2457,7 @@ mod manager_tests {
             created_dirs: Mutex::new(Vec::new()),
             stat_listings: Mutex::new(HashMap::new()),
             stats_calls: Mutex::new(Vec::new()),
+            not_found_dirs: Mutex::new(std::collections::HashSet::new()),
         });
         backend.replace(entries);
         backend
@@ -4356,6 +4428,104 @@ mod manager_tests {
         assert!(manager.db.pending_op_of(11).unwrap().is_none());
         let snap = manager.db.snapshot_for(11).unwrap().unwrap();
         assert_eq!(snap.size, Some(5), "基线已更新为召回后的真实内容大小");
+    }
+
+    /// 目录在云端已被删除（list 顶层 -9）时的语义：按删除收编，不炸整层。
+    /// （2026-10-14 生产实锤：/cc-switch-sync 整树被删后每层必炸。）
+    #[tokio::test]
+    async fn deep_scan_dir_gone_remotely_reconciles_subtree_without_layer_failure() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![
+            (
+                "/",
+                vec![dir_snap("/d", 101), file_snap("/a.txt", 201, Some("aaa"))],
+            ),
+            ("/d", vec![file_snap("/d/f.txt", 301, None)]),
+        ]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // /d 在云端被删（根 listing 滞后仍含 /d ⇒ 不在根层 missing；深扫 list 吃 -9）。
+        backend
+            .not_found_dirs
+            .lock()
+            .unwrap()
+            .insert("/d".to_string());
+        let report = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("目录 -9 不得炸整层");
+        assert!(report.removed >= 1, "子树应按删除收编: {report:?}");
+        let f_tomb: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT tombstone FROM remote_entry WHERE fs_id=301",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let d_tomb: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT tombstone FROM remote_entry WHERE fs_id=101",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((f_tomb, d_tomb), (1, 1), "子项与目录自身都应 tombstone");
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.iter().filter(|c| c.starts_with("remove:")).count() >= 2,
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_now_dir_gone_remotely_tombstones_subtree_without_failure() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![
+            (
+                "/",
+                vec![dir_snap("/d", 101), file_snap("/a.txt", 201, Some("aaa"))],
+            ),
+            ("/d", vec![file_snap("/d/f.txt", 301, None)]),
+        ]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        backend
+            .not_found_dirs
+            .lock()
+            .unwrap()
+            .insert("/d".to_string());
+        manager
+            .sync_now()
+            .await
+            .expect("sync_now 遇目录 -9 不得失败");
+        let f_tomb: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT tombstone FROM remote_entry WHERE fs_id=301",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let d_tomb: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT tombstone FROM remote_entry WHERE fs_id=101",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((f_tomb, d_tomb), (1, 1));
     }
 
     #[tokio::test]
