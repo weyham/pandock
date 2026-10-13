@@ -3,6 +3,6 @@ members = ["core", "src-tauri", "nativesync", "updater"]
 resolver = "2"
 
 [workspace.package]
-version = "1.2.1"
+version = "1.3.0"
 edition = "2021"
 license = "MIT"
