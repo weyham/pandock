@@ -244,6 +244,9 @@ pub trait PlatformSync: Send + Sync {
     /// 把占位符标为「未同步」：平台据此**拒绝脱水**（甲方案的守卫，见 `mark_path_not_in_sync`）。
     /// 默认空实现（非 Windows / 未实现平台不影响其它路径）。
     fn mark_not_in_sync(&mut self, _path: &Path) {}
+    /// 登记应用自身发起的路径操作（自杀回调守卫，ADR-112 冲突副本改名）：
+    /// 随后这些路径的 NOTIFY_* 不得记为用户的本地变更。路径为**完整路径**。
+    fn note_self_path_ops(&mut self, _paths: &[std::path::PathBuf]) {}
     /// 从文件系统回读 pin 状态（None = 未知/非占位符）。
     /// CFAPI 会把「固定到本地」镜像到 FILE_ATTRIBUTE_PINNED 属性位。
     fn pin_state(&self, path: &Path) -> Option<bool>;
@@ -3612,6 +3615,11 @@ mod windows_impl {
             // 也要落实成平台状态，否则平台仍可能把它脱水掉。
             if let Err(err) = mark_path_not_in_sync(path) {
                 log::warn!("native-sync mark_not_in_sync failed: {err}");
+            }
+        }
+        fn note_self_path_ops(&mut self, paths: &[std::path::PathBuf]) {
+            for path in paths {
+                note_app_path_op(&self.runtime, path);
             }
         }
         fn remove_placeholder(&mut self, path: &Path, is_dir: bool) -> Result<(), PlatformError> {

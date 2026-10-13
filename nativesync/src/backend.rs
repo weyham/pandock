@@ -37,6 +37,11 @@ pub trait CloudBackend: Send + Sync {
         &'a self,
         path: &'a RemotePath,
     ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>>;
+    /// 创建目录（本地新建目录的上传）；云端已存在（-8）由调用方按「已存在即成功」处理。
+    fn create_dir<'a>(
+        &'a self,
+        path: &'a RemotePath,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>>;
 }
 
 pub struct SnapshotBackend {
@@ -72,6 +77,12 @@ impl CloudBackend for SnapshotBackend {
         path: &'a RemotePath,
     ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
         self.inner.remove(path)
+    }
+    fn create_dir<'a>(
+        &'a self,
+        path: &'a RemotePath,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+        self.inner.create_collection(path)
     }
 
     fn stat<'a>(
@@ -178,5 +189,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind, pandock_core::cloud::CloudErrorKind::Unsupported);
+        assert!(backend.create_dir(&root).await.is_ok());
     }
 }

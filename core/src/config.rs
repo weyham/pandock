@@ -25,6 +25,10 @@ pub struct Config {
     pub native_sync_notifications: bool,
     /// NativeSync 自动对账（ADR-111 无感同步）开关：false = 退回纯手动「立即对账」。
     pub native_sync_auto: bool,
+    /// NativeSync 上传方向（ADR-112 双向工作区）开关：false = 回 S1 单向
+    /// （本地变更仍记录 pending，绝不传播到云端）。默认开启（2026-10-13 总监裁决：
+    /// 用户已裁决双向工作区照 OneDrive，默认关等于交付不生效的双向）。
+    pub native_sync_upload: bool,
 }
 
 impl Default for Config {
@@ -44,6 +48,7 @@ impl Default for Config {
             start_webdav_automatically: true,
             native_sync_notifications: true,
             native_sync_auto: true,
+            native_sync_upload: true,
         }
     }
 }
@@ -159,6 +164,25 @@ mod migration_tests {
         assert!(legacy.native_sync_auto);
         let off: Config = serde_json::from_str(r#"{"native_sync_auto":false}"#).unwrap();
         assert!(!off.native_sync_auto);
+    }
+
+    #[test]
+    fn native_sync_upload_defaults_on_and_reads_explicit_off() {
+        let cfg = Config::default();
+        assert!(
+            cfg.native_sync_upload,
+            "上传方向默认开启（ADR-112 + 总监裁决）"
+        );
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["native_sync_upload"], true);
+        assert!(
+            json.get("nativeSyncUpload").is_none(),
+            "config.json 不使用 camelCase 键"
+        );
+        let legacy: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(legacy.native_sync_upload);
+        let off: Config = serde_json::from_str(r#"{"native_sync_upload":false}"#).unwrap();
+        assert!(!off.native_sync_upload);
     }
 
     #[test]

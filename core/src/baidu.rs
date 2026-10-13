@@ -1,4 +1,4 @@
-use crate::cloud::UploadOutcome;
+use crate::cloud::{UploadFailure, UploadOutcome};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -58,6 +58,14 @@ pub struct FileEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ListResponse {
     pub list: Vec<FileEntry>,
+}
+
+/// `upload_precreate_and_parts` 的产物：待 create 的全部材料。
+struct UploadPrepared {
+    path: String,
+    upload_id: String,
+    block_list: String,
+    rapid: bool,
 }
 
 /// `method=list` 的固定分页大小。NativeSync 自动对账按它把一次目录列举折算成实际 HTTP
@@ -548,6 +556,7 @@ impl BaiduClient {
         self.upload_file_detailed(dav_path, local, size, 3)
             .await
             .map(|_| ())
+            .map_err(|failure| failure.message)
     }
 
     /// 详细上传（ADR-112）：`rtype` 由调用方给定（NativeSync 用 0 = 冲突失败以便检测）；
@@ -559,7 +568,50 @@ impl BaiduClient {
         local: &Path,
         size: u64,
         rtype: u32,
-    ) -> Result<UploadOutcome, String> {
+    ) -> Result<UploadOutcome, UploadFailure> {
+        let prepared = self
+            .upload_precreate_and_parts(dav_path, local, size, rtype)
+            .await
+            .map_err(|message| UploadFailure {
+                rapid: false,
+                message,
+            })?;
+        // errno -8（rtype=0 冲突）在这里以 Err 返回，错误文本含 JSON 原文，
+        // 由 CloudError::from_message 分类为 AlreadyExists（ADR-112 §3.3 冲突入口）；
+        // rapid 随失败返回（秒传假冲突守卫需要）。
+        let created = self
+            .upload_create(
+                &prepared.path,
+                size,
+                rtype,
+                &prepared.upload_id,
+                &prepared.block_list,
+            )
+            .await
+            .map_err(|message| UploadFailure {
+                rapid: prepared.rapid,
+                message,
+            })?;
+        Ok(UploadOutcome {
+            fs_id: created.get("fs_id").and_then(|v| v.as_u64()),
+            md5: created
+                .get("md5")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            size,
+            mtime: created.get("mtime").and_then(|v| v.as_i64()),
+            rapid: prepared.rapid,
+        })
+    }
+
+    /// 三段式的前两段：precreate + 分片上传（秒传时跳过）→ 待 create 的全部材料。
+    async fn upload_precreate_and_parts(
+        &self,
+        dav_path: &str,
+        local: &Path,
+        size: u64,
+        rtype: u32,
+    ) -> Result<UploadPrepared, String> {
         self.require_child_path(dav_path)?;
         let path = self.remote_path(dav_path)?;
         let mut file = tokio::fs::File::open(local)
@@ -669,33 +721,39 @@ impl BaiduClient {
         }
         let uploaded_block_list =
             serde_json::to_string(&uploaded_hashes).map_err(|e| e.to_string())?;
+        Ok(UploadPrepared {
+            path,
+            upload_id,
+            block_list: uploaded_block_list,
+            rapid,
+        })
+    }
+
+    /// 三段式的末段：create（合并分片）。独立出来以便调用方拿到 create 的原始 JSON
+    /// （fs_id/md5/mtime 是回声抑制的基线来源；-8 冲突也要从这里冒出）。
+    async fn upload_create(
+        &self,
+        path: &str,
+        size: u64,
+        rtype: u32,
+        upload_id: &str,
+        block_list: &str,
+    ) -> Result<serde_json::Value, String> {
         let response = self
             .api_post("/rest/2.0/xpan/file")
             .query(&[("method", "create")])
             .form(&[
-                ("path", path.as_str()),
+                ("path", path),
                 ("size", &size.to_string()),
                 ("isdir", "0"),
                 ("rtype", rtype.to_string().as_str()),
-                ("uploadid", upload_id.as_str()),
-                ("block_list", uploaded_block_list.as_str()),
+                ("uploadid", upload_id),
+                ("block_list", block_list),
             ])
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        // errno -8（rtype=0 冲突）在这里以 Err 返回，错误文本含 JSON 原文，
-        // 由 CloudError::from_message 分类为 AlreadyExists（ADR-112 §3.3 冲突入口）。
-        let created = self.decode_json(response).await?;
-        Ok(UploadOutcome {
-            fs_id: created.get("fs_id").and_then(|v| v.as_u64()),
-            md5: created
-                .get("md5")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            size,
-            mtime: created.get("mtime").and_then(|v| v.as_i64()),
-            rapid,
-        })
+        self.decode_json(response).await
     }
 
     async fn locate_upload(&self, path: &str, upload_id: &str) -> Result<String, String> {
@@ -1183,12 +1241,14 @@ mod api_tests {
             .await;
         let client = BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
             .with_base_urls(&server.uri());
-        let error = client
+        let failure = client
             .upload_file_detailed("/f.bin", &local, 5, 0)
             .await
             .unwrap_err();
+        // 秒传轮（block_list=[]）⇒ rapid 必须随失败返回（假冲突守卫的依据）。
+        assert!(failure.rapid, "本轮为秒传，rapid 必须随 -8 返回");
         // ADR-112 §3.3 冲突入口：-8 必须能分类为 AlreadyExists（含原始 errno）。
-        let cloud = crate::cloud::CloudError::from_message(error);
+        let cloud = crate::cloud::CloudError::from_message(failure.message);
         assert_eq!(cloud.kind, crate::cloud::CloudErrorKind::AlreadyExists);
         assert_eq!(cloud.raw_errno, Some(-8));
         assert!(!cloud.retryable, "冲突不可重试（要走冲突流程，不是盲重）");

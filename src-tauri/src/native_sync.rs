@@ -104,6 +104,11 @@ fn attach_event_sink(app: &AppHandle, manager: &mut NativeSyncManager) {
         // 变更事件立即推送（UI 按 source 过滤）；状态统计做节流重推。
         let _ = change_handle.emit(NATIVE_SYNC_CHANGE_EVENT, &event);
         emit_state_throttled(&change_handle);
+        // ADR-112：本地变更 ⇒ 唤醒上传 worker（上传队列由它消费）。
+        change_handle
+            .state::<AppState>()
+            .auto_sync_wake
+            .notify_one();
     })));
     manager.set_event_sink(Some(std::sync::Arc::new(move |_event| {
         let app = app_handle.clone();
@@ -142,6 +147,152 @@ pub async fn native_sync_status(app: AppHandle) -> Result<NativeSyncStatusView, 
 // 任何时刻最多一层对账在跑（native_sync_engine 互斥）；手动对账经 auto_sync_cancel 抢占。
 
 static AUTO_SYNC_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// ---------- ADR-112：上传 worker（双向工作区 S2） ----------
+//
+// 消费本地变更队列（drain_upload_queue）：防抖 3s、串行、文件间让位（engine 互斥 + cancel）。
+// 唤醒源：变更事件（change sink）、enable、手动对账成功、配置切换；60s 兜底巡检。
+// 开关：`native_sync_upload=false` ⇒ 回 S1 单向（pending 仍记录，绝不传播）。
+
+static UPLOAD_WORKER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 启动上传 worker（幂等）。挂点与自动对账调度器一致。
+pub fn spawn_upload_worker(app: &AppHandle) {
+    use std::sync::atomic::Ordering;
+    if UPLOAD_WORKER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    log::info!("native-sync upload worker spawned");
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        upload_worker_loop(app).await;
+    });
+}
+
+async fn upload_worker_loop(app: AppHandle) {
+    let params = pandock_nativesync::UploadParams::default();
+    let wake = app.state::<AppState>().auto_sync_wake.clone();
+    // 启动短延迟：本地改动要尽快上云（自动对账首层是 60s，上传不能等满）。
+    sleep_or_wake(std::time::Duration::from_secs(5), &wake).await;
+    let mut consecutive_failures = 0u32;
+    loop {
+        // 开关（ADR-112 §3.6 #8 的回滚路径）。
+        let upload_on = app
+            .state::<AppState>()
+            .config
+            .lock()
+            .map(|config| config.native_sync_upload)
+            .unwrap_or(false);
+        if !upload_on {
+            sleep_or_wake(std::time::Duration::from_secs(60), &wake).await;
+            continue;
+        }
+        let enabled = {
+            let state = app.state::<AppState>();
+            let guard = state.native_sync.lock().await;
+            guard
+                .as_ref()
+                .and_then(|manager| manager.status().ok())
+                .map(|status| status.enabled)
+                .unwrap_or(false)
+        };
+        if !enabled {
+            sleep_or_wake(std::time::Duration::from_secs(60), &wake).await;
+            continue;
+        }
+        // 单飞 + 手动抢占让位：与自动对账/手动对账共用同一把 engine 互斥。
+        let engine = app.state::<AppState>().native_sync_engine.clone();
+        let Ok(engine_guard) = engine.try_lock() else {
+            sleep_or_wake(std::time::Duration::from_secs(15), &wake).await;
+            continue;
+        };
+        let backend = match client_from_state(&app) {
+            Ok(client) => {
+                let cloud: Arc<dyn CloudFs> = Arc::new(BaiduCloudFs::new(client));
+                Some(Arc::new(SnapshotBackend::new(cloud))
+                    as Arc<dyn pandock_nativesync::CloudBackend>)
+            }
+            Err(_) => None,
+        };
+        let mut manager = {
+            let state = app.state::<AppState>();
+            let mut guard = state.native_sync.lock().await;
+            if ensure_manager_guard(&app, &mut guard).await.is_err() {
+                drop(guard);
+                drop(engine_guard);
+                sleep_or_wake(std::time::Duration::from_secs(60), &wake).await;
+                continue;
+            }
+            guard.take().expect("manager initialized")
+        };
+        let result = match backend {
+            Some(backend) => {
+                manager.set_backend(backend);
+                let cancel = app.state::<AppState>().auto_sync_cancel.clone();
+                manager.drain_upload_queue(&params, &cancel).await.map(Some)
+            }
+            None => Ok(None),
+        };
+        {
+            let state = app.state::<AppState>();
+            let mut guard = state.native_sync.lock().await;
+            *guard = Some(manager);
+        }
+        drop(engine_guard);
+        match result {
+            Ok(Some(report)) => {
+                let did_work = report.uploaded
+                    + report.dirs_created
+                    + report.conflicts
+                    + report.deleted
+                    + report.renamed
+                    > 0;
+                if did_work || report.failed > 0 {
+                    emit_current_state(&app).await;
+                }
+                if report.failed > 0 {
+                    consecutive_failures += 1;
+                    let delay = next_delay(
+                        false,
+                        consecutive_failures,
+                        &pandock_nativesync::AutoSyncParams::default(),
+                    );
+                    sleep_or_wake(delay, &wake).await;
+                } else {
+                    consecutive_failures = 0;
+                    if report.deferred > 0 || did_work {
+                        // 防抖窗口内的条目 / 刚做过功 ⇒ 短睡后尽快再扫一轮。
+                        sleep_or_wake(std::time::Duration::from_secs(3), &wake).await;
+                    } else {
+                        // 空队列：低频兜底巡检（正常由变更事件唤醒）。
+                        sleep_or_wake(std::time::Duration::from_secs(60), &wake).await;
+                    }
+                }
+            }
+            Ok(None) => {
+                // 未授权：与自动对账同纪律（退避，不骚扰）。
+                consecutive_failures += 1;
+                let delay = next_delay(
+                    false,
+                    consecutive_failures,
+                    &pandock_nativesync::AutoSyncParams::default(),
+                );
+                sleep_or_wake(delay, &wake).await;
+            }
+            Err(error) => {
+                consecutive_failures += 1;
+                log::warn!("native-sync upload worker drain failed: {error}");
+                let delay = next_delay(
+                    false,
+                    consecutive_failures,
+                    &pandock_nativesync::AutoSyncParams::default(),
+                );
+                sleep_or_wake(delay, &wake).await;
+            }
+        }
+    }
+}
 
 /// 启动自动对账调度器（幂等）。挂点：启动重连完成后 + native_sync_enable 成功后。
 pub fn spawn_auto_sync(app: &AppHandle) {
@@ -332,6 +483,7 @@ pub async fn native_sync_enable(
     emit_state(&app, &status);
     // 启用成功 ⇒ 调度器必须在场（不能只在启动重连一处挂）；唤醒立即重估。
     spawn_auto_sync(&app);
+    spawn_upload_worker(&app);
     app.state::<AppState>().auto_sync_wake.notify_one();
     Ok(status)
 }

@@ -11,6 +11,7 @@ mod notify;
 mod path;
 mod platform;
 mod scheduler;
+mod upload;
 
 pub use backend::{CloudBackend, SnapshotBackend};
 pub use model::{NativeSyncChangeEvent, NativeSyncEvent};
@@ -23,3 +24,4 @@ pub use model::{
 };
 pub use path::{default_root_path, sanitize_component, validate_root_path};
 pub use scheduler::{next_delay, should_pause, AutoSyncParams};
+pub use upload::{UploadDrainReport, UploadParams};

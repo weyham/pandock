@@ -584,19 +584,17 @@ fn save_config(app: AppHandle, mut config: Config) -> Result<(), String> {
         .lock()
         .unwrap()
         .native_sync_notifications;
-    let auto_before = app
-        .state::<AppState>()
-        .config
-        .lock()
-        .unwrap()
-        .native_sync_auto;
+    let (auto_before, upload_before) = {
+        let current = app.state::<AppState>().config.lock().unwrap().clone();
+        (current.native_sync_auto, current.native_sync_upload)
+    };
     app.state::<AppState>()
         .config
         .lock()
         .unwrap()
         .clone_from(&config);
-    if auto_before != config.native_sync_auto {
-        // 自动对账开关即时生效：唤醒调度器重估（ADR-111 §2.5 回滚路径）。
+    if auto_before != config.native_sync_auto || upload_before != config.native_sync_upload {
+        // 自动对账/上传开关即时生效：唤醒调度器重估（ADR-111/ADR-112 回滚路径）。
         app.state::<AppState>().auto_sync_wake.notify_one();
     }
     if notifications_before != config.native_sync_notifications {
@@ -1226,8 +1224,10 @@ pub fn run() {
                             status.total_entries
                         );
                     }
-                    // 自动对账调度器（ADR-111）：幂等；循环自身按 enabled/config/暂停门控。
+                    // 自动对账调度器（ADR-111）+ 上传 worker（ADR-112）：
+                    // 幂等；循环自身按 enabled/config/暂停门控。
                     crate::native_sync::spawn_auto_sync(&autostart_app);
+                    crate::native_sync::spawn_upload_worker(&autostart_app);
                 });
             }
             {

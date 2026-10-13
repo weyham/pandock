@@ -822,6 +822,163 @@ impl IndexDb {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+    /// 失败计次 +1 并返回新值（上传 worker 退避/阈值判定用）。
+    pub fn bump_error_count(&self, fs_id: i64) -> Result<u32, String> {
+        self.conn
+            .execute(
+                "UPDATE local_state SET error_count=error_count+1 WHERE fs_id=?1",
+                params![fs_id],
+            )
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .query_row(
+                "SELECT error_count FROM local_state WHERE fs_id=?1",
+                params![fs_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u32)
+            .map_err(|e| e.to_string())
+    }
+    /// 传播成功后清零失败计次与错误文本。
+    pub fn clear_error(&self, fs_id: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE local_state SET error_count=0,last_error=NULL WHERE fs_id=?1",
+                params![fs_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    /// 上传成功的新云端条目直接落库为「完整本地内容」（placeholder=0、hydrated）。
+    /// 与 rekey 不同：没有旧的 local_only 行要清理（冲突副本走这里）。
+    pub fn insert_uploaded_entry(&self, record: &EntryRecord) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone) VALUES(?,?,?,?,?,?,?,?,?,0,0) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0",
+                params![
+                    record.fs_id,
+                    record.parent_fs_id,
+                    record.remote_path,
+                    record.name,
+                    record.is_dir as i64,
+                    record.size as i64,
+                    record.md5,
+                    record.modified_at,
+                    Option::<String>::None
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?,?,0,'hydrated','unpinned',NULL,0) ON CONFLICT(fs_id) DO UPDATE SET relative_path=excluded.relative_path,placeholder=0,hydration_state='hydrated',last_error=NULL,error_count=0",
+                params![record.fs_id, record.relative_path],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    /// S2 上传队列：待传播条目（pending_op 非空）。按 relative_path 字典序——
+    /// 父目录天然排在子项之前（"a" < "a/b"），新建目录先于其内容上传。
+    /// 行：(fs_id, relative_path, pending_op, is_dir, local_only, remote_path)。
+    #[allow(clippy::type_complexity)]
+    pub fn upload_queue(
+        &self,
+    ) -> Result<Vec<(i64, String, String, bool, bool, String, Option<String>)>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT r.fs_id,l.relative_path,l.pending_op,r.is_dir,r.local_only,r.remote_path,l.pending_since FROM remote_entry r JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0 AND l.pending_op IN ('upload','delete','rename') ORDER BY l.relative_path",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                    r.get::<_, i64>(4)? != 0,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+    /// 某条目的本地变更已传播到云端：local_change 未应用行全部标记。
+    pub fn mark_local_changes_applied(&self, fs_id: i64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE local_change SET applied_to_cloud=1 WHERE fs_id=?1 AND applied_to_cloud=0",
+                params![fs_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    /// 改名传播成功后回写云端事实（fs_id 不变——opera=move 的全部意义）。
+    pub fn apply_remote_rename(
+        &self,
+        fs_id: i64,
+        new_remote: &str,
+        new_name: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE remote_entry SET remote_path=?2,name=?3 WHERE fs_id=?1",
+                params![fs_id, new_remote, new_name],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    /// local_only（负数 fs_id）上传成功 ⇒ 以真实 fs_id 重建索引行并删除旧行。
+    /// 新文件在本地是完整内容：placeholder=0、hydrated；pin_state 从旧行继承。
+    pub fn rekey_local_only(&self, old_fs_id: i64, record: &EntryRecord) -> Result<(), String> {
+        let pin: String = self
+            .conn
+            .query_row(
+                "SELECT pin_state FROM local_state WHERE fs_id=?1",
+                params![old_fs_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "unpinned".into());
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO remote_entry(fs_id,parent_fs_id,remote_path,name,is_dir,size,md5,modified_at,etag,seen_cycle,tombstone) VALUES(?,?,?,?,?,?,?,?,?,0,0) ON CONFLICT(fs_id) DO UPDATE SET parent_fs_id=excluded.parent_fs_id,remote_path=excluded.remote_path,name=excluded.name,is_dir=excluded.is_dir,size=excluded.size,md5=excluded.md5,modified_at=excluded.modified_at,tombstone=0",
+            params![
+                record.fs_id,
+                record.parent_fs_id,
+                record.remote_path,
+                record.name,
+                record.is_dir as i64,
+                record.size as i64,
+                record.md5,
+                record.modified_at,
+                Option::<String>::None
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO local_state(fs_id,relative_path,placeholder,hydration_state,pin_state,last_error,error_count) VALUES(?,?,0,'hydrated',?,NULL,0) ON CONFLICT(fs_id) DO UPDATE SET relative_path=excluded.relative_path,placeholder=0,hydration_state='hydrated',pin_state=excluded.pin_state,last_error=NULL,error_count=0",
+            params![record.fs_id, record.relative_path, pin],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM local_state WHERE fs_id=?1", params![old_fs_id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM remote_entry WHERE fs_id=?1",
+            params![old_fs_id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
     pub fn counts(&self) -> Result<(u64, u64, u64, u64, u64), String> {
         self.conn.query_row("SELECT COUNT(*),COALESCE(SUM(CASE WHEN l.placeholder=1 THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN l.hydration_state='hydrated' THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN l.hydration_state IN ('error','remote_missing','stale') OR l.pending_op IN ('delete','rename') THEN 1 ELSE 0 END),0),COALESCE((SELECT COUNT(*) FROM hydration_job WHERE status='running'),0) FROM remote_entry r LEFT JOIN local_state l ON l.fs_id=r.fs_id WHERE r.tombstone=0",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).map_err(|e|e.to_string())
     }

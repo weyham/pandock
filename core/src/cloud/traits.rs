@@ -250,7 +250,11 @@ impl CloudFs for BaiduCloudFs {
             self.client
                 .upload_file_detailed(path.as_str(), local, size, rtype)
                 .await
-                .map_err(CloudError::from_message)
+                .map_err(|failure| {
+                    let mut error = CloudError::from_message(failure.message);
+                    error.rapid_hint = failure.rapid;
+                    error
+                })
         }
         .boxed()
     }

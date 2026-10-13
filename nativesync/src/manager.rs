@@ -1,18 +1,19 @@
 use crate::backend::CloudBackend;
 use crate::db::IndexDb;
 use crate::model::{
-    EntryAction, NativeSyncAction, NativeSyncEntryView, NativeSyncEvent, NativeSyncListView,
-    NativeSyncState, NativeSyncStatusView, PinState,
+    EntryAction, EntryRecord, NativeSyncAction, NativeSyncEntryView, NativeSyncEvent,
+    NativeSyncListView, NativeSyncState, NativeSyncStatusView, PinState,
 };
 use crate::path::{default_root_path, sanitize_component, validate_root_path};
 use crate::platform::{new_platform, PlatformError, PlatformSync};
 use crate::scheduler::AutoSyncParams;
-use pandock_core::cloud::{RemotePath, ResourceSnapshot};
+use crate::upload::{self, UploadDrainReport, UploadParams};
+use pandock_core::cloud::{CloudError, RemotePath, ResourceSnapshot};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeSyncError {
@@ -77,6 +78,56 @@ fn remote_content_changed(
             }
         }
     }
+}
+
+/// 上传任务效果（report 计数用）。
+enum UploadTaskEffect {
+    Uploaded,
+    DirCreated,
+    Conflicted,
+    Deleted,
+    Renamed,
+    Skipped,
+}
+
+/// 上传任务失败：Hard = 只影响该条目（继续下一个）；Retryable = 中断本层（退避交给调度层）。
+enum UploadTaskError {
+    Hard(String),
+    Retryable(String),
+}
+impl UploadTaskError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Hard(message) | Self::Retryable(message) => message,
+        }
+    }
+}
+impl From<NativeSyncError> for UploadTaskError {
+    fn from(error: NativeSyncError) -> Self {
+        Self::Retryable(error.to_string())
+    }
+}
+
+/// 上传目标远端路径：本地新建（或 remote_path 还是 local: 前缀）⇒ 按相对路径推导；
+/// 云端已知条目 ⇒ 用索引里的真实云端路径（大小写/净化差异以云端为准）。
+fn remote_for_upload(
+    relative: &str,
+    remote_path: &str,
+    local_only: bool,
+) -> Result<RemotePath, String> {
+    let candidate = if local_only || remote_path.starts_with("local:") {
+        format!("/{relative}")
+    } else {
+        remote_path.to_string()
+    };
+    RemotePath::parse(&candidate).map_err(|e| format!("远端路径非法: {e}"))
+}
+
+/// SystemTime → epoch 秒（索引 modified_at 契约）。
+fn epoch_of(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
 }
 
 /// 单个目录列举的消化结果（全量 BFS 与增量层共用）。
@@ -796,6 +847,575 @@ impl NativeSyncManager {
         self.apply_missing(root, missing)
     }
 
+    /// S2 上传方向（ADR-112）：传播一轮待同步变更（本地 → 云端）。
+    ///
+    /// 与自动对账共用 src-tauri 的 engine 互斥；文件间检查 `cancel`（手动对账抢占 ⇒
+    /// `interrupted=true` 让位，不算失败）。失败纪律：硬错误（配额/权限/参数/冲突逃逸）只影响
+    /// 该条目、进「需处理」；可重试错误计次退避（≥5 次进「需处理」）并中断本层（不烧配额）。
+    pub async fn drain_upload_queue(
+        &mut self,
+        params: &UploadParams,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<UploadDrainReport, NativeSyncError> {
+        let mut report = UploadDrainReport::default();
+        let Some((root, enabled, _)) = self.db.root().map_err(NativeSyncError::Message)? else {
+            return Ok(report);
+        };
+        if !enabled {
+            return Ok(report);
+        }
+        let Some(backend) = self.backend.clone() else {
+            return Err(NativeSyncError::Message("请先完成百度网盘授权".into()));
+        };
+        let queue = self.db.upload_queue().map_err(NativeSyncError::Message)?;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for (fs_id, relative, op, is_dir, local_only, remote_path, pending_since) in queue {
+            if cancel.load(Ordering::Relaxed) {
+                report.interrupted = true;
+                break;
+            }
+            // 防抖（ADR-112 §3.6：3s）：窗口内的条目留给下一次 drain（编辑器连续保存合并）。
+            if let Some(since) = pending_since
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                if now_secs.saturating_sub(since) < params.debounce.as_secs() {
+                    report.deferred += 1;
+                    continue;
+                }
+            }
+            let outcome = match op.as_str() {
+                "upload" => {
+                    self.exec_upload(
+                        &root,
+                        &backend,
+                        params,
+                        fs_id,
+                        &relative,
+                        is_dir,
+                        local_only,
+                        &remote_path,
+                    )
+                    .await
+                }
+                "delete" => {
+                    self.exec_delete(&backend, params, fs_id, local_only, &remote_path)
+                        .await
+                }
+                "rename" => {
+                    self.exec_rename_propagate(&backend, params, fs_id, &relative, &remote_path)
+                        .await
+                }
+                _ => Ok(UploadTaskEffect::Skipped),
+            };
+            match outcome {
+                Ok(UploadTaskEffect::Uploaded) => report.uploaded += 1,
+                Ok(UploadTaskEffect::DirCreated) => report.dirs_created += 1,
+                Ok(UploadTaskEffect::Conflicted) => report.conflicts += 1,
+                Ok(UploadTaskEffect::Deleted) => report.deleted += 1,
+                Ok(UploadTaskEffect::Renamed) => report.renamed += 1,
+                Ok(UploadTaskEffect::Skipped) => report.skipped += 1,
+                Err(error) => {
+                    let retryable = matches!(error, UploadTaskError::Retryable(_));
+                    report.failed += 1;
+                    let message = error.into_message();
+                    log::warn!(
+                        "native-sync upload task failed fs_id={fs_id} op={op} retryable={retryable} error={message}"
+                    );
+                    if report.first_error.is_none() {
+                        report.first_error = Some(message);
+                    }
+                    if retryable {
+                        // 可重试错误（疑似网络/限流）：本层到此为止，退避交给调度层——
+                        // 继续打只会把整队文件都变成失败计次并烧配额。
+                        break;
+                    }
+                }
+            }
+        }
+        if report.uploaded
+            + report.dirs_created
+            + report.conflicts
+            + report.deleted
+            + report.renamed
+            + report.failed
+            + report.skipped
+            + report.deferred
+            > 0
+        {
+            log::info!(
+                "native-sync upload drain uploaded={} dirs={} conflicts={} deleted={} renamed={} skipped={} deferred={} failed={} interrupted={}",
+                report.uploaded, report.dirs_created, report.conflicts, report.deleted,
+                report.renamed, report.skipped, report.deferred, report.failed, report.interrupted
+            );
+        }
+        Ok(report)
+    }
+
+    /// 单条 upload 任务：本地新建（local_only）或云端条目的本地编辑。
+    #[allow(clippy::too_many_arguments)]
+    async fn exec_upload(
+        &mut self,
+        root: &Path,
+        backend: &Arc<dyn CloudBackend>,
+        params: &UploadParams,
+        fs_id: i64,
+        relative: &str,
+        is_dir: bool,
+        local_only: bool,
+        remote_path: &str,
+    ) -> Result<UploadTaskEffect, UploadTaskError> {
+        let local = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let meta = match std::fs::metadata(&local) {
+            Ok(meta) => meta,
+            Err(_) => {
+                // 本地已消失：本地新建从未上云 ⇒ 清索引；云端条目 ⇒ 删除是否传播由
+                // delete pending 另行裁决，这里只清 upload 标记防卡死（无证据不传播）。
+                let _ = self.db.set_pending_op(fs_id, None, None);
+                if local_only {
+                    let _ = self.db.tombstone(fs_id as u64);
+                }
+                log::info!("native-sync upload skipped: local file gone fs_id={fs_id}");
+                return Ok(UploadTaskEffect::Skipped);
+            }
+        };
+        let remote =
+            remote_for_upload(relative, remote_path, local_only).map_err(UploadTaskError::Hard)?;
+        if is_dir {
+            let created = match backend.create_dir(&remote).await {
+                Ok(()) => true,
+                // 云端已存在（-8）⇒ 视为成功（目录语义幂等）。
+                Err(error) if upload::is_conflict_error(&error) => false,
+                Err(error) => return Err(self.fail_entry(fs_id, &error, params)),
+            };
+            if local_only {
+                // create_collection 不回 fs_id：stat 一次拿真身（仅新建目录路径，+1 次调用）。
+                let snap = backend
+                    .stat(&remote)
+                    .await
+                    .map_err(|e| self.fail_entry(fs_id, &e, params))?;
+                let Some(real_id) = snap.fs_id else {
+                    return Err(UploadTaskError::Retryable(
+                        "目录上传后 stat 缺少 fs_id".into(),
+                    ));
+                };
+                let record = self.uploaded_record(
+                    real_id,
+                    relative,
+                    &remote,
+                    true,
+                    snap.size,
+                    snap.md5.clone(),
+                    epoch_of(snap.modified),
+                )?;
+                self.db
+                    .rekey_local_only(fs_id, &record)
+                    .map_err(UploadTaskError::Hard)?;
+            }
+            self.db
+                .set_pending_op(fs_id, None, None)
+                .map_err(UploadTaskError::Hard)?;
+            let _ = self.db.mark_local_changes_applied(fs_id);
+            let _ = self.db.clear_error(fs_id);
+            let _ = self.platform.mark_in_sync(&local);
+            if let Some(real) = self.db.entry_by_relative(relative).ok().flatten() {
+                self.platform
+                    .set_remote_mapping(relative, remote.clone(), real.0 as u64);
+            }
+            log::info!("native-sync upload dir done fs_id={fs_id} created={created}");
+            return Ok(if created {
+                UploadTaskEffect::DirCreated
+            } else {
+                UploadTaskEffect::Uploaded
+            });
+        }
+        let size = meta.len();
+        match backend.upload(&remote, &local, size).await {
+            Ok(outcome) => {
+                let real_id = outcome
+                    .fs_id
+                    .ok_or_else(|| UploadTaskError::Retryable("上传回执缺少 fs_id".into()))?;
+                self.finish_upload_success(
+                    fs_id,
+                    real_id,
+                    relative,
+                    &remote,
+                    &local,
+                    &meta,
+                    local_only,
+                    false,
+                    outcome.size,
+                    outcome.md5.clone(),
+                    outcome.mtime,
+                )?;
+                log::info!(
+                    "native-sync upload done fs_id={real_id} rapid={} size={size}",
+                    outcome.rapid
+                );
+                Ok(UploadTaskEffect::Uploaded)
+            }
+            Err(error) if upload::is_conflict_error(&error) => {
+                if error.rapid_hint {
+                    // 秒传假冲突守卫（ADR-112 §3.3 终审补记）：先比 md5，
+                    // 一致 ⇒ 双方已一致，直接回写基线，不走冲突流程。
+                    let local_md5 =
+                        upload::local_md5(&local).map_err(UploadTaskError::Retryable)?;
+                    let snap = backend
+                        .stat(&remote)
+                        .await
+                        .map_err(|e| self.fail_entry(fs_id, &e, params))?;
+                    if snap.md5.as_deref() == Some(local_md5.as_str()) {
+                        let real_id = snap
+                            .fs_id
+                            .ok_or_else(|| UploadTaskError::Retryable("stat 缺少 fs_id".into()))?;
+                        self.finish_upload_success(
+                            fs_id,
+                            real_id,
+                            relative,
+                            &remote,
+                            &local,
+                            &meta,
+                            local_only,
+                            false,
+                            snap.size,
+                            snap.md5.clone(),
+                            epoch_of(snap.modified),
+                        )?;
+                        log::info!(
+                            "native-sync upload already consistent after rapid -8 fs_id={real_id}"
+                        );
+                        return Ok(UploadTaskEffect::Uploaded);
+                    }
+                }
+                self.exec_conflict(
+                    root, backend, params, fs_id, relative, &local, local_only, size,
+                )
+                .await
+            }
+            Err(error) => Err(self.fail_entry(fs_id, &error, params)),
+        }
+    }
+
+    /// 上传成功（或秒传守卫判定双方已一致）的回声抑制基线回写：
+    /// create/stat 的 (fs_id, md5, size, mtime) 立即入索引 + 本地快照 + 清 pending——
+    /// 下一轮 ADR-111 对账必须判「一致」（ADR-112 §3.5 核心）。
+    #[allow(clippy::too_many_arguments)]
+    fn finish_upload_success(
+        &mut self,
+        pending_fs_id: i64,
+        real_fs_id: u64,
+        relative: &str,
+        remote: &RemotePath,
+        local: &Path,
+        meta: &std::fs::Metadata,
+        local_only: bool,
+        fresh_insert: bool,
+        size: u64,
+        md5: Option<String>,
+        mtime: Option<i64>,
+    ) -> Result<(), UploadTaskError> {
+        let record = self.uploaded_record(real_fs_id, relative, remote, false, size, md5, mtime)?;
+        if local_only {
+            self.db
+                .rekey_local_only(pending_fs_id, &record)
+                .map_err(UploadTaskError::Hard)?;
+        } else if fresh_insert {
+            // 全新行（冲突副本）：本地是完整内容 ⇒ placeholder=0、hydrated。
+            self.db
+                .insert_uploaded_entry(&record)
+                .map_err(UploadTaskError::Hard)?;
+        } else {
+            self.db.upsert(&record).map_err(UploadTaskError::Hard)?;
+        }
+        let local_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        let _ = self
+            .db
+            .set_snapshot(real_fs_id as i64, local_mtime, meta.len());
+        self.db
+            .set_pending_op(pending_fs_id, None, None)
+            .map_err(UploadTaskError::Hard)?;
+        let _ = self.db.mark_local_changes_applied(pending_fs_id);
+        let _ = self.db.clear_error(real_fs_id as i64);
+        let _ = self.platform.mark_in_sync(local);
+        self.platform
+            .set_remote_mapping(relative, remote.clone(), real_fs_id);
+        Ok(())
+    }
+
+    /// 冲突（ADR-112 §3.3，OneDrive 口径）：云端版本占原名不动；
+    /// 本地副本改名 `<原名>-<设备名>` 保留并回传；原名条目进「需处理」。
+    /// 改名循环终止规则（总监终审补）：副本上传再撞 -8 只加序号重试**一次**，
+    /// 仍撞则副本留本地、进「需处理」、**不再自动重传、不递归冲突流程**。
+    #[allow(clippy::too_many_arguments)]
+    async fn exec_conflict(
+        &mut self,
+        root: &Path,
+        backend: &Arc<dyn CloudBackend>,
+        params: &UploadParams,
+        fs_id: i64,
+        relative: &str,
+        local: &Path,
+        local_only: bool,
+        size: u64,
+    ) -> Result<UploadTaskEffect, UploadTaskError> {
+        let _ = local_only;
+        let device = upload::device_name();
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        let dir_rel = relative.rsplit_once('/').map(|(dir, _)| dir);
+        let join_rel = |file_name: &str| match dir_rel {
+            Some(dir) => format!("{dir}/{file_name}"),
+            None => file_name.to_string(),
+        };
+        // 1) 副本名：本地磁盘与索引都不许撞。
+        let mut pick = 1u32;
+        let (mut copy_rel, mut copy_local) = loop {
+            let candidate_rel = join_rel(&upload::conflict_copy_name(name, &device, pick));
+            let candidate_local =
+                root.join(candidate_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let index_hit = self
+                .db
+                .entry_by_relative(&candidate_rel)
+                .map_err(UploadTaskError::Hard)?
+                .is_some();
+            if !candidate_local.exists() && !index_hit {
+                break (candidate_rel, candidate_local);
+            }
+            pick += 1;
+            if pick > 99 {
+                return Err(UploadTaskError::Hard("冲突副本命名空间耗尽".into()));
+            }
+        };
+        // 2) 自杀回调守卫（RENAME 记源路径、RENAME_COMPLETION 记目标路径——两个都要登记）+ 本地改名。
+        self.platform
+            .note_self_path_ops(&[local.to_path_buf(), copy_local.clone()]);
+        std::fs::rename(local, &copy_local)
+            .map_err(|e| UploadTaskError::Hard(format!("冲突副本改名失败: {e}")))?;
+        log::info!(
+            "native-sync conflict fs_id={fs_id}: cloud version keeps the name, local copy renamed with device suffix"
+        );
+        // 3) 原名条目：进「需处理」、清 pending；云端版本不动（下一轮自动对账把原名带回来）。
+        if fs_id > 0 {
+            let _ = self.db.set_state_by_fs_id(
+                fs_id as u64,
+                "error",
+                Some("与云端版本冲突：云端版本保留原名，本地副本已改名保留"),
+            );
+        }
+        self.db
+            .set_pending_op(fs_id, None, None)
+            .map_err(UploadTaskError::Hard)?;
+        let _ = self.db.mark_local_changes_applied(fs_id);
+        // 4) 副本上传（终止规则：再撞 -8 加序号只重试一次）。
+        for upload_attempt in 1..=2u32 {
+            let copy_remote = RemotePath::parse(&format!("/{copy_rel}"))
+                .map_err(|e| UploadTaskError::Hard(format!("副本远端路径非法: {e}")))?;
+            match backend.upload(&copy_remote, &copy_local, size).await {
+                Ok(outcome) => {
+                    let real_id = outcome.fs_id.ok_or_else(|| {
+                        UploadTaskError::Retryable("副本上传回执缺少 fs_id".into())
+                    })?;
+                    let meta = std::fs::metadata(&copy_local)
+                        .map_err(|e| UploadTaskError::Retryable(e.to_string()))?;
+                    self.finish_upload_success(
+                        real_id as i64,
+                        real_id,
+                        &copy_rel,
+                        &copy_remote,
+                        &copy_local,
+                        &meta,
+                        false,
+                        true,
+                        outcome.size,
+                        outcome.md5.clone(),
+                        outcome.mtime,
+                    )?;
+                    return Ok(UploadTaskEffect::Conflicted);
+                }
+                Err(error) if upload::is_conflict_error(&error) && upload_attempt == 1 => {
+                    let new_rel = join_rel(&upload::conflict_copy_name(name, &device, 2));
+                    let new_local = root.join(new_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+                    self.platform
+                        .note_self_path_ops(&[copy_local.clone(), new_local.clone()]);
+                    std::fs::rename(&copy_local, &new_local)
+                        .map_err(|e| UploadTaskError::Hard(format!("冲突副本再改名失败: {e}")))?;
+                    copy_rel = new_rel;
+                    copy_local = new_local;
+                }
+                Err(error) if upload::is_conflict_error(&error) => {
+                    if fs_id > 0 {
+                        let _ = self.db.set_state_by_fs_id(
+                            fs_id as u64,
+                            "error",
+                            Some("冲突副本云端同名，已保留在本地，未自动重传"),
+                        );
+                    }
+                    log::warn!(
+                        "native-sync conflict copy collided twice fs_id={fs_id}: kept local, NOT re-uploaded"
+                    );
+                    return Ok(UploadTaskEffect::Conflicted);
+                }
+                Err(error) => return Err(self.fail_entry(fs_id, &error, params)),
+            }
+        }
+        unreachable!("副本上传至多两次")
+    }
+
+    /// 删除传播（ADR-112 §3.4）：**仅当索引有基线**（云端已知条目）才执行——
+    /// 「索引缺失」与「用户删除」必须区分（护栏，防索引损坏放大成云端批量删除）。
+    async fn exec_delete(
+        &mut self,
+        backend: &Arc<dyn CloudBackend>,
+        params: &UploadParams,
+        fs_id: i64,
+        local_only: bool,
+        remote_path: &str,
+    ) -> Result<UploadTaskEffect, UploadTaskError> {
+        let has_baseline = !local_only
+            && !remote_path.starts_with("local:")
+            && self
+                .db
+                .remote_meta_by_fs_id(fs_id as u64)
+                .map_err(UploadTaskError::Hard)?
+                .is_some();
+        if !has_baseline {
+            log::info!("native-sync upload delete blocked: no baseline fs_id={fs_id}");
+            self.db
+                .set_pending_op(fs_id, None, None)
+                .map_err(UploadTaskError::Hard)?;
+            if local_only {
+                let _ = self.db.tombstone(fs_id as u64);
+            }
+            return Ok(UploadTaskEffect::Skipped);
+        }
+        let remote = RemotePath::parse(remote_path)
+            .map_err(|e| UploadTaskError::Hard(format!("远端路径非法: {e}")))?;
+        backend
+            .remove(&remote)
+            .await
+            .map_err(|e| self.fail_entry(fs_id, &e, params))?;
+        self.db
+            .tombstone(fs_id as u64)
+            .map_err(UploadTaskError::Hard)?;
+        self.db
+            .set_pending_op(fs_id, None, None)
+            .map_err(UploadTaskError::Hard)?;
+        let _ = self.db.mark_local_changes_applied(fs_id);
+        log::info!("native-sync delete propagated fs_id={fs_id}");
+        Ok(UploadTaskEffect::Deleted)
+    }
+
+    /// 改名传播：opera=move 保 fs_id（**不走 delete+upload**），成功后回写云端事实。
+    async fn exec_rename_propagate(
+        &mut self,
+        backend: &Arc<dyn CloudBackend>,
+        params: &UploadParams,
+        fs_id: i64,
+        relative: &str,
+        remote_path: &str,
+    ) -> Result<UploadTaskEffect, UploadTaskError> {
+        // local_state.relative_path 捕获时已改写为新名；remote_path 仍是旧云端路径。
+        let from = RemotePath::parse(remote_path)
+            .map_err(|e| UploadTaskError::Hard(format!("远端路径非法: {e}")))?;
+        let to = RemotePath::parse(&format!("/{relative}"))
+            .map_err(|e| UploadTaskError::Hard(format!("远端路径非法: {e}")))?;
+        backend
+            .rename(&from, &to)
+            .await
+            .map_err(|e| self.fail_entry(fs_id, &e, params))?;
+        let new_name = relative.rsplit('/').next().unwrap_or(relative);
+        self.db
+            .apply_remote_rename(fs_id, to.as_str(), new_name)
+            .map_err(UploadTaskError::Hard)?;
+        self.db
+            .set_pending_op(fs_id, None, None)
+            .map_err(UploadTaskError::Hard)?;
+        let _ = self.db.mark_local_changes_applied(fs_id);
+        self.platform
+            .set_remote_mapping(relative, to.clone(), fs_id as u64);
+        log::info!("native-sync rename propagated fs_id={fs_id}");
+        Ok(UploadTaskEffect::Renamed)
+    }
+
+    /// 失败分类（ADR-112 §3.6）：硬错误 ⇒ 条目进「需处理」并清 pending（不盲重）；
+    /// 其余计次退避，≥ 阈值（5 次）同样进「需处理」。
+    fn fail_entry(
+        &mut self,
+        fs_id: i64,
+        error: &CloudError,
+        params: &UploadParams,
+    ) -> UploadTaskError {
+        if upload::is_hard_error(error) {
+            if fs_id > 0 {
+                let _ =
+                    self.db
+                        .set_state_by_fs_id(fs_id as u64, "error", Some(error.message.as_str()));
+            }
+            let _ = self.db.set_pending_op(fs_id, None, None);
+            UploadTaskError::Hard(error.message.clone())
+        } else {
+            let count = self.db.bump_error_count(fs_id).unwrap_or(1);
+            if count >= params.error_threshold {
+                if fs_id > 0 {
+                    let _ = self.db.set_state_by_fs_id(
+                        fs_id as u64,
+                        "error",
+                        Some(error.message.as_str()),
+                    );
+                }
+                // 阈值清理对所有条目生效（local_only 负数 fs_id 也在内）——否则无限重试。
+                let _ = self.db.set_pending_op(fs_id, None, None);
+            }
+            UploadTaskError::Retryable(error.message.clone())
+        }
+    }
+
+    /// 构造上传成功后的索引记录（rekey 或 insert/upsert 共用）。
+    #[allow(clippy::too_many_arguments)]
+    fn uploaded_record(
+        &self,
+        fs_id: u64,
+        relative: &str,
+        remote: &RemotePath,
+        is_dir: bool,
+        size: u64,
+        md5: Option<String>,
+        mtime: Option<i64>,
+    ) -> Result<EntryRecord, UploadTaskError> {
+        let parent_fs_id = match relative.rsplit_once('/') {
+            Some((dir, _)) => self
+                .db
+                .entry_by_relative(dir)
+                .map_err(UploadTaskError::Hard)?
+                .map(|row| row.0 as u64),
+            None => None,
+        };
+        Ok(EntryRecord {
+            fs_id: fs_id as i64,
+            local_only: false,
+            parent_fs_id,
+            remote_path: remote.as_str().to_string(),
+            relative_path: relative.to_string(),
+            name: relative.rsplit('/').next().unwrap_or(relative).to_string(),
+            is_dir,
+            size,
+            md5,
+            modified_at: mtime,
+            state: NativeSyncState::Hydrated,
+            pin_state: PinState::Unpinned,
+            error: None,
+            pending_op: None,
+            pending_since: None,
+            has_children: is_dir,
+        })
+    }
+
     /// 用**磁盘真值**校正 `hydration_state`（面板必须与磁盘一致）。
     ///
     /// 水合/脱水都会被外部驱动（Explorer、平台后台、第三方程序），只在自家动作里写库就
@@ -1279,6 +1899,29 @@ mod manager_tests {
         fail_list: AtomicBool,
         /// 记录每次 list 的目录（调用预算/游标断言用）。
         list_calls: Mutex<Vec<String>>,
+        /// 写方向调用记录与脚本（S2 drain 测试）。
+        uploads: Mutex<Vec<(String, u64)>>,
+        upload_script: Mutex<Vec<Result<pandock_core::cloud::UploadOutcome, CloudError>>>,
+        removes: Mutex<Vec<String>>,
+        renames: Mutex<Vec<(String, String)>>,
+        created_dirs: Mutex<Vec<String>>,
+    }
+    impl FakeBackend {
+        fn script_upload(
+            &self,
+            results: Vec<Result<pandock_core::cloud::UploadOutcome, CloudError>>,
+        ) {
+            *self.upload_script.lock().unwrap() = results;
+        }
+        fn upload_outcome(fs_id: u64, size: u64) -> pandock_core::cloud::UploadOutcome {
+            pandock_core::cloud::UploadOutcome {
+                fs_id: Some(fs_id),
+                md5: Some("deadbeef".into()),
+                size,
+                mtime: Some(1_700_000_100),
+                rapid: false,
+            }
+        }
     }
     impl FakeBackend {
         fn replace(&self, entries: Vec<(&str, Vec<ResourceSnapshot>)>) {
@@ -1328,27 +1971,56 @@ mod manager_tests {
         }
         fn upload<'a>(
             &'a self,
-            _path: &'a RemotePath,
+            path: &'a RemotePath,
             _local: &'a std::path::Path,
-            _size: u64,
+            size: u64,
         ) -> futures_util::future::BoxFuture<
             'a,
             Result<pandock_core::cloud::UploadOutcome, CloudError>,
         > {
-            async move { Err(CloudError::unsupported("fake upload")) }.boxed()
+            self.uploads
+                .lock()
+                .unwrap()
+                .push((path.as_str().to_string(), size));
+            let result = self.upload_script.lock().unwrap().first().cloned();
+            if result.is_some() {
+                let _ = self.upload_script.lock().unwrap().remove(0);
+            }
+            let outcome = result.unwrap_or_else(|| {
+                Ok(Self::upload_outcome(
+                    9_000_000 + self.uploads.lock().unwrap().len() as u64,
+                    size,
+                ))
+            });
+            async move { outcome }.boxed()
         }
         fn rename<'a>(
             &'a self,
-            _from: &'a RemotePath,
-            _to: &'a RemotePath,
+            from: &'a RemotePath,
+            to: &'a RemotePath,
         ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
-            async move { Err(CloudError::unsupported("fake rename")) }.boxed()
+            self.renames
+                .lock()
+                .unwrap()
+                .push((from.as_str().to_string(), to.as_str().to_string()));
+            async move { Ok(()) }.boxed()
         }
         fn remove<'a>(
             &'a self,
-            _path: &'a RemotePath,
+            path: &'a RemotePath,
         ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
-            async move { Err(CloudError::unsupported("fake remove")) }.boxed()
+            self.removes.lock().unwrap().push(path.as_str().to_string());
+            async move { Ok(()) }.boxed()
+        }
+        fn create_dir<'a>(
+            &'a self,
+            path: &'a RemotePath,
+        ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+            self.created_dirs
+                .lock()
+                .unwrap()
+                .push(path.as_str().to_string());
+            async move { Ok(()) }.boxed()
         }
         fn read_at<'a>(
             &'a self,
@@ -1396,6 +2068,11 @@ mod manager_tests {
             listings: Mutex::new(HashMap::new()),
             fail_list: AtomicBool::new(false),
             list_calls: Mutex::new(Vec::new()),
+            uploads: Mutex::new(Vec::new()),
+            upload_script: Mutex::new(Vec::new()),
+            removes: Mutex::new(Vec::new()),
+            renames: Mutex::new(Vec::new()),
+            created_dirs: Mutex::new(Vec::new()),
         });
         backend.replace(entries);
         backend
@@ -2268,6 +2945,453 @@ mod manager_tests {
             &Some("b".into()),
             Some(2)
         ));
+    }
+
+    // ---------- S2 上传方向（ADR-112）：drain_upload_queue ----------
+
+    /// 把条目的 pending 时间改到防抖窗口之外。
+    fn make_pending_old(manager: &NativeSyncManager, fs_id: i64, op: &str) {
+        manager
+            .db
+            .set_pending_op(fs_id, Some(op), Some("1000000000"))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_new_local_file_rekeys_and_writes_baseline() {
+        let (_dir, root, calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        std::fs::write(root.join("n.txt"), b"hello").unwrap();
+        manager
+            .db
+            .insert_local_only_entry(-5, "n.txt", "n.txt", false, 5)
+            .unwrap();
+        make_pending_old(&manager, -5, "upload");
+        let backend = backend_with(vec![]);
+        backend.script_upload(vec![Ok(pandock_core::cloud::UploadOutcome {
+            fs_id: Some(4242),
+            md5: Some("5d41402abc4b2a76b9719d911017c592".into()),
+            size: 5,
+            mtime: Some(1_700_000_123),
+            rapid: false,
+        })]);
+        manager.backend = Some(backend.clone());
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.uploaded,
+            1,
+            "report={report:?} queue={:?}",
+            manager.db.upload_queue()
+        );
+        assert_eq!(
+            backend.uploads.lock().unwrap().as_slice(),
+            &[("/n.txt".to_string(), 5u64)]
+        );
+        // rekey：真实 fs_id 落库，hydrated、placeholder=0，旧的负数行消失。
+        let (real_id, hydration, md5, remote, _, local_only) =
+            manager.db.entry_by_relative("n.txt").unwrap().unwrap();
+        assert_eq!(real_id, 4242);
+        assert_eq!(hydration, "hydrated");
+        assert_eq!(md5.as_deref(), Some("5d41402abc4b2a76b9719d911017c592"));
+        assert_eq!(remote, "/n.txt");
+        assert!(!local_only);
+        let placeholder: i64 = manager
+            .db
+            .conn
+            .query_row(
+                "SELECT placeholder FROM local_state WHERE fs_id=4242",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(placeholder, 0, "上传成功的本地文件不是占位符");
+        assert!(
+            manager.db.upload_queue().unwrap().is_empty(),
+            "pending 必须清掉"
+        );
+        {
+            let calls = calls.lock().unwrap();
+            assert!(
+                calls.iter().any(|c| c == "mapping:n.txt:/n.txt:4242"),
+                "{calls:?}"
+            );
+        } // 守卫必须在这里 drop：下面的自动对账还会写平台调用记录（同一把互斥锁）。
+          // 回声抑制：下一轮自动对账看到同样的云端事实 ⇒ 零差异。
+        backend.replace(vec![(
+            "/",
+            vec![file_snap(
+                "/n.txt",
+                4242,
+                Some("5d41402abc4b2a76b9719d911017c592"),
+            )],
+        )]);
+        let layer = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (layer.added, layer.changed, layer.removed),
+            (0, 0, 0),
+            "上传后下一轮对账必须判一致（ADR-112 §3.5）"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_edit_of_cloud_entry_then_incremental_layer_zero_diff() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // 本地编辑（内容变为 5 字节新内容）→ pending upload。
+        std::fs::write(root.join("a.txt"), b"loc12").unwrap();
+        make_pending_old(&manager, 11, "upload");
+        backend.script_upload(vec![Ok(FakeBackend::upload_outcome(11, 5))]);
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.uploaded, 1);
+        // 基线回写 create 响应值（md5=deadbeef）。
+        let (_, _, md5, remote, ..) = manager.db.entry_by_relative("a.txt").unwrap().unwrap();
+        assert_eq!(md5.as_deref(), Some("deadbeef"));
+        assert_eq!(remote, "/a.txt");
+        assert!(manager.db.upload_queue().unwrap().is_empty());
+        // 回声：远端列出的就是刚上传的事实 ⇒ 零差异。
+        backend.replace(vec![("/", vec![file_snap("/a.txt", 11, Some("deadbeef"))])]);
+        let layer = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!((layer.added, layer.changed, layer.removed), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn upload_delete_with_baseline_propagates_and_no_echo() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![(
+            "/",
+            vec![
+                file_snap("/a.txt", 11, Some("aaa")),
+                file_snap("/b.txt", 12, Some("bbb")),
+            ],
+        )]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // 用户在 Explorer 删除 a.txt（本地消失 + pending delete）。
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        make_pending_old(&manager, 11, "delete");
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.deleted, 1);
+        assert_eq!(
+            backend.removes.lock().unwrap().as_slice(),
+            &["/a.txt".to_string()]
+        );
+        // 回声：远端也消失了 ⇒ 下一轮对账 removed=0（tombstone 行不参与 missing）。
+        backend.replace(vec![("/", vec![file_snap("/b.txt", 12, Some("bbb"))])]);
+        let layer = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!((layer.added, layer.changed, layer.removed), (0, 0, 0));
+        let page = manager.list(Some("B".into()), None, 50).unwrap();
+        assert_eq!(page.total, 0);
+    }
+
+    #[tokio::test]
+    async fn upload_delete_without_baseline_blocked_no_cloud_call() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        // 本地新建（从未上云）随即删除 ⇒ 无基线，绝不能向云端发 delete（ADR-112 §3.4 护栏）。
+        manager
+            .db
+            .insert_local_only_entry(-7, "ghost.txt", "ghost.txt", false, 3)
+            .unwrap();
+        make_pending_old(&manager, -7, "delete");
+        let backend = backend_with(vec![]);
+        manager.backend = Some(backend.clone());
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.deleted, 0);
+        assert!(
+            backend.removes.lock().unwrap().is_empty(),
+            "无基线 ⇒ 零云端调用"
+        );
+        assert!(manager.db.upload_queue().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_rename_uses_move_not_delete_upload_and_updates_remote_path() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/old.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        // 用户改名：本地文件改名 + 索引捕获（apply_local_rename 的线上行为）。
+        std::fs::rename(root.join("old.txt"), root.join("new.txt")).unwrap();
+        manager.db.apply_local_rename(11, "new.txt").unwrap();
+        make_pending_old(&manager, 11, "rename");
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.renamed, 1);
+        assert_eq!(
+            backend.renames.lock().unwrap().as_slice(),
+            &[("/old.txt".to_string(), "/new.txt".to_string())]
+        );
+        assert!(
+            backend.removes.lock().unwrap().is_empty(),
+            "改名不得走 delete"
+        );
+        assert!(
+            backend.uploads.lock().unwrap().is_empty(),
+            "改名不得走 upload"
+        );
+        // fs_id 保留（opera=move 的全部意义）；remote_path 已回写。
+        let (real_id, _, _, remote, ..) = manager.db.entry_by_relative("new.txt").unwrap().unwrap();
+        assert_eq!(real_id, 11);
+        assert_eq!(remote, "/new.txt");
+        // 回声：远端列出新名 ⇒ 零差异。
+        backend.replace(vec![("/", vec![file_snap("/new.txt", 11, Some("aaa"))])]);
+        let layer = manager
+            .reconcile_incremental(
+                &AutoSyncParams::default(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        assert_eq!((layer.added, layer.changed, layer.removed), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn rapid_minus8_same_md5_writes_baseline_without_conflict() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        // 云端基线 md5=old；本地内容与云端**当前**内容一致（秒传守卫要比对的对象）。
+        let backend = backend_with(vec![(
+            "/",
+            vec![file_snap(
+                "/a.txt",
+                11,
+                Some("5d41402abc4b2a76b9719d911017c592"),
+            )],
+        )]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        make_pending_old(&manager, 11, "upload");
+        // 秒传轮 -8：rapid_hint=true（ADR-112 §3.3 终审补记的入口）。
+        let mut conflict = CloudError::already_exists("百度 API 错误：{\"errno\":-8}");
+        conflict.raw_errno = Some(-8);
+        conflict.rapid_hint = true;
+        backend.script_upload(vec![Err(conflict)]);
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.uploaded, 1, "md5 一致 ⇒ 双方已一致，不走冲突");
+        assert_eq!(report.conflicts, 0);
+        // 没有改名发生：本地文件保持原名。
+        assert!(root.join("a.txt").exists());
+        assert!(manager.db.upload_queue().unwrap().is_empty());
+        let (_, _, md5, ..) = manager.db.entry_by_relative("a.txt").unwrap().unwrap();
+        assert_eq!(md5.as_deref(), Some("5d41402abc4b2a76b9719d911017c592"));
+    }
+
+    #[tokio::test]
+    async fn nonrapid_minus8_goes_conflict_renames_copy_and_reuploads() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        std::fs::write(root.join("a.txt"), b"mine!").unwrap();
+        make_pending_old(&manager, 11, "upload");
+        let mut conflict = CloudError::already_exists("百度 API 错误：{\"errno\":-8}");
+        conflict.raw_errno = Some(-8);
+        conflict.rapid_hint = false;
+        // 第一次上传 -8（非秒传 ⇒ 直接冲突）；副本上传成功。
+        backend.script_upload(vec![
+            Err(conflict),
+            Ok(FakeBackend::upload_outcome(7777, 5)),
+        ]);
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.conflicts, 1);
+        // OneDrive 语义：云端版本占原名（云端不动），本地副本改名保留。
+        let copy_name =
+            crate::upload::conflict_copy_name("a.txt", &crate::upload::device_name(), 1);
+        assert!(
+            root.join(&copy_name).exists(),
+            "副本必须保留在本地: {copy_name}"
+        );
+        assert!(!root.join("a.txt").exists(), "原路径已改名为副本");
+        // 原名条目进「需处理」（error + 冲突说明）。
+        let (_, state, _, _, _, _) = manager.db.entry_by_relative("a.txt").unwrap().unwrap();
+        assert_eq!(state, "error");
+        // 副本已回传：第二次 upload 调用目标是副本远端路径。
+        let uploads = backend.uploads.lock().unwrap().clone();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(uploads[1].0, format!("/{copy_name}"));
+        // 副本落库为 hydrated 新行。
+        let (copy_id, copy_state, ..) = manager.db.entry_by_relative(&copy_name).unwrap().unwrap();
+        assert_eq!(copy_id, 7777);
+        assert_eq!(copy_state, "hydrated");
+        assert!(manager.db.upload_queue().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn conflict_copy_name_collision_appends_counter_and_never_recurses() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        let backend = backend_with(vec![("/", vec![file_snap("/a.txt", 11, Some("aaa"))])]);
+        manager.backend = Some(backend.clone());
+        manager.sync_now().await.unwrap();
+        std::fs::write(root.join("a.txt"), b"mine!").unwrap();
+        make_pending_old(&manager, 11, "upload");
+        let minus8 = || {
+            let mut e = CloudError::already_exists("百度 API 错误：{\"errno\":-8}");
+            e.raw_errno = Some(-8);
+            e
+        };
+        // 原名 -8；副本 -8；序号副本仍 -8 ⇒ 终止：留本地，不再重传，不递归冲突。
+        backend.script_upload(vec![Err(minus8()), Err(minus8()), Err(minus8())]);
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.conflicts, 1);
+        let device = crate::upload::device_name();
+        let final_name = crate::upload::conflict_copy_name("a.txt", &device, 2);
+        assert!(
+            root.join(&final_name).exists(),
+            "序号副本保留在本地: {final_name}"
+        );
+        // 三次上传调用后停手（原名 1 + 副本 1 + 序号副本 1），绝不递归冲突流程。
+        let uploads = backend.uploads.lock().unwrap().clone();
+        assert_eq!(
+            uploads.len(),
+            3,
+            "改名循环终止：最多原名+副本+序号副本各一次: {uploads:?}"
+        );
+        assert_eq!(uploads[2].0, format!("/{final_name}"));
+        assert!(
+            manager.db.upload_queue().unwrap().is_empty(),
+            "不再自动重传 ⇒ 无 pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_debounce_defers_recent_pending() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        std::fs::write(root.join("n.txt"), b"hello").unwrap();
+        manager
+            .db
+            .insert_local_only_entry(-5, "n.txt", "n.txt", false, 5)
+            .unwrap();
+        // insert_local_only_entry 的 pending_since = 现在 ⇒ 防抖窗口内。
+        let backend = backend_with(vec![]);
+        manager.backend = Some(backend.clone());
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.deferred, 1);
+        assert_eq!(report.uploaded, 0);
+        assert!(
+            backend.uploads.lock().unwrap().is_empty(),
+            "防抖窗口内不上传"
+        );
+        // 窗口过去后继续。
+        make_pending_old(&manager, -5, "upload");
+        let report = manager
+            .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(report.uploaded, 1);
+    }
+
+    #[tokio::test]
+    async fn upload_failure_counts_then_errors_at_threshold() {
+        let (_dir, root, _calls, mut manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        manager
+            .db
+            .insert_local_only_entry(-5, "a.txt", "a.txt", false, 5)
+            .unwrap();
+        make_pending_old(&manager, -5, "upload");
+        let backend = backend_with(vec![]);
+        backend.script_upload(vec![
+            Err(CloudError::transient("net down")),
+            Err(CloudError::transient("net down")),
+            Err(CloudError::transient("net down")),
+            Err(CloudError::transient("net down")),
+            Err(CloudError::transient("net down")),
+        ]);
+        manager.backend = Some(backend.clone());
+        for round in 1..=5u32 {
+            let report = manager
+                .drain_upload_queue(&UploadParams::default(), &Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap();
+            assert_eq!(report.failed, 1, "第 {round} 轮");
+            assert_eq!(report.uploaded, 0);
+        }
+        assert_eq!(backend.uploads.lock().unwrap().len(), 5);
+        // 达到阈值（5 次）⇒ 清 pending 不再自动重试（local_only 行不进 error 状态，仅清 pending）。
+        assert!(
+            manager.db.upload_queue().unwrap().is_empty(),
+            "≥5 次后不得再重试"
+        );
+    }
+
+    #[test]
+    fn upload_queue_orders_parents_before_children() {
+        let (_dir, root, _calls, manager) = setup();
+        manager.db.set_root(&root, true, "connected").unwrap();
+        manager
+            .db
+            .insert_local_only_entry(-1, "zdir", "zdir", true, 0)
+            .unwrap();
+        manager
+            .db
+            .insert_local_only_entry(-2, "zdir/f.txt", "f.txt", false, 3)
+            .unwrap();
+        manager
+            .db
+            .insert_local_only_entry(-3, "a.txt", "a.txt", false, 3)
+            .unwrap();
+        let queue = manager.db.upload_queue().unwrap();
+        let relatives: Vec<&str> = queue.iter().map(|row| row.1.as_str()).collect();
+        assert_eq!(
+            relatives,
+            vec!["a.txt", "zdir", "zdir/f.txt"],
+            "父目录必须先于其子项"
+        );
     }
 
     #[tokio::test]

@@ -139,6 +139,20 @@ pub struct UploadOutcome {
     pub rapid: bool,
 }
 
+/// 详细上传的失败（ADR-112）：`rapid` 跟随失败一同返回——秒传假冲突守卫需要知道
+/// 「本轮 precreate 是否秒传命中」才能决定 -8 时先比 md5 还是直接进冲突流程。
+#[derive(Clone, Debug)]
+pub struct UploadFailure {
+    pub rapid: bool,
+    pub message: String,
+}
+
+impl std::fmt::Display for UploadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ResourceSnapshot {
     pub path: RemotePath,

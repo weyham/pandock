@@ -182,6 +182,12 @@ mod tests {
         ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
             async move { Err(CloudError::unsupported("fake remove")) }.boxed()
         }
+        fn create_dir<'a>(
+            &'a self,
+            _: &'a RemotePath,
+        ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+            async move { Err(CloudError::unsupported("fake create_dir")) }.boxed()
+        }
         fn read_at<'a>(
             &'a self,
             _: &'a RemotePath,
