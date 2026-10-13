@@ -417,6 +417,8 @@ pub async fn native_sync_sync_now(app: AppHandle) -> Result<NativeSyncStatusView
     state
         .native_sync_runs
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 手动对账成功已清 paused：立即唤醒调度器重估，不必等满 60 秒低频轮询（PR-1 终审附议项）。
+    state.auto_sync_wake.notify_one();
     emit_state(&app, &status);
     Ok(status)
 }

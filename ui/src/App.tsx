@@ -15,6 +15,8 @@ export type Config = {
   cache_size_mb: number;
   launch_at_login: boolean;
   start_webdav_automatically: boolean;
+  /** ADR-111 自动对账开关（默认开；false = 纯手动「立即对账」）。 */
+  native_sync_auto: boolean;
 };
 export type AuthPhase = "disconnected" | "editing_credentials" | "requesting_device_code" | "waiting_authorization" | "exchanging_token" | "starting_webdav" | "connected" | "cancelling" | "cancelled" | "error";
 export type AuthErrorView = { code: string; message: string; retryable: boolean };
@@ -31,7 +33,7 @@ export type UpdateSourceError = {
 };
 export type UpdateStateView = { phase: UpdatePhase; currentVersion: string; availableVersion?: string | null; releaseUrl?: string | null; manualOnly: boolean; error?: UpdateSourceError | null };
 
-const fallbackConfig: Config = { app_key: "", app_name: "", listen: "127.0.0.1:19090", dav_prefix: "/dav", basic_auth: false, username: "dav", webdav_password: "", cache_size_mb: 256, launch_at_login: false, start_webdav_automatically: true };
+const fallbackConfig: Config = { app_key: "", app_name: "", listen: "127.0.0.1:19090", dav_prefix: "/dav", basic_auth: false, username: "dav", webdav_password: "", cache_size_mb: 256, launch_at_login: false, start_webdav_automatically: true, native_sync_auto: true };
 const fallbackAuth: AuthStateView = { phase: "disconnected", appKey: null, appName: null, challenge: null, error: null, connectedAt: null };
 const fallbackUpdate: UpdateStateView = { phase: "idle", currentVersion: "1.0.0", availableVersion: null, releaseUrl: null, manualOnly: false, error: null };
 const labels: Record<string, string> = { not_configured: "未配置", stopped: "服务已停止", waiting_for_authorization: "等待授权", connecting: "连接中", connected: "已连接", disconnected: "连接断开", error: "发生错误" };
@@ -270,6 +272,15 @@ export function App() {
       setMessage("设置已保存。");
     } catch (error) { setMessage(String(error)); }
   };
+  const toggleNativeSyncAuto = async (next: boolean) => {
+    const payload = { ...config, native_sync_auto: next, app_secret: "" };
+    try {
+      await busy.run("save_config", () => invoke("save_config", { config: payload }));
+      setConfig((prev) => ({ ...prev, native_sync_auto: next, webdav_password: "" }));
+      setSavedConfig((prev) => (prev ? { ...prev, native_sync_auto: next, webdav_password: "" } : prev));
+      setMessage(next ? "已开启自动对账。" : "已关闭自动对账（仍可手动「立即对账（诊断）」）。");
+    } catch (error) { setMessage(String(error)); }
+  };
   const copyUrl = async () => { await navigator.clipboard.writeText("http://" + config.listen + config.dav_prefix + "/"); setMessage("WebDAV 地址已复制。"); };
   const openExternal = async (url?: string | null) => { if (!url) return; try { await invoke("open_external_url", { url }); } catch (error) { setModalError(String(error)); } };
   const [page, setPage] = React.useState<"general" | "webdav" | "nativesync" | "about">("general");
@@ -369,7 +380,7 @@ export function App() {
           </div>
         </div>
       </section>}
-      {page === "nativesync" && nativeSyncSupported && <NativeSyncSettings status={nativeSync} statusError={nativeSyncError} rootPath={nativeSyncRoot} setRootPath={setNativeSyncRoot} onRefresh={() => void refreshNativeSync()} onEnable={enableNativeSync} onDisable={disableNativeSync} onSyncNow={syncNativeNow} onOpenRoot={openNativeSyncRoot} busy={busy} />}
+      {page === "nativesync" && nativeSyncSupported && <NativeSyncSettings status={nativeSync} statusError={nativeSyncError} rootPath={nativeSyncRoot} setRootPath={setNativeSyncRoot} onRefresh={() => void refreshNativeSync()} onEnable={enableNativeSync} onDisable={disableNativeSync} onSyncNow={syncNativeNow} onOpenRoot={openNativeSyncRoot} busy={busy} autoSyncEnabled={config.native_sync_auto} onToggleAutoSync={(next) => void toggleNativeSyncAuto(next)} />}
       {page === "about" && <>
         <div className="page-head">
           <div>

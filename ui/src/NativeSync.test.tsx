@@ -72,9 +72,10 @@ function mockBackend({
 }
 
 /** 与 App.tsx 同构的最小接线：设置卡 + 自带 busy（覆盖 useDelayedBusy 语义）。 */
-function renderSettings(overrides: { status?: NativeSyncStatus; syncNowTask?: () => Promise<NativeSyncStatus> } = {}) {
+function renderSettings(overrides: { status?: NativeSyncStatus; syncNowTask?: () => Promise<NativeSyncStatus>; autoSyncEnabled?: boolean; onToggleAutoSync?: (next: boolean) => void } = {}) {
   const Harness = () => {
     const busy = useDelayedBusy();
+    const [autoSync, setAutoSync] = React.useState(overrides.autoSyncEnabled ?? true);
     return <NativeSyncSettings
       status={overrides.status ?? enabledStatus}
       statusError=""
@@ -86,6 +87,8 @@ function renderSettings(overrides: { status?: NativeSyncStatus; syncNowTask?: ()
       onSyncNow={() => { void busy.run("native_sync_sync_now", overrides.syncNowTask ?? (async () => enabledStatus)); }}
       onOpenRoot={() => { void busy.run("native_sync_open_root", async () => invokeMock("native_sync_open_in_explorer", { relativePath: "" })); }}
       busy={busy}
+      autoSyncEnabled={autoSync}
+      onToggleAutoSync={(next) => { setAutoSync(next); overrides.onToggleAutoSync?.(next); }}
     />;
   };
   return render(<Harness />);
@@ -215,12 +218,84 @@ describe("NativeSync settings page entry list", () => {
   it("disables action immediately and shows delayed spinner for a slow sync", async () => {
     let resolveSync: ((value: NativeSyncStatus) => void) | undefined;
     renderSettings({ syncNowTask: () => new Promise<NativeSyncStatus>((resolve) => { resolveSync = resolve; }) });
-    const button = await screen.findByRole("button", { name: "立即同步" });
+    const button = await screen.findByRole("button", { name: "立即对账（诊断）" });
     await userEvent.click(button);
     expect(button).toBeDisabled();
     expect(within(button).queryByRole("progressbar")).toBeNull();
     await waitFor(() => expect(within(button).queryByRole("progressbar")).not.toBeNull(), { timeout: 1500 });
     resolveSync!(enabledStatus);
     await waitFor(() => expect(within(button).queryByRole("progressbar")).toBeNull());
+  });
+});
+
+describe("ADR-111 自动对账状态面（PR-2 UI 切片）", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    nativeSyncStateListener = undefined;
+    mockBackend();
+  });
+
+  it("「立即同步」降级为「立即对账（诊断）」", async () => {
+    renderSettings();
+    const button = await screen.findByRole("button", { name: "立即对账（诊断）" });
+    expect(button.title).toContain("诊断/应急");
+    expect(screen.queryByRole("button", { name: "立即同步" })).toBeNull();
+  });
+
+  it("状态行：字符串 epoch 的 lastSyncAt 格式化为「上次对账 HH:mm:ss · 正常」", async () => {
+    renderSettings({
+      status: { ...enabledStatus, lastSyncAt: "1727000000", autoSyncState: "ok", consecutiveFailures: 0 },
+    });
+    const line = (await screen.findByText(/上次对账/)).closest("p")!;
+    expect(line.textContent).toMatch(/上次对账 \d{2}:\d{2}:\d{2} · 正常/);
+  });
+
+  it("状态行：backing_off 显示连续失败次数与重试时间", async () => {
+    renderSettings({
+      status: {
+        ...enabledStatus, lastSyncAt: "1727000000", lastError: "list failed",
+        autoSyncState: "backing_off", consecutiveFailures: 2, backoffUntil: "1727001200",
+      },
+    });
+    const line = (await screen.findByText(/连续失败 2 次/)).closest("p")!;
+    expect(line.textContent).toContain("将于");
+    expect(line.textContent).toContain("重试");
+    expect(line.className).toContain("native-sync-autoline-warn");
+  });
+
+  it("状态行：paused 升级为非模态提示并给出恢复路径", async () => {
+    renderSettings({
+      status: {
+        ...enabledStatus, lastError: "请先完成百度网盘授权",
+        autoSyncState: "paused", consecutiveFailures: 5,
+      },
+    });
+    const line = (await screen.findByText(/自动对账已暂停/)).closest("p")!;
+    expect(line.textContent).toContain("最近失败：请先完成百度网盘授权");
+    expect(line.textContent).toContain("手动「立即对账」成功或授权恢复后自动恢复");
+    expect(line.className).toContain("native-sync-autoline-warn");
+  });
+
+  it("native_sync_auto 开关：关闭时状态行提示纯手动，切换即回调", async () => {
+    const toggles: boolean[] = [];
+    const user = userEvent.setup();
+    renderSettings({ autoSyncEnabled: false, onToggleAutoSync: (next) => toggles.push(next) });
+    const line = await screen.findByText(/自动对账已关闭 · 可手动「立即对账（诊断）」/);
+    expect(line).toBeTruthy();
+    const toggle = screen.getByRole("checkbox", { name: /自动同步云端变化/ });
+    expect((toggle as HTMLInputElement).checked).toBe(false);
+    await user.click(toggle);
+    expect(toggles).toEqual([true]);
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("formatSyncTimeOfDay：字符串/数字 epoch 与无效输入", async () => {
+    const { formatSyncTimeOfDay } = await import("./NativeSync");
+    expect(formatSyncTimeOfDay("1727000000")).toMatch(/\d{2}:\d{2}:\d{2}/);
+    expect(formatSyncTimeOfDay(1727000000)).toMatch(/\d{2}:\d{2}:\d{2}/);
+    expect(formatSyncTimeOfDay("")).toBeNull();
+    expect(formatSyncTimeOfDay("abc")).toBeNull();
+    expect(formatSyncTimeOfDay(null)).toBeNull();
+    expect(formatSyncTimeOfDay(undefined)).toBeNull();
   });
 });

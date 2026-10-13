@@ -550,3 +550,7 @@ button.danger { color: #e74c3c; }
 .native-sync-entrylist-loading { display: flex; align-items: center; gap: 8px; padding: 10px 0; }
 .native-sync-entrylist-error { margin-top: 8px; padding: 10px 12px; border: 1px dashed rgba(231, 76, 60, 0.4); border-radius: 10px; color: #f0b9b3; font-size: 12px; }
 .native-sync-entrylist-empty { color: #9a9aa5; }
+/* 「上次对账」状态行（ADR-111）：note=常规；warn=退避/暂停的非模态提示（绝不弹窗）。 */
+.native-sync-autoline { margin: 6px 0 0; }
+.native-sync-autoline-warn { color: #b8860b; font-weight: 500; }
+.native-sync-auto-toggle { margin: 8px 0 0; }

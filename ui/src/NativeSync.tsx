@@ -5,7 +5,12 @@ import { listen } from "@tauri-apps/api/event";
 export type NativeSyncStatus = {
   enabled: boolean; supported: boolean; supportReason?: string | null; rootPath?: string | null;
   state: string; totalEntries: number; placeholderEntries: number; hydratedEntries: number;
-  attentionEntries: number; activeJobs: number; lastSyncAt?: number | null; lastError?: string | null;
+  attentionEntries: number; activeJobs: number;
+  /** 后端契约是字符串形式的 epoch 秒；兼容旧夹具的数字形态。 */
+  lastSyncAt?: string | number | null; lastError?: string | null;
+  /** ADR-111 自动对账：ok / backing_off / paused / disabled。 */
+  autoSyncState?: string; consecutiveFailures?: number;
+  backoffUntil?: string | null; lastLayerAt?: string | null;
 };
 export type NativeSyncProgress = { completed: number; total: number };
 export type NativeSyncEntry = {
@@ -73,6 +78,31 @@ const stateClasses: Record<string, string> = {
   hydrated: "native-sync-badge-hydrated", error: "native-sync-badge-error",
   remote_missing: "native-sync-badge-missing", stale: "native-sync-badge-stale",
 };
+/** epoch 秒（string/number）→ HH:mm:ss；无效输入 ⇒ null。 */
+export function formatSyncTimeOfDay(value?: string | number | null): string | null {
+  if (value == null || value === "") return null;
+  const secs = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(secs) || secs <= 0) return null;
+  return new Date(secs * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+/** 「上次对账 HH:mm:ss · 结果」一行（ADR-111 §2.6）。paused 时同一行升级为非模态提示（绝不弹窗）。 */
+export function autoSyncLine(status: NativeSyncStatus, autoEnabled: boolean): { tone: "note" | "warn"; text: string } | null {
+  if (!status.enabled) return null;
+  if (!autoEnabled) return { tone: "note", text: "自动对账已关闭 · 可手动「立即对账（诊断）」" };
+  const at = formatSyncTimeOfDay(status.lastSyncAt) ?? "—";
+  if (status.autoSyncState === "paused") {
+    const reason = status.lastError ? `（最近失败：${status.lastError}）` : "";
+    return { tone: "warn", text: `自动对账已暂停${reason} · 手动「立即对账」成功或授权恢复后自动恢复` };
+  }
+  if (status.autoSyncState === "backing_off") {
+    const retry = formatSyncTimeOfDay(status.backoffUntil);
+    const times = status.consecutiveFailures ? `（连续失败 ${status.consecutiveFailures} 次）` : "";
+    return { tone: "warn", text: `上次对账 ${at} · 失败${times}${retry ? `，将于 ${retry} 重试` : ""}` };
+  }
+  return { tone: "note", text: `上次对账 ${at} · 正常` };
+}
+
 export function NativeSyncBadge({ entry }: { entry: NativeSyncEntry }) {
   const label = stateLabels[entry.state] || entry.state;
   return <span className={`native-sync-badge ${stateClasses[entry.state] || "native-sync-badge-online"}`}>
@@ -91,10 +121,13 @@ export function syncStateLabel(status: NativeSyncStatus | null) {
 
 export function NativeSyncSettings({
   status, statusError, rootPath, setRootPath, onRefresh, onEnable, onDisable, onSyncNow, onOpenRoot, busy,
+  autoSyncEnabled, onToggleAutoSync,
 }: {
   status: NativeSyncStatus | null; statusError: string; rootPath: string; setRootPath: (value: string) => void;
   onRefresh: () => void; onEnable: () => void; onDisable: () => void; onSyncNow: () => void; onOpenRoot: () => void;
   busy: ReturnType<typeof useDelayedBusy>;
+  /** `native_sync_auto` 配置（ADR-111 §2.5 回滚开关）；切换即保存，无需按「保存设置」。 */
+  autoSyncEnabled: boolean; onToggleAutoSync: (next: boolean) => void;
 }) {
   const supported = status?.supported ?? true;
   const enabled = status?.enabled ?? false;
@@ -111,11 +144,18 @@ export function NativeSyncSettings({
         {statusError && <p className="note">后端状态暂不可用；可先填写同步根目录，操作会在后端恢复后生效。</p>}
         <label className="field native-sync-root-field">同步根目录<input value={enabled ? (status?.rootPath || rootPath) : rootPath} disabled={enabled || busy.pending("native_sync_enable")} placeholder="留空使用系统文档目录下的 Pandock（推荐）" onChange={(event) => setRootPath(event.target.value)} /></label>
         {status?.enabled && <div className="native-sync-settings-stats"><span>占位符 {status.placeholderEntries}</span><span>已下载 {status.hydratedEntries}</span><span>需处理 {status.attentionEntries}</span></div>}
+        {status?.enabled && (() => { const line = autoSyncLine(status, autoSyncEnabled); return line
+          ? <p className={`note native-sync-autoline${line.tone === "warn" ? " native-sync-autoline-warn" : ""}`} role="status">{line.text}</p>
+          : null; })()}
+        {status?.enabled && <label className="switch native-sync-auto-toggle">
+          <input type="checkbox" checked={autoSyncEnabled} disabled={busy.pending("save_config")} onChange={(event) => onToggleAutoSync(event.target.checked)} />
+          自动同步云端变化（约每 10 分钟对账一次，失败自动退避）
+        </label>}
         <div className="actions start native-sync-actions">
           {!enabled
             ? <button className="primary" disabled={busy.pending("native_sync_enable")} onClick={onEnable}>{busy.spinning("native_sync_enable") && <Spinner />}启用同步</button>
             : <button className="secondary" disabled={busy.pending("native_sync_disable")} onClick={onDisable}>{busy.spinning("native_sync_disable") && <Spinner />}停止同步</button>}
-          <button className="secondary" disabled={!enabled || busy.pending("native_sync_sync_now")} onClick={onSyncNow}>{busy.spinning("native_sync_sync_now") && <Spinner />}立即同步</button>
+          <button className="secondary" disabled={!enabled || busy.pending("native_sync_sync_now")} onClick={onSyncNow} title="手动触发一次全量对账（诊断/应急用途；云端变化平时会自动跟上）">{busy.spinning("native_sync_sync_now") && <Spinner />}立即对账（诊断）</button>
           <button className="link-button native-sync-refresh" disabled={busy.pending("native_sync_status")} onClick={onRefresh}>{busy.spinning("native_sync_status") && <Spinner />}刷新状态</button>
           {enabled && <button className="secondary" disabled={busy.pending("native_sync_open_root")} onClick={onOpenRoot}>{busy.spinning("native_sync_open_root") && <Spinner />}打开根目录</button>}
         </div>
