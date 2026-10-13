@@ -158,6 +158,30 @@ mod tests {
         {
             async move { Ok(vec![]) }.boxed()
         }
+        fn upload<'a>(
+            &'a self,
+            _: &'a RemotePath,
+            _: &'a std::path::Path,
+            _: u64,
+        ) -> futures_util::future::BoxFuture<
+            'a,
+            Result<pandock_core::cloud::UploadOutcome, CloudError>,
+        > {
+            async move { Err(CloudError::unsupported("fake upload")) }.boxed()
+        }
+        fn rename<'a>(
+            &'a self,
+            _: &'a RemotePath,
+            _: &'a RemotePath,
+        ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+            async move { Err(CloudError::unsupported("fake rename")) }.boxed()
+        }
+        fn remove<'a>(
+            &'a self,
+            _: &'a RemotePath,
+        ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+            async move { Err(CloudError::unsupported("fake remove")) }.boxed()
+        }
         fn read_at<'a>(
             &'a self,
             _: &'a RemotePath,

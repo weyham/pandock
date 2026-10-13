@@ -4,7 +4,7 @@ use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 
 use super::error::CloudError;
-use super::resource::{RemotePath, ResourceKind, ResourceSnapshot};
+use super::resource::{RemotePath, ResourceKind, ResourceSnapshot, UploadOutcome};
 
 pub type CloudFuture<'a, T> = BoxFuture<'a, Result<T, CloudError>>;
 
@@ -31,6 +31,18 @@ pub trait CloudFs: Send + Sync {
         local: &'a Path,
         size: u64,
     ) -> CloudFuture<'a, ()>;
+    /// 详细上传（ADR-112）：`rtype` 由调用方控制（NativeSync=0 冲突失败 / WebDAV=3 覆盖）。
+    /// 默认未实现（返回 Unsupported）；BaiduCloudFs 覆盖。Additive，不影响既有实现者。
+    fn upload_detailed<'a>(
+        &'a self,
+        path: &'a RemotePath,
+        local: &'a Path,
+        size: u64,
+        rtype: u32,
+    ) -> CloudFuture<'a, UploadOutcome> {
+        let _ = (path, local, size, rtype);
+        Box::pin(async move { Err(CloudError::unsupported("upload_detailed 未实现")) })
+    }
     fn read_at<'a>(
         &'a self,
         path: &'a RemotePath,
@@ -222,6 +234,21 @@ impl CloudFs for BaiduCloudFs {
         async move {
             self.client
                 .upload_file(path.as_str(), local, size)
+                .await
+                .map_err(CloudError::from_message)
+        }
+        .boxed()
+    }
+    fn upload_detailed<'a>(
+        &'a self,
+        path: &'a RemotePath,
+        local: &'a Path,
+        size: u64,
+        rtype: u32,
+    ) -> CloudFuture<'a, UploadOutcome> {
+        async move {
+            self.client
+                .upload_file_detailed(path.as_str(), local, size, rtype)
                 .await
                 .map_err(CloudError::from_message)
         }

@@ -1326,6 +1326,30 @@ mod manager_tests {
             };
             async move { out }.boxed()
         }
+        fn upload<'a>(
+            &'a self,
+            _path: &'a RemotePath,
+            _local: &'a std::path::Path,
+            _size: u64,
+        ) -> futures_util::future::BoxFuture<
+            'a,
+            Result<pandock_core::cloud::UploadOutcome, CloudError>,
+        > {
+            async move { Err(CloudError::unsupported("fake upload")) }.boxed()
+        }
+        fn rename<'a>(
+            &'a self,
+            _from: &'a RemotePath,
+            _to: &'a RemotePath,
+        ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+            async move { Err(CloudError::unsupported("fake rename")) }.boxed()
+        }
+        fn remove<'a>(
+            &'a self,
+            _path: &'a RemotePath,
+        ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+            async move { Err(CloudError::unsupported("fake remove")) }.boxed()
+        }
         fn read_at<'a>(
             &'a self,
             _path: &'a RemotePath,

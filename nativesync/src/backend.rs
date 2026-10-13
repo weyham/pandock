@@ -1,4 +1,4 @@
-use pandock_core::cloud::{CloudError, CloudFs, RemotePath, ResourceSnapshot};
+use pandock_core::cloud::{CloudError, CloudFs, RemotePath, ResourceSnapshot, UploadOutcome};
 use std::sync::Arc;
 
 /// Read-only backend contract used by the sync manager. No WebDAV calls are
@@ -19,6 +19,24 @@ pub trait CloudBackend: Send + Sync {
         start: u64,
         count: usize,
     ) -> futures_util::future::BoxFuture<'a, Result<Vec<u8>, CloudError>>;
+    /// 上传（ADR-112）：rtype 固定 0（冲突失败），-8 经 CloudErrorKind::AlreadyExists 表达。
+    fn upload<'a>(
+        &'a self,
+        path: &'a RemotePath,
+        local: &'a std::path::Path,
+        size: u64,
+    ) -> futures_util::future::BoxFuture<'a, Result<UploadOutcome, CloudError>>;
+    /// 改名/移动（opera=move，保 fs_id）。
+    fn rename<'a>(
+        &'a self,
+        from: &'a RemotePath,
+        to: &'a RemotePath,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>>;
+    /// 删除（filemanager opera=delete，实测进回收站——ADR-112 §3.4）。
+    fn remove<'a>(
+        &'a self,
+        path: &'a RemotePath,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>>;
 }
 
 pub struct SnapshotBackend {
@@ -32,6 +50,30 @@ impl SnapshotBackend {
 }
 
 impl CloudBackend for SnapshotBackend {
+    fn upload<'a>(
+        &'a self,
+        path: &'a RemotePath,
+        local: &'a std::path::Path,
+        size: u64,
+    ) -> futures_util::future::BoxFuture<'a, Result<UploadOutcome, CloudError>> {
+        // ADR-112 定稿：NativeSync 上传固定 rtype=0（冲突失败以便检测）；
+        // WebDAV PUT 的 rtype=3 是另一条独立路径，不受影响。
+        self.inner.upload_detailed(path, local, size, 0)
+    }
+    fn rename<'a>(
+        &'a self,
+        from: &'a RemotePath,
+        to: &'a RemotePath,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+        self.inner.rename(from, to, false)
+    }
+    fn remove<'a>(
+        &'a self,
+        path: &'a RemotePath,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+        self.inner.remove(path)
+    }
+
     fn stat<'a>(
         &'a self,
         path: &'a RemotePath,
@@ -127,5 +169,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, vec![1, 2, 3]);
+        // ADR-112 写方向委托：rename/remove 直达 CloudFs；upload 固定 rtype=0
+        // （FakeFs 未覆盖 upload_detailed ⇒ 默认 Unsupported，证明走的就是该方法）。
+        assert!(backend.rename(&root, &root).await.is_ok());
+        assert!(backend.remove(&root).await.is_ok());
+        let error = backend
+            .upload(&root, std::path::Path::new("x"), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, pandock_core::cloud::CloudErrorKind::Unsupported);
     }
 }

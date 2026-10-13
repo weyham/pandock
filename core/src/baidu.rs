@@ -1,3 +1,4 @@
+use crate::cloud::UploadOutcome;
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -543,6 +544,22 @@ impl BaiduClient {
     }
 
     pub async fn upload_file(&self, dav_path: &str, local: &Path, size: u64) -> Result<(), String> {
+        // WebDAV PUT 语义保持 rtype=3（覆盖同名）——ADR-112 定稿：此路径**不动**。
+        self.upload_file_detailed(dav_path, local, size, 3)
+            .await
+            .map(|_| ())
+    }
+
+    /// 详细上传（ADR-112）：`rtype` 由调用方给定（NativeSync 用 0 = 冲突失败以便检测）；
+    /// 回执含 create 响应的 fs_id/md5/mtime 与 `rapid`（precreate 返回待传分片为空 = 秒传候选，
+    /// 秒传假冲突守卫据此决定先比 md5 再判冲突）。
+    pub async fn upload_file_detailed(
+        &self,
+        dav_path: &str,
+        local: &Path,
+        size: u64,
+        rtype: u32,
+    ) -> Result<UploadOutcome, String> {
         self.require_child_path(dav_path)?;
         let path = self.remote_path(dav_path)?;
         let mut file = tokio::fs::File::open(local)
@@ -575,7 +592,7 @@ impl BaiduClient {
                 ("size", &size.to_string()),
                 ("isdir", "0"),
                 ("autoinit", "1"),
-                ("rtype", "3"),
+                ("rtype", rtype.to_string().as_str()),
                 ("block_list", block_list.as_str()),
             ])
             .send()
@@ -587,17 +604,21 @@ impl BaiduClient {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "预上传未返回 uploadid".to_string())?
             .to_string();
-        let mut needed = pre
+        let needed = pre
             .get("block_list")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        if needed.is_empty() {
-            needed.push(serde_json::json!(0));
-        }
-        let host = self.locate_upload(&path, &upload_id).await?;
+        // 秒传：服务端待传分片列表为空 ⇒ 一个分片都不用传（ADR-112 §3.3）。
+        let rapid = needed.is_empty();
+        let host = if rapid {
+            None
+        } else {
+            Some(self.locate_upload(&path, &upload_id).await?)
+        };
         let mut uploaded_hashes = hashes.clone();
         for part in needed {
+            let host = host.as_ref().expect("非秒传必有上传域名");
             let seq = part
                 .as_u64()
                 .ok_or_else(|| "百度返回非法分片序号".to_string())? as usize;
@@ -655,14 +676,26 @@ impl BaiduClient {
                 ("path", path.as_str()),
                 ("size", &size.to_string()),
                 ("isdir", "0"),
-                ("rtype", "3"),
+                ("rtype", rtype.to_string().as_str()),
                 ("uploadid", upload_id.as_str()),
                 ("block_list", uploaded_block_list.as_str()),
             ])
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        self.ensure_success(response).await
+        // errno -8（rtype=0 冲突）在这里以 Err 返回，错误文本含 JSON 原文，
+        // 由 CloudError::from_message 分类为 AlreadyExists（ADR-112 §3.3 冲突入口）。
+        let created = self.decode_json(response).await?;
+        Ok(UploadOutcome {
+            fs_id: created.get("fs_id").and_then(|v| v.as_u64()),
+            md5: created
+                .get("md5")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            size,
+            mtime: created.get("mtime").and_then(|v| v.as_i64()),
+            rapid,
+        })
     }
 
     async fn locate_upload(&self, path: &str, upload_id: &str) -> Result<String, String> {
@@ -817,7 +850,7 @@ mod tests {
 mod api_tests {
     use super::*;
     use wiremock::{
-        matchers::{method, path, query_param},
+        matchers::{body_string_contains, method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -1002,6 +1035,163 @@ mod api_tests {
         assert_eq!(list[0].server_filename, "hello.txt");
         let meta = client.meta("/hello.txt").await.unwrap();
         assert_eq!(meta.dlink.as_deref(), Some("http://example.invalid/file"));
+    }
+
+    #[tokio::test]
+    async fn upload_detailed_uses_rtype0_and_returns_create_outcome() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("f.bin");
+        std::fs::write(&local, b"hello").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "precreate"))
+            .and(body_string_contains("rtype=0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 0, "uploadid": "u1", "block_list": [0]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/rest/2.0/pcs/file"))
+            .and(query_param("method", "locateupload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error_code": 0, "servers": [{"server": server.uri()}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/pcs/superfile2"))
+            .and(query_param("method", "upload"))
+            .and(query_param("partseq", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "md5": "5d41402abc4b2a76b9719d911017c592"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "create"))
+            .and(body_string_contains("rtype=0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 0, "fs_id": 4242, "md5": "5d41402abc4b2a76b9719d911017c592",
+                "size": 5, "mtime": 1700000123, "ctime": 1700000123, "path": "/apps/Demo/f.bin"
+            })))
+            .mount(&server)
+            .await;
+        let client = BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
+            .with_base_urls(&server.uri());
+        let outcome = client
+            .upload_file_detailed("/f.bin", &local, 5, 0)
+            .await
+            .unwrap();
+        assert_eq!(outcome.fs_id, Some(4242));
+        assert_eq!(
+            outcome.md5.as_deref(),
+            Some("5d41402abc4b2a76b9719d911017c592")
+        );
+        assert_eq!(outcome.mtime, Some(1700000123));
+        assert_eq!(outcome.size, 5);
+        assert!(!outcome.rapid, "有分片待传就不是秒传");
+    }
+
+    #[tokio::test]
+    async fn upload_detailed_rapid_skips_part_upload_and_locate() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("f.bin");
+        std::fs::write(&local, b"hello").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "precreate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 0, "uploadid": "u1", "block_list": []
+            })))
+            .mount(&server)
+            .await;
+        // 秒传：superfile2 与 locateupload 都不得被调用（未挂 mock ⇒ 调用即 404 ⇒ 报错）。
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "create"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 0, "fs_id": 777, "md5": "5d41402abc4b2a76b9719d911017c592",
+                "size": 5, "mtime": 1700000222
+            })))
+            .mount(&server)
+            .await;
+        let client = BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
+            .with_base_urls(&server.uri());
+        let outcome = client
+            .upload_file_detailed("/f.bin", &local, 5, 0)
+            .await
+            .unwrap();
+        assert!(outcome.rapid);
+        assert_eq!(outcome.fs_id, Some(777));
+    }
+
+    #[tokio::test]
+    async fn upload_file_keeps_webdav_rtype3() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("f.bin");
+        std::fs::write(&local, b"hello").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "precreate"))
+            .and(body_string_contains("rtype=3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 0, "uploadid": "u1", "block_list": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "create"))
+            .and(body_string_contains("rtype=3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 0, "fs_id": 1, "size": 5
+            })))
+            .mount(&server)
+            .await;
+        let client = BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
+            .with_base_urls(&server.uri());
+        // rtype 不匹配时 wiremock 不命中 ⇒ 404 ⇒ Err——所以成功即证明两段都是 rtype=3。
+        client.upload_file("/f.bin", &local, 5).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_detailed_create_minus8_classifies_as_already_exists() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("f.bin");
+        std::fs::write(&local, b"hello").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "precreate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": 0, "uploadid": "u1", "block_list": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/2.0/xpan/file"))
+            .and(query_param("method", "create"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errno": -8, "request_id": 12345
+            })))
+            .mount(&server)
+            .await;
+        let client = BaiduClient::new("key".into(), "secret".into(), "Demo".into(), "token".into())
+            .with_base_urls(&server.uri());
+        let error = client
+            .upload_file_detailed("/f.bin", &local, 5, 0)
+            .await
+            .unwrap_err();
+        // ADR-112 §3.3 冲突入口：-8 必须能分类为 AlreadyExists（含原始 errno）。
+        let cloud = crate::cloud::CloudError::from_message(error);
+        assert_eq!(cloud.kind, crate::cloud::CloudErrorKind::AlreadyExists);
+        assert_eq!(cloud.raw_errno, Some(-8));
+        assert!(!cloud.retryable, "冲突不可重试（要走冲突流程，不是盲重）");
     }
 
     #[tokio::test]

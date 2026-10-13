@@ -127,6 +127,18 @@ impl std::fmt::Display for Revision {
     }
 }
 
+/// 上传回执（ADR-112）：NativeSync 冲突检测与回声抑制的硬依赖。
+/// `rapid` = precreate 返回的待传分片列表为空（秒传候选；假冲突守卫据此决定是否先比 md5）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UploadOutcome {
+    pub fs_id: Option<u64>,
+    pub md5: Option<String>,
+    pub size: u64,
+    /// 服务端 mtime（epoch 秒）。
+    pub mtime: Option<i64>,
+    pub rapid: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResourceSnapshot {
     pub path: RemotePath,
