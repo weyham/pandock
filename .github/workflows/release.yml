@@ -35,23 +35,27 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: ui/package-lock.json
-      - name: Rust GNU toolchain（与本地发布构建一致：windres/WebView2Loader/时间戳）
-        run: |
-          rustup toolchain install stable-x86_64-pc-windows-gnu --component rustfmt --component clippy
-          rustup default stable-x86_64-pc-windows-gnu
-          Add-Content $env:GITHUB_PATH "C:\mingw64\bin"
+      # ADR-113：发布构建用 MSVC（WebView2 静态链接、免随包 DLL）+ /Brepro 确定性输出，
+      # 照抄 Halcyon：不显式指定 target，主机默认 = MSVC。
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d  # stable
+        with:
+          components: rustfmt, clippy
       - name: Velopack CLI (vpk)
         run: dotnet tool install --global vpk
       - name: full local gate
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -SkipCoverage
-          # 覆盖率门禁由 build.yml 在同一提交上完成（llvm-cov 与 GNU 工具链不兼容，
-          # 而发布构建必须与本地一致使用 GNU——WebView2Loader.dll 只在 GNU 下产出）
+          # 覆盖率门禁由 build.yml 在同一提交上完成（ADR-113：MSVC 下 llvm-cov 照常使用）
       - name: build + publish Velopack release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: powershell -ExecutionPolicy Bypass -File .\scripts\build-velopack.ps1 -Upload -Publish
+      # ADR-113 风险 2 显形防线：构建后断言产物不依赖 WebView2Loader.dll
+      # （脚本内已有同款断言，此处为 CI 层独立重复，失败即显形）。
+      - name: assert no WebView2Loader.dll dependency
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\verify-no-webview2loader-dependency.ps1 -ExePath target\release-package\release\pandock.exe
       - name: attach sha256 sidecars
         shell: pwsh
         env:

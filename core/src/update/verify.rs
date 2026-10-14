@@ -35,9 +35,10 @@ pub fn verify_size(data_len: usize, expected_size: u64) -> Result<(), UpdateErro
 
 pub fn default_install_allowlist(helper_path: Option<&str>) -> HashSet<String> {
     // 1.2.0 起更新链全部为 pandock.exe（ADR-104 双名过渡随开源迁移结束）。
+    // ADR-113：MSVC 静态链接后 WebView2Loader.dll 不再随包分发，白名单同步移除；
+    // 旧实例目录里的历史残留 DLL 不在白名单 = 更新时原样保留（只记录、不主动清）。
     let mut allowed = HashSet::from([
         "pandock.exe".to_string(),
-        "WebView2Loader.dll".to_string(),
         "VERSION.txt".to_string(),
         "LICENSE.txt".to_string(),
     ]);
@@ -65,7 +66,8 @@ mod tests {
     fn allowlist_accepts_app_files_and_helper() {
         let allowed = default_install_allowlist(Some("updater.exe"));
         assert!(allowed.contains("pandock.exe"));
-        assert!(allowed.contains("WebView2Loader.dll"));
         assert!(allowed.contains("updater.exe"));
+        // ADR-113：DLL 不再随包，必须不在白名单内。
+        assert!(!allowed.contains("WebView2Loader.dll"));
     }
 }

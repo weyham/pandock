@@ -23,11 +23,7 @@ pub const PACKAGE_ID: &str = "Pandock";
 /// Application files extracted from the nupkg for a portable update.
 /// Velopack plumbing (sq.version, Squirrel.exe, *Stub.exe) is deliberately
 /// excluded.
-pub const APP_FILES: [&str; 3] = [
-    "lib/app/pandock.exe",
-    "lib/app/WebView2Loader.dll",
-    "lib/app/updater.exe",
-];
+pub const APP_FILES: [&str; 2] = ["lib/app/pandock.exe", "lib/app/updater.exe"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FeedAsset {
@@ -192,6 +188,12 @@ mod tests {
         }
         writer.start_file("lib/app/sq.version", options).unwrap();
         writer.write_all(b"plumbing").unwrap();
+        // ADR-113：旧版 nupkg 里的 WebView2Loader.dll 属于历史残留条目，
+        // 新版本不再分发；fixture 故意保留它以断言"绝不被提取进 staging"。
+        writer
+            .start_file("lib/app/WebView2Loader.dll", options)
+            .unwrap();
+        writer.write_all(b"legacy-dll").unwrap();
         writer.finish().unwrap().into_inner()
     }
 
@@ -200,10 +202,10 @@ mod tests {
         let package = build_test_nupkg();
         let staging = tempfile::tempdir().unwrap();
         let extracted = extract_app_files(&package, staging.path()).unwrap();
-        assert_eq!(extracted.len(), 3);
+        assert_eq!(extracted.len(), 2);
         assert!(staging.path().join("pandock.exe").exists());
-        assert!(staging.path().join("WebView2Loader.dll").exists());
         assert!(staging.path().join("updater.exe").exists());
+        assert!(!staging.path().join("WebView2Loader.dll").exists());
         assert!(!staging.path().join("sq.version").exists());
         let content = std::fs::read_to_string(staging.path().join("pandock.exe")).unwrap();
         assert_eq!(content, "content-of-lib/app/pandock.exe");

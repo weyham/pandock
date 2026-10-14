@@ -42,11 +42,12 @@ try {
     # 有历史记录）；MSVC 下实证 8 passed。MSVC 与 GNU 产物在共享 target\ 下按
     # 指纹共存（首次 MSVC 构建会多花几分钟，属预期）。
     $msvcToolchain = "stable-x86_64-pc-windows-msvc"
-    $toolchainList = (& rustup toolchain list 2>$null) -join "`n"
+    $rustup = Resolve-PandockRustup
+    $toolchainList = (& $rustup toolchain list 2>$null) -join "`n"
     if ($toolchainList -notmatch [regex]::Escape($msvcToolchain)) {
         throw "缺少 Rust MSVC 工具链（$msvcToolchain）：app lib 测试要求它（ADR-113）。请先执行: rustup toolchain install $msvcToolchain"
     }
-    & rustup run $msvcToolchain cargo test -p pandock-app --lib
+    & $rustup run $msvcToolchain cargo test -p pandock-app --lib
     if ($LASTEXITCODE -ne 0) { throw "app lib tests (MSVC) failed with exit code $LASTEXITCODE" }
 
     & cargo check -p pandock-app

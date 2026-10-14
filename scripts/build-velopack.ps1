@@ -30,7 +30,8 @@ try {
         # 可复现性改用 MSVC 的 /Brepro（GNU 的 -Wl,--no-insert-timestamp 对 link.exe 无效，Halcyon 同款替换）。
         $env:RUSTFLAGS = "-C link-arg=/Brepro"
         $msvcToolchain = "stable-x86_64-pc-windows-msvc"
-        $toolchainList = (& rustup toolchain list 2>$null) -join "`n"
+        $rustup = Resolve-PandockRustup
+        $toolchainList = (& $rustup toolchain list 2>$null) -join "`n"
         if ($toolchainList -notmatch [regex]::Escape($msvcToolchain)) {
             throw "缺少 Rust MSVC 工具链（$msvcToolchain）：发布构建要求它（ADR-113）。请先执行: rustup toolchain install $msvcToolchain"
         }
@@ -38,11 +39,11 @@ try {
         & npm --prefix ui run build
         if ($LASTEXITCODE -ne 0) { throw "UI build failed with exit code $LASTEXITCODE" }
 
-        & rustup run $msvcToolchain cargo build --release -p pandock-app --features custom-protocol
+        & $rustup run $msvcToolchain cargo build --release -p pandock-app --features custom-protocol
         if ($LASTEXITCODE -ne 0) { throw "Release build failed with exit code $LASTEXITCODE" }
 
         # portable 就地更新 helper（ADR-102），随 nupkg 与便携包分发
-        & rustup run $msvcToolchain cargo build --release -p pandock-updater
+        & $rustup run $msvcToolchain cargo build --release -p pandock-updater
         if ($LASTEXITCODE -ne 0) { throw "Updater build failed with exit code $LASTEXITCODE" }
 
         $exe = Join-Path $env:CARGO_TARGET_DIR "release\pandock.exe"

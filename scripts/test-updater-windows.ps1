@@ -51,7 +51,6 @@ function New-Journal(
 function New-AppFixture([string]$AppDir) {
     New-Item -ItemType Directory -Path (Join-Path $AppDir "data") -Force | Out-Null
     Copy-Item -LiteralPath $fakeExe -Destination (Join-Path $AppDir "pandock.exe") -Force
-    Write-Text (Join-Path $AppDir "WebView2Loader.dll") "old-dll"
     Write-Text (Join-Path $AppDir "VERSION.txt") "1.0.0`r`n"
     Write-Text (Join-Path $AppDir "LICENSE.txt") "license"
     Write-Text (Join-Path $AppDir "data\config.json") '{"keep":true}'
@@ -60,7 +59,6 @@ function New-AppFixture([string]$AppDir) {
 function New-StagingFixture([string]$StagingDir, [string]$HelperPath) {
     New-Item -ItemType Directory -Path $StagingDir -Force | Out-Null
     Copy-Item -LiteralPath $fakeExe -Destination (Join-Path $StagingDir "pandock.exe") -Force
-    Write-Text (Join-Path $StagingDir "WebView2Loader.dll") "new-dll"
     Write-Text (Join-Path $StagingDir "VERSION.txt") "1.0.1`r`n"
     Write-Text (Join-Path $StagingDir "LICENSE.txt") "license"
     Copy-Item -LiteralPath $HelperPath -Destination (Join-Path $StagingDir "pandock-updater.exe") -Force

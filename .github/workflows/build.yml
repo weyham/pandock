@@ -27,6 +27,7 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: ui/package-lock.json
+      # windows-latest 默认 stable-MSVC，与发布构建一致（ADR-113），不显式安装其他工具链
       - name: Rust toolchain (fmt/clippy components)
         run: rustup component add rustfmt clippy
       - name: UI install

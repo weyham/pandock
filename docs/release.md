@@ -51,9 +51,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-velopack.ps1
 5. 构造规范便携包 `Pandock-win-Portable.zip`（自带 `data\README.txt` 与 `updater.exe`，触发 portable 数据目录与应用内自更新）；
 6. 生成两个产物的 `.sha256` 校验文件。
 
-产物位于 `dist\velopack\`（不提交）。`vpk pack` 的打包目录只包含 `pandock.exe`、`WebView2Loader.dll`、`updater.exe`，严禁混入 `target` 中间产物。
+产物位于 `dist\velopack\`（不提交）。`vpk pack` 的打包目录只包含 `pandock.exe`、`updater.exe`（ADR-113：MSVC 静态链接后 `WebView2Loader.dll` 不再随包），严禁混入 `target` 中间产物。
 
-发布构建使用独立的 `target/release-package`，避免正在运行的开发实例锁定默认 `target/release`。`--no-insert-timestamp` 链接参数保持启用。
+发布构建使用独立的 `target/release-package`，避免正在运行的开发实例锁定默认 `target/release`。可复现性链接参数保持启用（ADR-113：MSVC 的 `/Brepro`，替代 GNU 时代的 `--no-insert-timestamp`）。
 
 ## 发布前人工验收
 
