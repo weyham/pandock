@@ -201,3 +201,11 @@ db 快照：写入后新增行（fs_id=75416668168886，online_only，md5 有值
 - 百度 `method=list` 新鲜度无 SLA ⇒ 云端变化的下行延迟偶尔可达数十分钟（生杀判定已改用 stat 确认，不受影响；影响的是"新文件何时出现在本地"）；
 - 自愈回位的条目 state 停留 `remote_missing`（外观残留，upsert 复活行时未清）——小修待排；
 - `sync.db` 的 `.bak` 备份是空壳（不含 WAL）——改用 SQLite 在线备份属高优先待办。
+### WebDAV 目录列举新鲜度实验（2026-10-14，负结果如实记录）
+
+- 健康实例（PID 67796）+ 真实账号 + 应用目录根，3 轮 PUT / 3 轮 DELETE / 1 轮 MOVE，全部在**第一次父目录 PROPFIND 即反映最新状态**：PUT 可见延迟 0.281–0.556s、DELETE 消失 0.242–0.388s、MOVE 旧名消失与新名出现同帧；Depth:0 对照一致，无错位。
+- **未复现** NativeSync 侧 2026-10-13 观测到的 6–54 分钟 `method=list` 滞后（该滞后有生产日志实锤：上传 15:14 → list 16:04 才收录副本）。
+- 两通道共用**同一个 `BaiduCloudFs::list` 实现与请求参数** ⇒ 差异不是代码路径，定性为**上游间歇性最终一致**（时段/条件相关），非恒定缺陷。
+- 风险分级：WebDAV 侧滞后 = 目录视图晚看到（UX 级，无本地状态可误删）；NativeSync 侧滞后 = 曾导致误删（已由 stat 确认守卫防住，属生杀判定）。
+- **决策**：暂不为 WebDAV 实现写穿补偿层（无实证缺陷）；NativeSync 的 stat 确认守卫继续保留。若用户侧出现可复现症状，再按本实验协议复测。
+- 证据：`%TEMP%\pandock-webdav-fresh-probe\pandock-webdav-fresh-probe-1791944836-fa5845.summary.json` 及同前缀 `.jsonl`（每次请求的方法/状态码/耗时/条目清单）。
