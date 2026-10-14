@@ -125,6 +125,13 @@ scripts/deploy-dev.ps1
   **未能定位到具体缺失的导出符号**——继续深入需要加载器跟踪（通常需管理员）或 MSVC 对照（本机没有），
   代价与收益不成比例，故**停止追查**（不编造机理）。
 
+  **2026-10-14 追加（ADR-113）**：用 rustup `stable-x86_64-pc-windows-msvc` 在本机同一代码上直接跑
+  `cargo test -p pandock-app --lib` → **8 passed**（同一 worktree 用 GNU 复跑仍 `0xC0000139`）。
+  ⇒ 该失败确为 **GNU 工具链固有**（与代码无关），MSVC 迁移后本地门禁可恢复同构。
+  `scripts/check.ps1` 已加回该步骤（显式 `rustup run stable-x86_64-pc-windows-msvc`，
+  并带 `rustup toolchain list` 预检，缺工具链时给出明确安装提示而非裸 0xC0000139）。
+  上文「不要把它加进本地 check.ps1」的结论**作废**（保留历史记录以备追溯）。
+
 
 ## S1.5 无感同步（ADR-111）真实机验收（2026-10-13）
 

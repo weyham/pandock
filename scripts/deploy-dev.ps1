@@ -63,7 +63,7 @@ $src = (Resolve-Path -LiteralPath $SourceDir).Path
 $dst = (Resolve-Path -LiteralPath $RuntimeDir).Path
 
 # 只替换白名单文件；data\、updates\、日志等运行状态一概不动
-$whitelist = @("pandock.exe", "updater.exe", "WebView2Loader.dll", "VERSION.txt", "LICENSE.txt", "README-portable.txt")
+$whitelist = @("pandock.exe", "updater.exe", "VERSION.txt", "LICENSE.txt", "README-portable.txt")
 $present = @($whitelist | Where-Object { Test-Path -LiteralPath (Join-Path $src $_) })
 if ($present -notcontains "pandock.exe") { throw "源目录缺少 pandock.exe：$src" }
 
@@ -80,6 +80,7 @@ $targets = Get-CimInstance Win32_Process -Filter "Name='pandock.exe'" |
 # 实现：把"目标实例当前持有的路径"（映像 + 已加载模块 + 子进程映像/模块）从 pre-flight 里排除；
 # 任何**不在**这个集合里的占用 ⇒ 是第三方（Defender / 别的工具 / 残留句柄）⇒ 立即退出。
 # 例：`pandock.exe`（自己的映像）与 `WebView2Loader.dll`（实例把它映射进自己的进程）都不算冲突。
+# （ADR-113：MSVC 迁移后 DLL 不再随包分发，但旧实例目录里的历史残留仍可能被映射，本例继续成立。）
 $existing = @($present | ForEach-Object { Join-Path $dst $_ } | Where-Object { Test-Path -LiteralPath $_ })
 $instanceHeld = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($p in $targets) {

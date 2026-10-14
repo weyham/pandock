@@ -37,6 +37,18 @@ try {
     & cargo test -p pandock-nativesync
     if ($LASTEXITCODE -ne 0) { throw "nativesync tests failed with exit code $LASTEXITCODE" }
 
+    # app lib 测试（ADR-113 定稿）：显式 rustup MSVC 运行——本机 PATH 是独立 GNU，
+    # GNU 下该测试二进制 0xC0000139 加载失败（docs/validation.md「门禁覆盖面差异」
+    # 有历史记录）；MSVC 下实证 8 passed。MSVC 与 GNU 产物在共享 target\ 下按
+    # 指纹共存（首次 MSVC 构建会多花几分钟，属预期）。
+    $msvcToolchain = "stable-x86_64-pc-windows-msvc"
+    $toolchainList = (& rustup toolchain list 2>$null) -join "`n"
+    if ($toolchainList -notmatch [regex]::Escape($msvcToolchain)) {
+        throw "缺少 Rust MSVC 工具链（$msvcToolchain）：app lib 测试要求它（ADR-113）。请先执行: rustup toolchain install $msvcToolchain"
+    }
+    & rustup run $msvcToolchain cargo test -p pandock-app --lib
+    if ($LASTEXITCODE -ne 0) { throw "app lib tests (MSVC) failed with exit code $LASTEXITCODE" }
+
     & cargo check -p pandock-app
     if ($LASTEXITCODE -ne 0) { throw "cargo check failed with exit code $LASTEXITCODE" }
 

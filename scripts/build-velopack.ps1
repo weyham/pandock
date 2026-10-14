@@ -26,16 +26,23 @@ try {
 
     if (-not $SkipBuild) {
         $env:CARGO_TARGET_DIR = Join-Path $root "target\release-package"
-        $env:RUSTFLAGS = "-C link-arg=-Wl,--no-insert-timestamp"
+        # ADR-113：发布构建钉到 MSVC（rustup 显式，与 check.ps1 同款预检）；
+        # 可复现性改用 MSVC 的 /Brepro（GNU 的 -Wl,--no-insert-timestamp 对 link.exe 无效，Halcyon 同款替换）。
+        $env:RUSTFLAGS = "-C link-arg=/Brepro"
+        $msvcToolchain = "stable-x86_64-pc-windows-msvc"
+        $toolchainList = (& rustup toolchain list 2>$null) -join "`n"
+        if ($toolchainList -notmatch [regex]::Escape($msvcToolchain)) {
+            throw "缺少 Rust MSVC 工具链（$msvcToolchain）：发布构建要求它（ADR-113）。请先执行: rustup toolchain install $msvcToolchain"
+        }
 
         & npm --prefix ui run build
         if ($LASTEXITCODE -ne 0) { throw "UI build failed with exit code $LASTEXITCODE" }
 
-        & cargo build --release -p pandock-app --features custom-protocol
+        & rustup run $msvcToolchain cargo build --release -p pandock-app --features custom-protocol
         if ($LASTEXITCODE -ne 0) { throw "Release build failed with exit code $LASTEXITCODE" }
 
         # portable 就地更新 helper（ADR-102），随 nupkg 与便携包分发
-        & cargo build --release -p pandock-updater
+        & rustup run $msvcToolchain cargo build --release -p pandock-updater
         if ($LASTEXITCODE -ne 0) { throw "Updater build failed with exit code $LASTEXITCODE" }
 
         $exe = Join-Path $env:CARGO_TARGET_DIR "release\pandock.exe"
@@ -45,15 +52,17 @@ try {
     }
 
     $builtExe = Join-Path $root "target\release-package\release\pandock.exe"
-    $builtDll = Join-Path $root "target\release-package\release\WebView2Loader.dll"
     $builtUpdater = Join-Path $root "target\release-package\release\pandock-updater.exe"
-    foreach ($required in @($builtExe, $builtDll, $builtUpdater)) {
+    foreach ($required in @($builtExe, $builtUpdater)) {
         if (-not (Test-Path -LiteralPath $required)) { throw "Missing built file: $required (run without -SkipBuild)" }
     }
+    # ADR-113 显形防线：MSVC 静态链后 pandock.exe 不得再依赖 WebView2Loader.dll
+    & (Join-Path $PSScriptRoot "verify-no-webview2loader-dependency.ps1") -ExePath $builtExe
+    if ($LASTEXITCODE -ne 0) { throw "pandock.exe 仍依赖 WebView2Loader.dll（应为 MSVC 静态链接）" }
 
     if (Test-Path -LiteralPath $stageDir) { Remove-Item -Recurse -Force $stageDir }
     New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
-    Copy-Item -LiteralPath $builtExe, $builtDll -Destination $stageDir
+    Copy-Item -LiteralPath $builtExe -Destination $stageDir
     Copy-Item -LiteralPath $builtUpdater -Destination (Join-Path $stageDir "updater.exe")
 
     if (Test-Path -LiteralPath $outDir) { Remove-Item -Recurse -Force $outDir }
@@ -83,7 +92,7 @@ try {
     $portableStage = Join-Path $root "target\velopack-portable-stage"
     if (Test-Path -LiteralPath $portableStage) { Remove-Item -Recurse -Force $portableStage }
     New-Item -ItemType Directory -Path (Join-Path $portableStage "data") -Force | Out-Null
-    Copy-Item -LiteralPath $builtExe, $builtDll -Destination $portableStage
+    Copy-Item -LiteralPath $builtExe -Destination $portableStage
     Copy-Item -LiteralPath $builtUpdater -Destination (Join-Path $portableStage "updater.exe")
     Copy-Item -LiteralPath (Join-Path $root "LICENSE") -Destination (Join-Path $portableStage "LICENSE.txt")
     [System.IO.File]::WriteAllText((Join-Path $portableStage "VERSION.txt"), "$version`r`n", $utf8NoBom)
@@ -97,7 +106,7 @@ Pandock $version Windows x64 便携版
 4. 完成设备码授权。
 5. 挂载 http://127.0.0.1:19090/dav/。
 
-请保持 pandock.exe、WebView2Loader.dll 和 data\ 在一起。
+请保持 pandock.exe 和 data\ 在一起。
 运行时数据保存在 exe 旁的 data\ 中；机密和令牌保存在当前 Windows 用户的凭据管理器中。
 便携版不提供应用内自动更新，请前往 Releases 页面下载新版本，解压时保留 data\ 目录。
 "@
