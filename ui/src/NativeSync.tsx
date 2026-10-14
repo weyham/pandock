@@ -83,7 +83,9 @@ export function formatSyncTimeOfDay(value?: string | number | null): string | nu
   if (value == null || value === "") return null;
   const secs = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(secs) || secs <= 0) return null;
-  return new Date(secs * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  // 钉死 zh-CN：界面文案全中文，时间格式跟中文走；空 locale 数组跟随系统
+  // （en-US 会输出 "10:13:20 AM"，中英混杂且 CI 依赖系统 locale 不稳定）。
+  return new Date(secs * 1000).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 /** 「上次对账 HH:mm:ss · 结果」一行（ADR-111 §2.6）。paused 时同一行升级为非模态提示（绝不弹窗）。 */
