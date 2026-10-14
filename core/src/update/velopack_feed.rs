@@ -188,12 +188,13 @@ mod tests {
         }
         writer.start_file("lib/app/sq.version", options).unwrap();
         writer.write_all(b"plumbing").unwrap();
-        // ADR-113：旧版 nupkg 里的 WebView2Loader.dll 属于历史残留条目，
-        // 新版本不再分发；fixture 故意保留它以断言"绝不被提取进 staging"。
+        // ADR-113 兼容桥：包里继续携带 WebView2Loader.dll（1.4.0 及更早客户端的
+        // extract_app_files 把它当必需项）；新客户端的 APP_FILES 不含它，
+        // fixture 据此同时断言"包里有"（下方回归测试）与"新客户端不提取"（本测试）。
         writer
             .start_file("lib/app/WebView2Loader.dll", options)
             .unwrap();
-        writer.write_all(b"legacy-dll").unwrap();
+        writer.write_all(b"compat-bridge-dll").unwrap();
         writer.finish().unwrap().into_inner()
     }
 
@@ -209,6 +210,29 @@ mod tests {
         assert!(!staging.path().join("sq.version").exists());
         let content = std::fs::read_to_string(staging.path().join("pandock.exe")).unwrap();
         assert_eq!(content, "content-of-lib/app/pandock.exe");
+    }
+
+    /// ADR-113 兼容桥回归测试（1.4.1 线上事故）：1.4.0 及更早客户端的
+    /// extract_app_files 用硬编码三项清单（含 DLL）且逐条 by_name 必需。
+    /// 新版包必须继续携带 DLL 条目，否则旧客户端拒收更新包。
+    /// 摘除条件：所有 1.4.0 及更早客户端退市（见 docs/release.md）。
+    #[test]
+    fn legacy_three_item_extraction_succeeds_on_bridge_package() {
+        let package = build_test_nupkg();
+        // 旧客户端（tag 1.4.0）的硬编码清单，逐条必需——刻意不引用 APP_FILES，
+        // 钉死"旧清单"这个历史形态。
+        let legacy_required = [
+            "lib/app/pandock.exe",
+            "lib/app/WebView2Loader.dll",
+            "lib/app/updater.exe",
+        ];
+        let mut zip = zip::ZipArchive::new(Cursor::new(&package)).unwrap();
+        for name in legacy_required {
+            assert!(
+                zip.by_name(name).is_ok(),
+                "旧客户端（≤1.4.0）必需条目在新包中缺失: {name}"
+            );
+        }
     }
 
     #[test]

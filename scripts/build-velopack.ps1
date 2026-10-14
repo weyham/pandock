@@ -61,10 +61,28 @@ try {
     & (Join-Path $PSScriptRoot "verify-no-webview2loader-dependency.ps1") -ExePath $builtExe
     if ($LASTEXITCODE -ne 0) { throw "pandock.exe 仍依赖 WebView2Loader.dll（应为 MSVC 静态链接）" }
 
+    # ADR-113 兼容桥（1.4.1 线上事故复盘）：1.4.0 及更早客户端的 extract_app_files
+    # 把 WebView2Loader.dll 当**必需项**（by_name 找不到即拒收整个更新包）——
+    # 包里必须继续携带它；1.4.1+ 客户端不需要也不加载它（上面的 PE 断言保证）。
+    # 摘除条件见 docs/release.md。DLL 取自 cargo 缓存中本构建实际使用的
+    # webview2-com-sys 版本（与 1.4.0 随包那份字节一致，SHA256 三方核对过）。
+    $lockText = [System.IO.File]::ReadAllText((Join-Path $root "Cargo.lock"), $utf8NoBom)
+    $wv2 = [regex]::Match($lockText, '(?ms)name = "webview2-com-sys"\s*version = "([^"]+)"')
+    if (-not $wv2.Success) { throw "Cargo.lock 中找不到 webview2-com-sys 版本（兼容桥 DLL 定位失败）" }
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+    $bridgeDll = Get-ChildItem -LiteralPath (Join-Path $cargoHome "registry\src") -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { Join-Path $_.FullName ("webview2-com-sys-" + $wv2.Groups[1].Value + "\x64\WebView2Loader.dll") } |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+    if (-not $bridgeDll) { throw "cargo 缓存中找不到 webview2-com-sys $($wv2.Groups[1].Value) 的 x64 WebView2Loader.dll（兼容桥）" }
+
     if (Test-Path -LiteralPath $stageDir) { Remove-Item -Recurse -Force $stageDir }
     New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
     Copy-Item -LiteralPath $builtExe -Destination $stageDir
     Copy-Item -LiteralPath $builtUpdater -Destination (Join-Path $stageDir "updater.exe")
+    Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $stageDir "WebView2Loader.dll")
+    # 兼容桥断言：打包目录必须含 DLL（否则 1.4.0 及更早客户端拒收本包）
+    if (-not (Test-Path -LiteralPath (Join-Path $stageDir "WebView2Loader.dll"))) { throw "打包目录缺少 WebView2Loader.dll（ADR-113 兼容桥）" }
 
     if (Test-Path -LiteralPath $outDir) { Remove-Item -Recurse -Force $outDir }
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
@@ -95,6 +113,8 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $portableStage "data") -Force | Out-Null
     Copy-Item -LiteralPath $builtExe -Destination $portableStage
     Copy-Item -LiteralPath $builtUpdater -Destination (Join-Path $portableStage "updater.exe")
+    # 兼容桥同款：便携包也带上（内容物与 nupkg 对齐；1.4.1+ 运行时不加载它）
+    Copy-Item -LiteralPath $bridgeDll -Destination (Join-Path $portableStage "WebView2Loader.dll")
     Copy-Item -LiteralPath (Join-Path $root "LICENSE") -Destination (Join-Path $portableStage "LICENSE.txt")
     [System.IO.File]::WriteAllText((Join-Path $portableStage "VERSION.txt"), "$version`r`n", $utf8NoBom)
     [System.IO.File]::WriteAllText((Join-Path $portableStage "data\README.txt"), "Pandock 运行时数据目录，请勿手动修改。`r`n更新便携版时保留本目录即可。`r`n", $utf8NoBom)
