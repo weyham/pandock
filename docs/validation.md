@@ -216,3 +216,17 @@ db 快照：写入后新增行（fs_id=75416668168886，online_only，md5 有值
 - 风险分级：WebDAV 侧滞后 = 目录视图晚看到（UX 级，无本地状态可误删）；NativeSync 侧滞后 = 曾导致误删（已由 stat 确认守卫防住，属生杀判定）。
 - **决策**：暂不为 WebDAV 实现写穿补偿层（无实证缺陷）；NativeSync 的 stat 确认守卫继续保留。若用户侧出现可复现症状，再按本实验协议复测。
 - 证据：`%TEMP%\pandock-webdav-fresh-probe\pandock-webdav-fresh-probe-1791944836-fa5845.summary.json` 及同前缀 `.jsonl`（每次请求的方法/状态码/耗时/条目清单）。
+## ADR-113 MSVC 工具链迁移验收（2026-10-14）
+
+**验收对象**：`main = 8000f0a`（PR-1 构建/门禁 `0f5e2e9` + PR-2 更新链/CI `8000f0a`），发布形态 = Release 1.4.1（tag `e4bf771`）。
+
+| 判据 | 证据 |
+|---|---|
+| 本机 app lib 测试恢复 | MSVC 下 `cargo test -p pandock-app --lib` = 8 passed（GNU 对照仍 0xC0000139）；已加回 `check.ps1`（显式 `rustup run` + 预检） |
+| 发布物不携带 DLL | 1.4.1 nupkg `lib/app` 仅 pandock.exe + updater.exe + vpk 管道件；CI 层 `assert no WebView2Loader.dll dependency` = success（脚本内 + CI 两道防线） |
+| 无 DLL 渲染 | 干净目录（无 DLL）实例：WebView2 六进程树 + 启动 5 行 + `show_settings` 可见性日志 |
+| 更新链兼容 | feed Full 条目 SHA256 == 资产 digest == 实下载哈希；`test-updater-windows.ps1` 五案全过（MSVC 产物）；隔离环境 1.4.0(GNU 带 DLL) → 1.4.1(MSVC 无 DLL) 升级成功、旧 DLL 残留但运行实例零加载（决策 4 实锤）、data\ 零改动 |
+| updater 回滚链 | 计划外负向实证：readiness 超时 → helper 自动回滚 → 旧版逐字节恢复重启（journal=rolled_back） |
+| 产物形态 | Setup.exe 27.6MB→17.6MB、Portable.zip 17.3MB→7.5MB、nupkg 20MB→10MB（静态链接 + 去 GNU 静态运行时的双重瘦身） |
+
+**已知项（落档）**：feed 无 delta 包（消费侧只认 Full，若要引入需同步改 `velopack_feed.rs` + release.yml 先下载上一版 nupkg——体积优化项非缺陷）；同机隔离测试实例必读生产 keyring（KEYRING_SERVICE 固定串）⇒ 测试纪律见 `docs/问题与解决.md`。
