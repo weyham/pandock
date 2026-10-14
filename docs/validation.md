@@ -230,3 +230,8 @@ db 快照：写入后新增行（fs_id=75416668168886，online_only，md5 有值
 | 产物形态 | Setup.exe 27.6MB→17.6MB、Portable.zip 17.3MB→7.5MB、nupkg 20MB→10MB（静态链接 + 去 GNU 静态运行时的双重瘦身） |
 
 **已知项（落档）**：feed 无 delta 包（消费侧只认 Full，若要引入需同步改 `velopack_feed.rs` + release.yml 先下载上一版 nupkg——体积优化项非缺陷）；同机隔离测试实例必读生产 keyring（KEYRING_SERVICE 固定串）⇒ 测试纪律见 `docs/问题与解决.md`。
+### 1.4.2 发布轮验证补充（2026-10-14）
+
+- **实物钉子**：tag 1.4.0 的真实 `extract_app_files`（三项硬编码清单）解包 1.4.2 **正式发布 nupkg** 成功，三项条目大小逐一核对（20,355,072 / 160,320 / 572,416）——线上 ≤1.4.0 用户更新链路实证已通；
+- feed 条目三方一致（feed SHA256 == GitHub digest == 实下载哈希）；updater e2e 五案全过（MSVC 产物）；
+- 附注：系统事件日志当日 4 条 WER 记录（pandock-updater-e2e 夹具的故意无效 exe）为测试预期形态，与生产实例无关。
